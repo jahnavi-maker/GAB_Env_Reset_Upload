@@ -1,0 +1,24 @@
+# systemd unit for the GAB platform API.
+# Install:  sudo cp deploy/gab-api.service /etc/systemd/system/gab-api.service
+#           sudo systemctl daemon-reload && sudo systemctl enable --now gab-api
+#           sudo systemctl status gab-api      # expect: active (running)
+#           journalctl -u gab-api -f           # live logs
+[Unit]
+Description=GAB Platform API (reset + upload)
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/gab-env-platform/api
+EnvironmentFile=/home/ubuntu/gab-env-platform/.env
+# --workers 1 is REQUIRED for now: OAuth pending state is in-memory, so a second
+# worker would not see a consent started on the first. --proxy-headers lets the
+# app trust nginx's X-Forwarded-Proto (so it knows it's really HTTPS).
+ExecStart=/home/ubuntu/gab-env-platform/api/.venv/bin/uvicorn reset_service.app:app \
+  --host 127.0.0.1 --port 8791 --workers 1 \
+  --proxy-headers --forwarded-allow-ips="*"
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

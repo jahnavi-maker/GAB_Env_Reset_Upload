@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>QC Review</title>
+<style>
+  :root { --bg:#f6f3f0; --card:#fff; --ink:#111113; --muted:#6b6b70; --brand:#175fff;
+    --ok:#12855a; --err:#c0392b; --warn:#b8860b; --line:#e6e2dd; --chip:#eef1f6; }
+  @media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){ --bg:#111113; --card:#1b1b1e; --ink:#f6f3f0; --muted:#9a9aa0; --line:#2c2c30; --chip:#23232a; } }
+  *{box-sizing:border-box;} body{margin:0;background:var(--bg);color:var(--ink);padding:24px 16px;
+    font-family:-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",sans-serif;}
+  .wrap{max-width:760px;margin:0 auto;}
+  h1{font-size:22px;margin:0 0 4px;} .sub{color:var(--muted);font-size:13px;margin-bottom:20px;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px;}
+  .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
+  input{flex:1;min-width:220px;border:1px solid var(--line);border-radius:10px;padding:11px 13px;font-size:14px;
+    font-family:ui-monospace,Menlo,monospace;background:var(--bg);color:var(--ink);}
+  button{appearance:none;border:0;cursor:pointer;border-radius:10px;font-weight:600;padding:11px 16px;font-size:14px;}
+  button.primary{background:var(--brand);color:#fff;} button.ghost{background:var(--chip);color:var(--ink);}
+  button.danger{background:var(--err);color:#fff;} button:disabled{opacity:.5;cursor:default;}
+  .step{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:10px;}
+  .rec{border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:10px;}
+  .rowline{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;}
+  .pill{font-size:12px;font-weight:700;padding:3px 9px;border-radius:999px;}
+  .pill.completed{background:rgba(18,133,90,.12);color:var(--ok);} .pill.failed{background:rgba(192,57,43,.12);color:var(--err);}
+  .pill.op{background:var(--chip);color:var(--ink);}
+  .mods{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0;}
+  .mod{background:var(--chip);border-radius:8px;padding:6px 10px;font-size:12px;}
+  .mod b{font-weight:700;}
+  .k{color:var(--muted);font-size:12px;} .v{font-weight:600;}
+  .warn{color:var(--warn);font-size:12px;margin-top:6px;}
+  .err{color:var(--err);font-size:12px;margin-top:6px;word-break:break-word;}
+  .muted{color:var(--muted);font-size:13px;}
+  .note{font-size:13px;margin-top:10px;} .note.ok{color:var(--ok);} .note.err{color:var(--err);}
+  table{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px;}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);} th{color:var(--muted);font-weight:600;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>QC Review</h1>
+  <div class="sub">Look up a task allocation id to see what the reset/upload did, then confirm to purge its log.</div>
+
+  <div class="card">
+    <div class="bar">
+      <input id="tid" placeholder="task_allocation_id (e.g. 6a84bc5ab47b41eee8a5a799)" />
+      <button class="primary" id="lookupBtn">Look up</button>
+    </div>
+    <div id="note" class="note"></div>
+  </div>
+
+  <div id="results" style="display:none">
+    <div class="card">
+      <div class="step">Operations for this task</div>
+      <div id="records"></div>
+    </div>
+    <div class="card">
+      <div class="step">DB sessions (kept for audit)</div>
+      <div id="sessions"></div>
+    </div>
+    <div class="card">
+      <div class="bar">
+        <button class="danger" id="confirmBtn">Confirm &amp; purge log</button>
+        <span class="muted">Deletes the local QC log for this task. The reset_sessions rows stay.</span>
+      </div>
+      <div id="confirmNote" class="note"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const q = new URLSearchParams(location.search);
+  const tidEl = document.getElementById("tid");
+  if (q.get("task_allocation_id")) tidEl.value = q.get("task_allocation_id");
+  const note = document.getElementById("note");
+  const results = document.getElementById("results");
+
+  function statusPill(s){ return `<span class="pill ${s==='completed'?'completed':s==='failed'?'failed':'op'}">${s||'?'}</span>`; }
+  function modChip(name, m){
+    if (m==null) return "";
+    if (typeof m !== "object") return `<div class="mod"><b>${name}</b> ${m}</div>`;
+    const keys = ["imported_messages","manifest_messages","uploaded_files","created","replaced","deleted","missing","skipped","events","messages"];
+    const parts = keys.filter(k=>k in m).map(k=>`${k}=${m[k]}`);
+    const extra = (m.missing_attachments||[]).length ? ` · missing_att=${m.missing_attachments.length}` : "";
+    return `<div class="mod"><b>${name}</b> ${parts.join(" · ")||JSON.stringify(m).slice(0,80)}${extra}</div>`;
+  }
+
+  // Accept a pasted filename too: strip a trailing ".jsonl" and whitespace.
+  function cleanTid(){ return tidEl.value.trim().replace(/\.jsonl$/i, ""); }
+
+  async function lookup(){
+    const tid = cleanTid();
+    if (tid !== tidEl.value.trim()) tidEl.value = tid;  // reflect the cleaned id
+    if (!tid){ note.className="note err"; note.textContent="Enter a task allocation id."; return; }
+    note.className="note"; note.textContent="Loading…"; results.style.display="none";
+    try {
+      const r = await fetch("/ui/qc/"+encodeURIComponent(tid));
+      const d = await r.json();
+      renderRecords(d.log_records||[]);
+      renderSessions(d.sessions||[]);
+      results.style.display="block";
+      const purgeable = (d.log_records||[]).length>0;
+      document.getElementById("confirmBtn").disabled = !purgeable;
+      note.className="note"; note.textContent = purgeable ? "" : "No local QC log found for this task (already purged, or never ran).";
+    } catch(e){ note.className="note err"; note.textContent="Lookup failed: "+e.message; }
+  }
+
+  function renderRecords(recs){
+    const box=document.getElementById("records");
+    if(!recs.length){ box.innerHTML='<div class="muted">No log records.</div>'; return; }
+    box.innerHTML = recs.map(r=>{
+      const mods=r.modules||{};
+      const modHtml = ["gmail","drive","calendar"].map(k=>modChip(k, mods[k])).join("");
+      const warn = (r.warnings||[]).length ? `<div class="warn">⚠ ${r.skips||r.warnings.length} skip(s): ${r.warnings.slice(0,4).join("; ")}${r.warnings.length>4?'…':''}</div>` : "";
+      const err = r.error ? `<div class="err">error: ${r.error}</div>` : "";
+      return `<div class="rec">
+        <div class="rowline"><span class="pill op">${r.op||'?'}</span> ${statusPill(r.status)}
+          <span class="k">${r.completed_at||''}</span></div>
+        <div class="mods">${modHtml||'<span class="muted">no module data</span>'}</div>
+        ${warn}${err}
+        <div class="k">email: <span class="v">${r.email||''}</span> · persona: <span class="v">${r.persona||''}</span></div>
+      </div>`;
+    }).join("");
+  }
+  function renderSessions(rows){
+    const box=document.getElementById("sessions");
+    if(!rows.length){ box.innerHTML='<div class="muted">No DB sessions.</div>'; return; }
+    box.innerHTML = `<table><thead><tr><th>mode</th><th>status</th><th>completed</th><th>reset id</th></tr></thead><tbody>`+
+      rows.map(s=>`<tr><td>${s.mode||''}</td><td>${statusPill(s.status)}</td><td class="k">${s.completed_at||''}</td><td class="k">${s.reset_session_id||''}</td></tr>`).join("")+
+      `</tbody></table>`;
+  }
+
+  async function confirmPurge(){
+    const tid = cleanTid();
+    const cn = document.getElementById("confirmNote");
+    cn.className="note"; cn.textContent="Purging…";
+    try {
+      const r = await fetch("/ui/qc/"+encodeURIComponent(tid)+"/confirm", {method:"POST"});
+      const d = await r.json();
+      cn.className="note ok"; cn.textContent = d.purged ? "✅ Log purged. DB rows kept for audit." : "Nothing to purge.";
+      document.getElementById("confirmBtn").disabled = true;
+    } catch(e){ cn.className="note err"; cn.textContent="Purge failed: "+e.message; }
+  }
+
+  document.getElementById("lookupBtn").addEventListener("click", lookup);
+  tidEl.addEventListener("keydown", e=>{ if(e.key==="Enter") lookup(); });
+  document.getElementById("confirmBtn").addEventListener("click", confirmPurge);
+  if (tidEl.value) lookup();
+</script>
+</body>
+</html>

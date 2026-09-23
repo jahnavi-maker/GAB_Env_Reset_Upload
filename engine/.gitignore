@@ -1,0 +1,16 @@
+.venv/
+*.egg-info/
+.state/
+*.manifest.json
+*.dry-run.json
+config.json
+__pycache__/
+.pytest_cache/
+.DS_Store
+._*
+*.log
+artifacts/*.json
+artifacts/*.zip
+artifacts/*.py
+artifacts/ui/*-preview.html
+artifacts/verification/

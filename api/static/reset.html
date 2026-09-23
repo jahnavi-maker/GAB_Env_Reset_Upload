@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Environment Reset</title>
+<style>
+  :root {
+    --bg: #f6f3f0; --card: #ffffff; --ink: #111113; --muted: #6b6b70;
+    --brand: #175fff; --ok: #12855a; --err: #c0392b; --line: #e6e2dd;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#111113; --card:#1b1b1e; --ink:#f6f3f0; --muted:#9a9aa0; --line:#2c2c30; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+    padding: 32px 28px; width: 100%; max-width: 420px;
+    box-shadow: 0 10px 40px rgba(0,0,0,.06);
+  }
+  h1 { font-size: 19px; margin: 0 0 20px; letter-spacing: -.01em; text-align: center; }
+  .field { margin-bottom: 14px; }
+  .label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 3px; }
+  .value { font-size: 14px; font-weight: 600; word-break: break-all; }
+  .value.empty { color: var(--muted); font-weight: 400; }
+  button {
+    appearance: none; border: 0; cursor: pointer; width: 100%; margin-top: 8px;
+    background: var(--brand); color: #fff; font-size: 16px; font-weight: 600;
+    padding: 15px; border-radius: 12px; transition: opacity .15s, transform .05s;
+  }
+  button:hover { opacity: .92; }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: .5; cursor: default; }
+  .result { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); display: none; }
+  .result.show { display: block; }
+  .status { display: inline-flex; align-items: center; gap: 8px; font-weight: 700; font-size: 15px; }
+  .status.running { color: var(--brand); }
+  .status.completed { color: var(--ok); }
+  .status.failed { color: var(--err); }
+  .spinner {
+    width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent;
+    border-radius: 50%; animation: spin .7s linear infinite; display: inline-block;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .err-detail { color: var(--err); font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Environment Reset</h1>
+
+    <div class="field">
+      <div class="label">Task Allocation ID</div>
+      <div class="value empty" id="taskId">—</div>
+    </div>
+    <div class="field">
+      <div class="label">Account</div>
+      <div class="value empty" id="email">—</div>
+    </div>
+
+    <button id="resetBtn" disabled>Reset environment</button>
+
+    <div class="result" id="result">
+      <div class="field">
+        <div class="label">Status</div>
+        <div class="status" id="statusWrap">—</div>
+      </div>
+      <div class="field">
+        <div class="label">Reset ID</div>
+        <div class="value" id="sid">—</div>
+      </div>
+      <div class="err-detail" id="errDetail"></div>
+    </div>
+  </div>
+
+<script>
+  // Identity arrives in the link Cosmo builds, e.g.
+  //   /reset?task_allocation_id=<id>&email=<account>
+  // Either param is enough; the server fills in the rest from the reset table.
+  const q = new URLSearchParams(location.search);
+  const ctx = {
+    task_allocation_id: q.get("task_allocation_id") || q.get("task") || null,
+    email: q.get("email") || null,
+  };
+
+  const taskEl = document.getElementById("taskId");
+  const emailEl = document.getElementById("email");
+  const btn = document.getElementById("resetBtn");
+  const result = document.getElementById("result");
+  const sidEl = document.getElementById("sid");
+  const statusWrap = document.getElementById("statusWrap");
+  const errDetail = document.getElementById("errDetail");
+
+  function setVal(el, text) {
+    if (text) { el.textContent = text; el.classList.remove("empty"); }
+    else { el.textContent = "—"; el.classList.add("empty"); }
+  }
+
+  function renderStatus(status) {
+    statusWrap.className = "status " + (status || "");
+    if (["running", "queued", "in_progress"].includes(status)) {
+      statusWrap.innerHTML = '<span class="spinner"></span> Resetting…';
+    } else if (status === "completed") {
+      statusWrap.textContent = "✅ Completed";
+    } else if (status === "failed") {
+      statusWrap.textContent = "❌ Failed";
+    } else {
+      statusWrap.textContent = status || "—";
+    }
+  }
+
+  async function loadTask() {
+    if (!ctx.task_allocation_id && !ctx.email) {
+      setVal(taskEl, null); setVal(emailEl, null);
+      errDetailShow("No task in the link. Open the reset link from your task sheet.");
+      return;
+    }
+    const params = new URLSearchParams();
+    if (ctx.task_allocation_id) params.set("task_allocation_id", ctx.task_allocation_id);
+    else if (ctx.email) params.set("email", ctx.email);
+    try {
+      const r = await fetch("/ui/task?" + params.toString());
+      const d = await r.json();
+      ctx.task_allocation_id = d.task_allocation_id || ctx.task_allocation_id;
+      ctx.email = d.email || ctx.email;
+      setVal(taskEl, ctx.task_allocation_id);
+      setVal(emailEl, ctx.email);
+      btn.disabled = !(ctx.task_allocation_id && ctx.email);
+      if (btn.disabled) errDetailShow("Could not find your account for this task.");
+    } catch (e) {
+      setVal(taskEl, ctx.task_allocation_id);
+      setVal(emailEl, ctx.email);
+      btn.disabled = !(ctx.task_allocation_id && ctx.email);
+    }
+  }
+
+  function errDetailShow(msg) {
+    result.classList.add("show");
+    errDetail.textContent = msg;
+  }
+
+  async function poll(id) {
+    try {
+      const r = await fetch("/ui/reset/" + id);
+      const d = await r.json();
+      renderStatus(d.status);
+      if (d.status === "completed" || d.status === "failed") {
+        if (d.error) errDetail.textContent = d.error;
+        btn.disabled = false;
+        btn.textContent = "Reset again";
+        return;
+      }
+    } catch (e) { /* transient; keep polling */ }
+    setTimeout(() => poll(id), 2000);
+  }
+
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.textContent = "Resetting…";
+    errDetail.textContent = "";
+    result.classList.add("show");
+    renderStatus("running");
+    sidEl.textContent = "…";
+    try {
+      const r = await fetch("/ui/task/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: ctx.email, task_allocation_id: ctx.task_allocation_id }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || ("HTTP " + r.status));
+      sidEl.textContent = d.reset_session_id;
+      poll(d.reset_session_id);
+    } catch (e) {
+      renderStatus("failed");
+      errDetail.textContent = "Could not start reset: " + e.message;
+      btn.disabled = false;
+      btn.textContent = "Reset environment";
+    }
+  });
+
+  loadTask();
+</script>
+</body>
+</html>

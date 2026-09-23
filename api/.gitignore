@@ -1,0 +1,5 @@
+.env
+.reset_sessions.json
+__pycache__/
+*.pyc
+.venv/

@@ -1,0 +1,13 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+httpx>=0.27
+pydantic>=2.6
+
+# Upload flow reuses the seeder's in-process OAuth (materialize.auth), so the
+# serving venv needs the Google client libs too (one project, one server).
+google-api-python-client>=2.100
+google-auth>=2.30
+google-auth-httplib2>=0.2
+google-auth-oauthlib>=1.2
+# Operator onboarding UI uploads client.json (multipart form).
+python-multipart>=0.0.9

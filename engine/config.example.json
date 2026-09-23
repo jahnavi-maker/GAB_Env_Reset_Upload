@@ -1,0 +1,21 @@
+{
+  "archive": "/absolute/path/to/GAB_Ultra_Core_Environments.zip",
+  "rubrics": "/absolute/path/to/GAB_Task_Rubrics_Latest.xlsx",
+  "accounts_workbook": "/absolute/path/to/Bench_Test_Account.xlsx",
+  "client_secret": "/absolute/path/to/oauth_desktop_client_secret.json",
+  "token_dir": "/secure/path/gab-seeder/tokens",
+  "state_dir": "/secure/path/gab-seeder/state",
+  "missing_attachment_policy": "error",
+  "accounts": {
+    "Student": {"email": "test-account@example.com", "timezone": null}
+  },
+  "task_environment_overrides": {
+    "6a84bc5ab47b41eee8a5a796": "Applied_ML_and_data_scientist"
+  },
+  "github": {
+    "Backend_software_engineer": {
+      "extract_dir": "/secure/path/gab-seeder/github/backend",
+      "remote_url": "git@github.com:YOUR-TEST-ORG/gab-backend.git"
+    }
+  }
+}

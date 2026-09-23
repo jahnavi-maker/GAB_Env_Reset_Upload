@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Authorized</title>
+<style>
+  :root { --bg:#f6f3f0; --card:#fff; --ink:#111113; --muted:#6b6b70; --brand:#175fff; --ok:#12855a; --err:#c0392b; --line:#e6e2dd; }
+  @media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){ --bg:#111113; --card:#1b1b1e; --ink:#f6f3f0; --muted:#9a9aa0; --line:#2c2c30; } }
+  *{box-sizing:border-box;} body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",sans-serif;display:flex;align-items:center;justify-content:center;padding:24px;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:36px 30px;max-width:440px;width:100%;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.06);}
+  .icon{font-size:44px;margin-bottom:10px;}
+  h1{font-size:20px;margin:0 0 8px;}
+  p{color:var(--muted);font-size:14px;line-height:1.5;margin:0 0 8px;}
+  .ok h1{color:var(--ok);} .err h1{color:var(--err);}
+  a{color:var(--brand);font-weight:600;text-decoration:none;}
+  .hint{margin-top:16px;font-size:13px;}
+</style>
+</head>
+<body>
+  <div class="card" id="card">
+    <div class="icon" id="icon">✅</div>
+    <h1 id="title">Authorized</h1>
+    <p id="msg">This account is authorized. You can close this tab and return to the onboarding page to push the environment.</p>
+    <div class="hint"><a href="/onboard" target="_blank">Open onboarding ↗</a></div>
+  </div>
+<script>
+  const q = new URLSearchParams(location.search);
+  const status = q.get("authorized") || q.get("upload") || "ok";
+  const card = document.getElementById("card");
+  if (status === "error") {
+    card.classList.add("err");
+    document.getElementById("icon").textContent = "⚠️";
+    document.getElementById("title").textContent = "Authorization failed";
+    document.getElementById("msg").textContent = "Consent did not complete (it may have expired, or the account didn't match). Go back to onboarding and click Authorize again.";
+  } else {
+    card.classList.add("ok");
+  }
+</script>
+</body>
+</html>

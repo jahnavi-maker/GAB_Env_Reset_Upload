@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gab-account-seeder"
+version = "0.1.0"
+description = "Seed and reset GeminiBench Gmail, Drive, Calendar, and GitHub test environments"
+requires-python = ">=3.11"
+dependencies = [
+  "google-api-python-client>=2.160",
+  "google-auth>=2.38",
+  "google-auth-oauthlib>=1.2",
+  "ijson>=3.3",
+  "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.3"]
+
+[project.scripts]
+gab-seed = "gab_seeder.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["error"]

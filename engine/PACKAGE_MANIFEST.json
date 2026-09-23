@@ -1,0 +1,237 @@
+{
+  "package": "GAB_Environment_Reset_Pipeline_Source_2026-09-19",
+  "source_revision": "0b7f48192cebd68e13e8d847779af50579d1da75",
+  "file_count_excluding_manifest": 46,
+  "files": [
+    {
+      "path": ".gitignore",
+      "size": 218,
+      "sha256": "0ba148dcb4f58c35214c1b81e8318024235991ee339a624c4d64b1101989b37f"
+    },
+    {
+      "path": "README.md",
+      "size": 5225,
+      "sha256": "607642253bfc98416ea838cf64086eb5ebb102ab8aa46d6c34168c1f6169f2f5"
+    },
+    {
+      "path": "SOURCE_REVISION.txt",
+      "size": 41,
+      "sha256": "6499fc5c5b6546f832a48cb4868869e70a92467fb0ca3e292ed76cb76c54f654"
+    },
+    {
+      "path": "apps-script/Code.gs",
+      "size": 9467,
+      "sha256": "c285df167bcd474d822c9ad1cc6734035f07d990856ce57e2e29bed3a46c4935"
+    },
+    {
+      "path": "apps-script/Index.html",
+      "size": 20696,
+      "sha256": "31378dabc0846094f0d1f49ae30ba66657e84e9614cd737aebb9ff7956b383f2"
+    },
+    {
+      "path": "apps-script/appsscript.json",
+      "size": 309,
+      "sha256": "a63468f5ff266512bfd75e85f3b61dc8b7aacda244539cfd913ab4a45ea967fe"
+    },
+    {
+      "path": "config.example.json",
+      "size": 795,
+      "sha256": "1a0bcffa97d597dcc3d3d78a4e65b41f1c6c24ccf87b77af4c1d896ca3a3207b"
+    },
+    {
+      "path": "docs/OAUTH_AND_SCALING.md",
+      "size": 2703,
+      "sha256": "97173eed8fcc852cc17e10834dd270eb2dfd8f8906e757813a9574c2b36b277a"
+    },
+    {
+      "path": "docs/PACKAGE_SCOPE.md",
+      "size": 702,
+      "sha256": "251e078e7c6371c52b8197ce59c3a2bae13b61ac5c351437b3750a2a6e6ad84a"
+    },
+    {
+      "path": "pyproject.toml",
+      "size": 658,
+      "sha256": "9f9b0eb208cb0a7bd832fa20371910b52f7676ce7f0086bfe24b457d75d8f2c4"
+    },
+    {
+      "path": "reset_control.example.json",
+      "size": 393,
+      "sha256": "85df5b5198b961f3ebfd0c64474836554bcfe7ac28142aa5520192d4da989926"
+    },
+    {
+      "path": "scripts/compare_calendar_baseline.py",
+      "size": 4449,
+      "sha256": "316626405f8657c937ab5717cdd0f60ce8e8ea570fb19e7a1607b624c9583f81"
+    },
+    {
+      "path": "scripts/deploy_reset_console.py",
+      "size": 5624,
+      "sha256": "ec8fca93bfc81b24136c044184979d4c61f4f12374981187f8ee4d74fdf5be0c"
+    },
+    {
+      "path": "scripts/gab_reset_worker_tick.sh",
+      "size": 593,
+      "sha256": "296c95ee018591695005777da074bbdc73cc8b2090ab021d60c8886dbed40f1e"
+    },
+    {
+      "path": "scripts/reset_environment.py",
+      "size": 4683,
+      "sha256": "c5df78f571e987925ad6c82bfbc25d58dadfbe21b8bd4d11c6929572f76d80f6"
+    },
+    {
+      "path": "src/gab_seeder/__init__.py",
+      "size": 69,
+      "sha256": "979e9d50687c02d116ac524ef2d050594252022a0eab587141c0f4da64645d93"
+    },
+    {
+      "path": "src/gab_seeder/__main__.py",
+      "size": 48,
+      "sha256": "935a1c1166b0c1ea35a82256345000bf2c73ded718d77773bc27a71ecce28f7d"
+    },
+    {
+      "path": "src/gab_seeder/archive.py",
+      "size": 12606,
+      "sha256": "ef1d7039a8fef8c328472df1da046e3df085c266b4d4b2db73c4a79db2d16f4a"
+    },
+    {
+      "path": "src/gab_seeder/calendar_compare.py",
+      "size": 7797,
+      "sha256": "df36e7623c9b070c56eb55dee94b27f017d6d3a0f9ecc4d086a81928230921f4"
+    },
+    {
+      "path": "src/gab_seeder/calendar_seed.py",
+      "size": 34552,
+      "sha256": "8cc4781d6fb3b59ee3d9c5ff1ef7bb2b166db17c1901ee59d087799ee5361e22"
+    },
+    {
+      "path": "src/gab_seeder/cli.py",
+      "size": 10756,
+      "sha256": "0417b4eabc6890f34f96873aadcdf4b52ff9232f694957e16c616d80c871a5b0"
+    },
+    {
+      "path": "src/gab_seeder/config.py",
+      "size": 1579,
+      "sha256": "7f17953a8edfa373bede8b46446fbce46595c85a48cb97dddc046dd764726b69"
+    },
+    {
+      "path": "src/gab_seeder/drive.py",
+      "size": 54996,
+      "sha256": "a13524fd5f864476c45fc8789b706e3ce5382212ec168ffc405a3c3fe076a047"
+    },
+    {
+      "path": "src/gab_seeder/github_seed.py",
+      "size": 3409,
+      "sha256": "a9eb11a63940c2a17eb383be38a4d74b5d3a285ea29a5b699e8dc41c8a0882c7"
+    },
+    {
+      "path": "src/gab_seeder/gmail.py",
+      "size": 44530,
+      "sha256": "17d3b2081fdebda336de49bb5bf56b2725adcdc3670eafc7094bde75470b6636"
+    },
+    {
+      "path": "src/gab_seeder/google_auth.py",
+      "size": 3959,
+      "sha256": "067dbed7e2bfde71ae44c7e7d6f04bc8da85e1bb8c2fc5fdfb4c58707ce61edf"
+    },
+    {
+      "path": "src/gab_seeder/manifest.py",
+      "size": 1296,
+      "sha256": "870340cd4d12e2c54e9f59023054c4263c4925f0e6e6051599c39300e30ab49e"
+    },
+    {
+      "path": "src/gab_seeder/preflight.py",
+      "size": 5989,
+      "sha256": "3b4e51d931f411f3f91d1943ef2114992f690b2a1f4a3ff3be8c9b0b0a20b4b9"
+    },
+    {
+      "path": "src/gab_seeder/reset_queue.py",
+      "size": 11338,
+      "sha256": "57d5e12cef011a2c033506441612f88fc7fd55b45742467a5212dd963d6d815f"
+    },
+    {
+      "path": "src/gab_seeder/reset_worker.py",
+      "size": 18602,
+      "sha256": "b0af9d96d59020888d4d136fe5573556722cee2c3fa607645a7a83776af1e24d"
+    },
+    {
+      "path": "src/gab_seeder/seeder.py",
+      "size": 19231,
+      "sha256": "9231164060d16d53c9e400b86c4a799c0de5d367b21bc02b10eacda551ab1b59"
+    },
+    {
+      "path": "tests/conftest.py",
+      "size": 498,
+      "sha256": "adc5c264edcd35305ceaa9d85c00d4997bc534f9453a80943b560c6f65b72a6d"
+    },
+    {
+      "path": "tests/test_apps_script_contract.py",
+      "size": 2594,
+      "sha256": "ca6954680b744248fe652c282a6e46b59fbcce4855cc447bc787f834eaa0b8f2"
+    },
+    {
+      "path": "tests/test_archive.py",
+      "size": 1143,
+      "sha256": "bd5682a81d4c275119c16aeaa39461a97d276ad822cf70a362619669b81903dc"
+    },
+    {
+      "path": "tests/test_calendar_compare.py",
+      "size": 2489,
+      "sha256": "ef873389ba4a7a75423e79a2f5457a9742fbed569fb8f06f696113e284802193"
+    },
+    {
+      "path": "tests/test_calendar_delta.py",
+      "size": 13894,
+      "sha256": "9dbec20c1957c7ea4bd766005c5c5318f7085ff4751c5af906f16ffdc8d64466"
+    },
+    {
+      "path": "tests/test_calendar_reliability.py",
+      "size": 7580,
+      "sha256": "4dbc0dc081b7daf33db47374f6a38cb49b6026428fcc14e2418972d32286adbb"
+    },
+    {
+      "path": "tests/test_delta.py",
+      "size": 55890,
+      "sha256": "1609c3431059527f639509a5a0e1cca273caa5f51c031235db1e8f284180a8dc"
+    },
+    {
+      "path": "tests/test_drive_reliability.py",
+      "size": 11764,
+      "sha256": "a55aab888f6a3292f1be4c8cf0f6b91e1e8d30bf5d24700a77d5274b46d579b5"
+    },
+    {
+      "path": "tests/test_dry_run.py",
+      "size": 4024,
+      "sha256": "b12c32d635b407ca867d7ed3ac00535aa20ac60e282bbfb015d47de3975c480b"
+    },
+    {
+      "path": "tests/test_gmail.py",
+      "size": 6446,
+      "sha256": "6d7a58a7c9f40f5b8e4df91acd146b3eb96fbe8aeff8173c33e5baaa545d70a2"
+    },
+    {
+      "path": "tests/test_google_auth.py",
+      "size": 2516,
+      "sha256": "f45787141ae9d9340c984d74d20e332439b8040b6da00788eca3bd0ca6956232"
+    },
+    {
+      "path": "tests/test_reset.py",
+      "size": 2855,
+      "sha256": "3d233126286705cd11d17fb381ca88fa78107988132b8a6d6caa29593bc22a00"
+    },
+    {
+      "path": "tests/test_reset_queue.py",
+      "size": 14901,
+      "sha256": "571fbe8bd816c019048bbf55ba56c179b4b2ea97865cd068f1bf7ee99a0421b7"
+    },
+    {
+      "path": "tests/test_reset_script.py",
+      "size": 3675,
+      "sha256": "7400758f66e4664d34d1917f8259acc2ce0a49202e211937e9fd60decb06ecf3"
+    },
+    {
+      "path": "tests/test_seed_tags.py",
+      "size": 292,
+      "sha256": "200d620b19ceeb81fb25eb7b529e25e3d98b7868c63101536dfa0667f9d1b0d8"
+    }
+  ]
+}

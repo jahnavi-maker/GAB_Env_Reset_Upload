@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GAB seed — request for the Workspace admin</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  * { box-sizing: border-box; }
+  body {
+    font: 11.5pt/1.45 "Helvetica Neue", Helvetica, Arial, sans-serif;
+    color: #122018;
+    margin: 0;
+  }
+  h1 {
+    font-size: 18pt;
+    margin: 0 0 4px;
+    color: #0b3d2c;
+  }
+  .sub {
+    color: #3d5a4c;
+    font-size: 10.5pt;
+    margin: 0 0 16px;
+  }
+  h2 {
+    font-size: 12.5pt;
+    margin: 18px 0 8px;
+    color: #0b3d2c;
+    border-bottom: 1px solid #c5d9cc;
+    padding-bottom: 3px;
+  }
+  h1.part {
+    font-size: 15pt;
+    margin: 22px 0 8px;
+    page-break-before: always;
+  }
+  .cmd {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 8.8pt;
+    line-height: 1.45;
+    background: #122018;
+    color: #e8f6ee;
+    padding: 10px 12px;
+    margin: 8px 0 12px;
+    white-space: pre-wrap;
+    border-radius: 6px;
+  }
+  p { margin: 0 0 10px; }
+  ol, ul { margin: 0 0 10px; padding-left: 22px; }
+  li { margin: 0 0 6px; }
+  .box {
+    background: #f3f8f4;
+    border: 1px solid #c5d9cc;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 10px 0 12px;
+  }
+  .scopes {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 8.6pt;
+    line-height: 1.4;
+    word-break: break-all;
+    background: #fff;
+    border: 1px solid #c5d9cc;
+    padding: 8px 10px;
+    margin: 8px 0 12px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 8px 0 12px;
+    font-size: 10.5pt;
+  }
+  th, td {
+    border: 1px solid #c5d9cc;
+    padding: 6px 8px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: #e6f2ea; color: #0b3d2c; }
+  .note { color: #3d5a4c; font-size: 10pt; }
+  .ok { color: #0b3d2c; font-weight: 600; }
+</style>
+</head>
+<body>
+  <h1>GAB seed — admin unlock + bulk upload</h1>
+  <p class="sub">Domain: deccanexperts.us · Part 1 is one-time Google admin work · Part 2 is how we push all 200 from the tool</p>
+
+  <p>We need to load Calendar, Gmail, and Drive persona data into the 200 demo mailboxes
+  <strong>user1@deccanexperts.us</strong> through <strong>user200@deccanexperts.us</strong>.
+  The operator cannot do this from a normal Google login. A normal login can only write
+  into its own mailbox. Google only allows a bulk write after a Workspace Super Admin
+  turns on domain-wide delegation and sends us one service-account key.</p>
+
+  <p>We do <strong>not</strong> need passwords. We do <strong>not</strong> need 200 people added to OAuth test users.</p>
+
+  <h2>Part 1 — Unlock the 200 accounts in Google (you do this once)</h2>
+  <h2>What to send back</h2>
+  <table>
+    <tr><th>Item</th><th>What we need</th></tr>
+    <tr><td>1. JSON key file</td><td>The service-account key you download in step 2 below (a <code>.json</code> file). Send it privately — Drive restricted link or 1:1 chat. Do not put it in email to a wide list or in git.</td></tr>
+    <tr><td>2. Confirmation</td><td>Domain-wide delegation is saved with the exact scopes below, using this key’s numeric Client ID.</td></tr>
+    <tr><td>3. Licence check</td><td>All 200 users have a paid Workspace licence that includes Gmail, Calendar, and Drive (not Cloud Identity Free).</td></tr>
+  </table>
+
+  <h2>Step 1 — Google Cloud project</h2>
+  <ol>
+    <li>Open <strong>https://console.cloud.google.com</strong> and pick the project used for this work (or create one).</li>
+    <li>APIs &amp; Services → Library. Enable if not already on: <strong>Gmail API</strong>, <strong>Google Calendar API</strong>, <strong>Google Drive API</strong>.</li>
+  </ol>
+
+  <h2>Step 2 — create the service account and download the key</h2>
+  <ol>
+    <li>IAM &amp; Admin → Service accounts → <strong>+ Create service account</strong>.</li>
+    <li>Name it <strong>gab-seed</strong>. Create and continue. Skip optional roles. Done.</li>
+    <li>Open <strong>gab-seed</strong> → Keys → Add key → Create new key → <strong>JSON</strong> → Create.</li>
+    <li>Save the downloaded file. Send that file to the operator.</li>
+    <li>On the same service account, Details tab: copy the numeric <strong>Unique ID / Client ID</strong> (a long number). Do not use the <code>@….iam.gserviceaccount.com</code> email.</li>
+  </ol>
+
+  <h2>Step 3 — allow that key to act as any @deccanexperts.us user</h2>
+  <ol>
+    <li>Open <strong>https://admin.google.com</strong> as a Super Admin for <strong>deccanexperts.us</strong>.</li>
+    <li>Security → Access and data control → API controls → <strong>Domain-wide delegation</strong> → Manage Domain Wide Delegation → <strong>Add new</strong>.</li>
+    <li>Client ID = the numeric ID from step 2.</li>
+    <li>OAuth scopes = paste this entire line, commas included, with no extra spaces at the ends:</li>
+  </ol>
+  <div class="scopes">openid,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/gmail.modify,https://www.googleapis.com/auth/calendar,https://www.googleapis.com/auth/drive</div>
+  <p>Click <strong>Authorize</strong>.</p>
+
+  <div class="box">
+    <p class="ok">What this grants</p>
+    <p>The key may act as any user on <strong>deccanexperts.us</strong>, only for the APIs in that scope list (identify the user, Gmail modify, Calendar, Drive). Keep the JSON file private. Revoke the Client ID in Domain-wide delegation if the key is leaked.</p>
+  </div>
+
+  <h2>Step 4 — licences</h2>
+  <p>In Admin console → Directory → Users, confirm <code>user1@deccanexperts.us</code> … <code>user200@deccanexperts.us</code> each have a paid Workspace licence that includes Gmail, Calendar, and Drive.</p>
+
+  <p class="note">If admin.google.com does not show Domain-wide delegation, the signed-in account is not a Super Admin. This request has to be done by the person who created the 200 accounts, or they must make the operator a Super Admin.</p>
+
+  <h1 class="part">Part 2 — How to bulk upload from the GAB seed tool</h1>
+  <p class="sub">Do this only after Part 1 is finished and you have the JSON key. Nobody clicks Authorize 200 times.</p>
+
+  <p>The tool is a local site on the operator’s laptop. It reads the 200-row mapping CSV, matches each row to a persona (Applied ML, Backend, Indie game designer, Student), and writes Calendar / Gmail / Drive into that user’s Google account. <strong>Push all matched accounts</strong> does the 200 in parallel (4 at a time).</p>
+
+  <h2>What you need on the laptop</h2>
+  <ul>
+    <li>The <strong>gab-workspace-seed</strong> folder (the tool)</li>
+    <li>The service-account <strong>JSON key</strong> from Part 1 (example path below: <code>/Users/divya/Downloads/gab-sa.json</code>)</li>
+    <li>The 200-row <strong>Account mapping</strong> CSV (columns used: <code>gmail</code> and <code>Persona loaded</code>)</li>
+  </ul>
+
+  <h2>Step 5 — start the tool in company mode</h2>
+  <p>Stop any old copy of the tool. In Terminal, run this (change the JSON path if the key is saved somewhere else):</p>
+  <div class="cmd">export ENV_LOADER_AUTH_BACKEND=workspace_delegation
+export ENV_LOADER_SA_KEY=/Users/divya/Downloads/gab-sa.json
+export ENV_LOADER_WORKSPACE_DOMAIN=deccanexperts.us
+export GAB_PUSH_WORKERS=4
+cd /path/to/gab-workspace-seed
+./start.sh</div>
+  <p>Open <strong>http://127.0.0.1:8765</strong> and hard-refresh (Cmd+Shift+R). Auth should say <strong>workspace_delegation</strong>. There is <strong>no Authorize</strong> button. That is correct.</p>
+
+  <h2>Step 6 — load all 200, then push</h2>
+  <ol>
+    <li>Click <strong>Choose CSV</strong> and pick the Account mapping sheet (200 rows of <code>userN@deccanexperts.us</code>).</li>
+    <li>Check the table: each row should show the right email and persona (from <strong>Persona loaded</strong>). Calendar / Gmail / Drive should already say <strong>persona</strong>.</li>
+    <li>Open <strong>05 · Push</strong>. Leave Calendar, Gmail, and Drive on. Leave the usual options on (replace previous seed, make Gmail dates recent) unless you were told otherwise.</li>
+    <li>Click <strong>Push all matched accounts</strong>. Do not click other buttons while it runs. The page will block them.</li>
+    <li>Watch the job log. It processes <strong>4 accounts at a time</strong>. A red <strong>FAIL</strong> line is one account/stage that did not land; the rest keep going.</li>
+  </ol>
+
+  <div class="box">
+    <p class="ok">When it is done</p>
+    <p>Those 200 mailboxes already contain the persona Calendar, Gmail, and Drive data. Annotators sign into Gemini as <code>userN@deccanexperts.us</code> as a populated user. They do not use this tool.</p>
+  </div>
+
+  <h2>If something is wrong in the tool</h2>
+  <table>
+    <tr><th>What you see</th><th>What to do</th></tr>
+    <tr><td>Site still asks to Authorize, or Push all is missing</td><td>The tool was started without the four <code>export</code> lines. Stop it and do Step 5 again.</td></tr>
+    <tr><td>Emails are not <code>@deccanexperts.us</code></td><td>Wrong CSV, or the sheet’s <code>gmail</code> column was not used. Re-upload the mapping file.</td></tr>
+    <tr><td>FAIL about domain / not authorized / insufficient permission</td><td>Part 1 is incomplete: wrong Client ID, wrong scopes, or the JSON key does not match Domain-wide delegation.</td></tr>
+    <tr><td>One row failed, others succeeded</td><td>Read the FAIL line (account + stage + error). Fix that user and push that row again. You do not re-do all 200.</td></tr>
+  </table>
+  <p class="note">Failures also sit on disk in <code>runs/&lt;run-id&gt;/failures.log</code> and <code>jobs/&lt;job-id&gt;.log</code> inside the tool folder. The 200 users cannot see those logs.</p>
+</body>
+</html>

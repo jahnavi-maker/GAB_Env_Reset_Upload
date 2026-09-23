@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GAB Onboarding</title>
+<style>
+  :root { --bg:#f6f3f0; --card:#fff; --ink:#111113; --muted:#6b6b70; --brand:#175fff;
+    --ok:#12855a; --err:#c0392b; --warn:#b8860b; --line:#e6e2dd; --chip:#eef1f6; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#111113; --card:#1b1b1e; --ink:#f6f3f0; --muted:#9a9aa0; --line:#2c2c30; --chip:#23232a; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); padding:24px 16px;
+    font-family:-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",sans-serif; }
+  .wrap { max-width:960px; margin:0 auto; }
+  h1 { font-size:22px; margin:0 0 4px; letter-spacing:-.01em; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:22px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; margin-bottom:16px; }
+  .step { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin-bottom:10px; }
+  label.file, button { appearance:none; border:0; cursor:pointer; border-radius:10px; font-weight:600; }
+  button.primary, label.file { background:var(--brand); color:#fff; padding:11px 16px; font-size:14px; display:inline-block; }
+  button.ghost { background:var(--chip); color:var(--ink); padding:9px 14px; font-size:13px; }
+  button.mini { padding:6px 11px; font-size:12px; }
+  button:disabled { opacity:.45; cursor:default; }
+  textarea { width:100%; min-height:110px; border:1px solid var(--line); border-radius:10px; padding:10px 12px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; background:var(--bg); color:var(--ink); resize:vertical; }
+  .hint { color:var(--muted); font-size:12px; }
+  .note { font-size:12px; margin-top:8px; }
+  .note.ok{color:var(--ok);} .note.err{color:var(--err);} .note.warn{color:var(--warn);}
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.03em; }
+  td.email { word-break:break-all; }
+  .persona.bad { color:var(--err); }
+  .st { font-weight:700; display:inline-flex; align-items:center; gap:6px; }
+  .st.idle{color:var(--muted);} .st.authorizing{color:var(--warn);} .st.authorized{color:var(--brand);}
+  .st.running,.st.queued{color:var(--brand);} .st.completed{color:var(--ok);} .st.failed{color:var(--err);}
+  .spin { width:12px;height:12px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite;display:inline-block; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  a.authlink { color:var(--brand); font-weight:600; text-decoration:none; font-size:12px; }
+  .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .counts { font-size:13px; color:var(--muted); margin-left:auto; }
+  .rid { font-family:ui-monospace,monospace; font-size:11px; color:var(--muted); word-break:break-all; }
+  .actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>GAB Onboarding</h1>
+  <div class="sub">Load accounts, add the OAuth client, authorize each account, then push the first environment. Consumer Google accounts only.</div>
+
+  <!-- Step 1: CSV -->
+  <div class="card">
+    <div class="step">1 · Accounts (CSV)</div>
+    <textarea id="csv" placeholder="email, persona&#10;geminiapp.gab.demo.user411@gmail.com, Applied_ML_and_data_scientist&#10;geminiapp.gab.demo.user414@gmail.com, Backend_software_engineer"></textarea>
+    <div class="bar" style="margin-top:10px">
+      <label class="file">Choose CSV<input id="csvFile" type="file" accept=".csv,text/csv,text/plain" hidden></label>
+      <button class="ghost" id="loadBtn">Load accounts</button>
+      <span class="hint">Each line: <b>email, persona</b>. Persona = archive key (extra columns like passwords are ignored).</span>
+    </div>
+  </div>
+
+  <!-- Step 2: client.json -->
+  <div class="card">
+    <div class="step">2 · OAuth client (client.json)</div>
+    <label class="file">Choose client.json<input id="clientFile" type="file" accept=".json,application/json" hidden></label>
+    <span id="clientName" class="hint">Checking…</span>
+    <div id="clientNote" class="note"></div>
+  </div>
+
+  <!-- Step 3: authorize + upload -->
+  <div class="card" id="tableCard" style="display:none">
+    <div class="step">3 · Authorize &amp; upload</div>
+    <div class="bar" style="margin-bottom:10px">
+      <button class="ghost" id="authAll">Authorize all</button>
+      <button class="primary" id="bulkUpload">Bulk upload all</button>
+      <button class="ghost" id="recoverAll">Retry skipped (all)</button>
+      <button class="ghost" id="refreshAll">Refresh</button>
+      <span class="counts" id="counts"></span>
+    </div>
+    <div style="overflow:auto">
+    <table>
+      <thead><tr><th>Account</th><th>Persona</th><th>Actions</th><th>Status</th><th>Reset ID</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    </div>
+    <div class="hint" style="margin-top:10px">Authorize (per account) writes <b>gab_accounts</b>. Upload / Bulk upload wipes &amp; seeds the CSV persona (writes <b>reset_sessions</b> + manifest), bounded-parallel for large batches. Retry skipped runs a delta for missing/failed items.</div>
+  </div>
+</div>
+
+<script>
+  const KNOWN = ["Applied_ML_and_data_scientist","Backend_software_engineer","Creative_producer_and_marketer",
+    "Educator_and_instructional_designer","Ghostwriter_and_nonfiction_author","Household_manager_and_parent",
+    "Independent_consultant","Independent_financial_planner","Indie_game_designer","Legal_and_contracts_analyst",
+    "Life_Sciences_Researcher","Luxury_travel_advisor","Residential_real_estate_agent","Solo_operator_and_owner",
+    "Startup_founder","Student","Travel_and_trip_planner"];
+  const norm = s => (s||"").toLowerCase().replace(/[^a-z0-9]+/g,"");
+  const KEYMAP = Object.fromEntries(KNOWN.map(k => [norm(k), k]));
+  const resolvePersona = raw => KEYMAP[norm(raw)] || null;
+
+  let clientReady = false;
+  const rows = [];  // {email, persona, rawP, valid, authorized, status, sid, uid}
+
+  // --- Step 2: detect existing client, allow re-upload ---
+  const clientNote = document.getElementById("clientNote");
+  const clientName = document.getElementById("clientName");
+  async function checkClient(){
+    try {
+      const r = await fetch("/ui/client"); const d = await r.json();
+      if (d && d.present) { clientReady = true; clientName.textContent = "A client is already configured ✓ (upload to replace)"; }
+      else { clientReady = false; clientName.textContent = "No client configured — upload client.json before authorizing."; }
+    } catch(e){ clientReady=false; clientName.textContent="No client configured — upload client.json before authorizing."; }
+    renderRows();
+  }
+  document.getElementById("clientFile").addEventListener("change", async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    clientName.textContent = f.name; clientNote.textContent = "Uploading…"; clientNote.className="note";
+    const fd = new FormData(); fd.append("file", f);
+    try {
+      const r = await fetch("/ui/client", { method:"POST", body:fd }); const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
+      clientReady = true;
+      const missing = d.missing_redirects || [];
+      if (missing.length) { clientNote.className="note warn"; clientNote.textContent="Saved. Also register these redirect URIs in Google: "+missing.join(", "); }
+      else { clientNote.className="note ok"; clientNote.textContent="Client saved ✓"; }
+      renderRows();
+    } catch(err){ clientReady=false; clientNote.className="note err"; clientNote.textContent="Rejected: "+err.message; }
+  });
+
+  // --- Step 1: CSV ---
+  document.getElementById("csvFile").addEventListener("change", (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    const rd = new FileReader(); rd.onload = () => { document.getElementById("csv").value = rd.result; }; rd.readAsText(f);
+  });
+  document.getElementById("loadBtn").addEventListener("click", loadCsv);
+
+  function loadCsv(){
+    const text = document.getElementById("csv").value;
+    rows.length = 0;
+    for (const line of text.split(/\r?\n/)) {
+      const t = line.trim(); if (!t) continue;
+      const parts = t.split(/[,\t]/).map(x=>x.trim()).filter(x=>x.length);
+      const email = parts.find(p => p.includes("@")); if (!email) continue;
+      if (/^e?mail$/i.test(email)) continue;
+      let persona=null, rawP=null;
+      for (let i=parts.length-1;i>=0;i--){ if (parts[i]===email) continue; const r=resolvePersona(parts[i]); if(r){persona=r;rawP=parts[i];break;} if(rawP===null) rawP=parts[i]; }
+      rows.push({ email:email.toLowerCase(), persona, rawP, valid:!!persona, authorized:false, status:"idle", sid:null, uid:null });
+    }
+    document.getElementById("tableCard").style.display = rows.length ? "block" : "none";
+    renderRows();
+    rows.forEach((row,i)=> refreshAuth(i));  // pre-mark already-authorized accounts
+  }
+
+  function renderRows(){
+    const tb = document.getElementById("rows"); tb.innerHTML="";
+    rows.forEach((row,i) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        `<td class="email">${row.email}</td>`+
+        `<td class="persona ${row.valid?"":"bad"}">${row.valid?row.persona:("? "+(row.rawP||"missing"))}</td>`+
+        `<td></td>`+
+        `<td><span class="st ${row.status}">${statusLabel(row)}</span></td>`+
+        `<td class="rid">${row.sid||""}</td>`;
+      const act = tr.children[2]; const box=document.createElement("div"); box.className="actions"; act.appendChild(box);
+
+      const authBtn=document.createElement("button"); authBtn.className="ghost mini";
+      authBtn.textContent = row.authorized ? "Re-authorize" : "Authorize";
+      authBtn.disabled = !clientReady || !row.valid;
+      authBtn.onclick=()=>startAuthorize(i); box.appendChild(authBtn);
+      if (row.authUrl && row.status==="authorizing"){ const a=document.createElement("a"); a.href=row.authUrl; a.target="_blank"; a.className="authlink"; a.textContent="open consent ↗"; box.appendChild(a); }
+
+      const upBtn=document.createElement("button"); upBtn.className="ghost mini"; upBtn.textContent="Upload";
+      upBtn.disabled = !row.authorized || ["running","queued"].includes(row.status);
+      upBtn.onclick=()=>startSeed(i); box.appendChild(upBtn);
+
+      if (["completed","failed"].includes(row.status)){ const rb=document.createElement("button"); rb.className="ghost mini"; rb.textContent="Retry skipped"; rb.title="Delta: re-push missing/failed items"; rb.onclick=()=>startRecover(i); box.appendChild(rb); }
+      tb.appendChild(tr);
+    });
+    updateCounts();
+  }
+  function statusLabel(row){
+    if(!row.valid) return "unknown persona";
+    if(row.status==="idle") return row.authorized ? "authorized ✓" : "ready";
+    if(row.status==="authorizing") return '<span class="spin"></span> awaiting consent';
+    if(row.status==="authorized") return "authorized ✓";
+    if(row.status==="running"||row.status==="queued") return '<span class="spin"></span> seeding…';
+    if(row.status==="completed") return "✅ uploaded";
+    if(row.status==="failed") return "❌ "+(row.error||"failed");
+    return row.status;
+  }
+  function updateCounts(){
+    const auth=rows.filter(r=>r.authorized).length;
+    const done=rows.filter(r=>r.status==="completed").length;
+    const fail=rows.filter(r=>r.status==="failed").length;
+    document.getElementById("counts").textContent = `${auth} authorized · ${done} uploaded · ${fail} failed · ${rows.length} total`;
+  }
+
+  async function refreshAuth(i){
+    const row=rows[i]; if(!row.valid) return;
+    try { const r=await fetch("/ui/account?email="+encodeURIComponent(row.email)); const d=await r.json();
+      if (d.authorized && !row.authorized){ row.authorized=true; if(row.status==="idle"||row.status==="authorizing") row.status="authorized"; renderRows(); } }
+    catch(e){}
+  }
+
+  async function startAuthorize(i){
+    const row=rows[i]; if(!clientReady||!row.valid) return;
+    row.status="authorizing"; row.error=null; renderRows();
+    try {
+      const r=await fetch("/ui/authorize",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:row.email,persona:row.persona})});
+      const d=await r.json(); if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
+      row.authUrl=d.auth_url; window.open(d.auth_url,"_blank"); renderRows();
+      pollAuth(i, 0);
+    } catch(err){ row.status="failed"; row.error=err.message; renderRows(); }
+  }
+  async function pollAuth(i, n){
+    const row=rows[i]; if(row.authorized) return;
+    await refreshAuth(i);
+    if(row.authorized) return;
+    if(n>100) return;  // ~5 min
+    setTimeout(()=>pollAuth(i, n+1), 3000);
+  }
+
+  async function startSeed(i){
+    const row=rows[i]; if(!row.authorized||!row.valid) return;
+    row.status="running"; row.error=null; renderRows();
+    try {
+      const r=await fetch("/ui/seed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:row.email,persona:row.persona})});
+      const d=await r.json(); if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
+      row.uid=d.reset_session_id; row.sid=d.reset_session_id; renderRows(); pollSeed(i);
+    } catch(err){ row.status="failed"; row.error=err.message; renderRows(); }
+  }
+  async function pollSeed(i){
+    const row=rows[i]; if(!row.uid) return;
+    try { const r=await fetch("/ui/upload/"+row.uid); const d=await r.json();
+      if(d.status && d.status!==row.status){ row.status=d.status; row.error=d.error; renderRows(); }
+      if(["completed","failed"].includes(d.status)) return; } catch(e){}
+    setTimeout(()=>pollSeed(i), 3000);
+  }
+
+  async function startRecover(i){
+    const row=rows[i]; if(!row.valid) return;
+    row.status="running"; row.error=null; renderRows();
+    try {
+      const r=await fetch("/ui/recover",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:row.email,persona:row.persona})});
+      const d=await r.json(); if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
+      row.uid=d.reset_session_id; row.sid=d.reset_session_id; renderRows(); pollSeed(i);
+    } catch(err){ row.status="failed"; row.error=err.message; renderRows(); }
+  }
+
+  document.getElementById("authAll").addEventListener("click", ()=>{ rows.forEach((row,i)=>{ if(clientReady&&row.valid&&!row.authorized&&row.status!=="authorizing") startAuthorize(i); }); });
+  document.getElementById("bulkUpload").addEventListener("click", ()=>{ rows.forEach((row,i)=>{ if(row.authorized&&["idle","authorized","failed","completed"].includes(row.status)) startSeed(i); }); });
+  document.getElementById("recoverAll").addEventListener("click", ()=>{ rows.forEach((row,i)=>{ if(row.valid&&["completed","failed"].includes(row.status)) startRecover(i); }); });
+  document.getElementById("refreshAll").addEventListener("click", ()=>{ rows.forEach((r,i)=>{ refreshAuth(i); if(r.uid) pollSeed(i); }); });
+
+  checkClient();
+</script>
+</body>
+</html>
