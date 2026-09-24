@@ -73,6 +73,18 @@ def classify_content(record: dict[str, Any]) -> str:
 
 
 def decode_content(record: dict[str, Any]) -> bytes:
+    # Cached record (see drive_cache.py): bytes already decoded to a file. Read them
+    # directly — no base64 round-trip. These are the SAME bytes decode_content would
+    # have produced from the zip, so sha256/md5/size fingerprints are unchanged.
+    content_path = record.get("content_path")
+    if content_path is not None:
+        data = Path(content_path).read_bytes()
+        declared = record.get("size_bytes", record.get("size"))
+        if declared is not None and len(data) != int(declared):
+            raise ArchiveError(
+                f"cached size mismatch for {record.get('path')!r}: read={len(data)} declared={declared}"
+            )
+        return data
     content = record.get("content")
     if not isinstance(content, str):
         raise ArchiveError(f"file {record.get('path')!r} has no string content")

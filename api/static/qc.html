@@ -40,7 +40,7 @@
 <body>
 <div class="wrap">
   <h1>QC Review</h1>
-  <div class="sub">Look up a task allocation id to see what the reset/upload did, then confirm to purge its log.</div>
+  <div class="sub">Look up a task allocation id to see what the reset/upload did. Logs are retained for audit and purged automatically; QC is review-only.</div>
 
   <div class="card">
     <div class="bar">
@@ -58,13 +58,6 @@
     <div class="card">
       <div class="step">DB sessions (kept for audit)</div>
       <div id="sessions"></div>
-    </div>
-    <div class="card">
-      <div class="bar">
-        <button class="danger" id="confirmBtn">Confirm &amp; purge log</button>
-        <span class="muted">Deletes the local QC log for this task. The reset_sessions rows stay.</span>
-      </div>
-      <div id="confirmNote" class="note"></div>
     </div>
   </div>
 </div>
@@ -100,9 +93,8 @@
       renderRecords(d.log_records||[]);
       renderSessions(d.sessions||[]);
       results.style.display="block";
-      const purgeable = (d.log_records||[]).length>0;
-      document.getElementById("confirmBtn").disabled = !purgeable;
-      note.className="note"; note.textContent = purgeable ? "" : "No local QC log found for this task (already purged, or never ran).";
+      const hasLog = (d.log_records||[]).length>0;
+      note.className="note"; note.textContent = hasLog ? "" : "No local QC log found for this task (already purged, or never ran).";
     } catch(e){ note.className="note err"; note.textContent="Lookup failed: "+e.message; }
   }
 
@@ -131,21 +123,8 @@
       `</tbody></table>`;
   }
 
-  async function confirmPurge(){
-    const tid = cleanTid();
-    const cn = document.getElementById("confirmNote");
-    cn.className="note"; cn.textContent="Purging…";
-    try {
-      const r = await fetch("/ui/qc/"+encodeURIComponent(tid)+"/confirm", {method:"POST"});
-      const d = await r.json();
-      cn.className="note ok"; cn.textContent = d.purged ? "✅ Log purged. DB rows kept for audit." : "Nothing to purge.";
-      document.getElementById("confirmBtn").disabled = true;
-    } catch(e){ cn.className="note err"; cn.textContent="Purge failed: "+e.message; }
-  }
-
   document.getElementById("lookupBtn").addEventListener("click", lookup);
   tidEl.addEventListener("keydown", e=>{ if(e.key==="Enter") lookup(); });
-  document.getElementById("confirmBtn").addEventListener("click", confirmPurge);
   if (tidEl.value) lookup();
 </script>
 </body>

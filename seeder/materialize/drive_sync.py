@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import socket
 import time
 from collections.abc import Callable
 from typing import Any
@@ -24,6 +25,15 @@ def _retry(fn, log: Callable[[str], None], tries: int = 6):
             status = getattr(exc.resp, "status", None)
             if status in (403, 429, 500, 503) and i < tries - 1:
                 log(f"Drive API {status}, retrying in {delay:.0f}s")
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
+            raise
+        except (socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
+            # Network stall (now surfaced by the global socket timeout instead of
+            # hanging forever). Retry like a transient 5xx rather than aborting.
+            if i < tries - 1:
+                log(f"Drive network stall ({type(exc).__name__}), retrying in {delay:.0f}s")
                 time.sleep(delay)
                 delay = min(delay * 2, 30)
                 continue

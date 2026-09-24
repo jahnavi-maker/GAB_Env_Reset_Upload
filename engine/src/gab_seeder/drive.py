@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
 import random
 import time
@@ -12,6 +13,7 @@ from typing import Any, Callable
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
 
+from . import drive_cache
 from .archive import EnvironmentArchive, decode_content, record_mime, rfc3339, safe_relpath
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -28,13 +30,33 @@ _INCLUDE_GITHUB = os.environ.get("GAB_DRIVE_INCLUDE_GITHUB", "1").strip().lower(
 }
 
 
+def _iter_filesystem_records(archive: EnvironmentArchive, persona: str):
+    """Filesystem Drive records, from the on-disk cache when enabled, else the zip.
+
+    The cache (opt-in, GAB_DRIVE_CACHE=1) decodes a persona's files once and serves
+    identical bytes on later runs — a big win for bulk uploads where many accounts
+    share a persona. It only applies to a real EnvironmentArchive (test doubles use
+    the direct path), and ANY cache error falls back to reading the zip, so behavior
+    and fingerprints are never at risk.
+    """
+    if drive_cache.enabled() and isinstance(archive, EnvironmentArchive):
+        try:
+            drive_cache.ensure(archive, persona)
+            yield from drive_cache.iter_cached(persona)
+            return
+        except Exception:  # noqa: BLE001 - cache must never break seeding
+            log = logging.getLogger("gab_seeder.drive")
+            log.warning("drive cache unavailable for %s; reading archive directly", persona, exc_info=True)
+    yield from archive.iter_files(persona)
+
+
 def _iter_drive_records(archive: EnvironmentArchive, persona: str):
     """Desired Drive records = filesystem files (+ GitHub files as Drive content).
 
     Single source of truth for every Drive desired-state builder (folders, files,
     seed, delta, verify) so GitHub is treated identically to normal Drive files.
     """
-    yield from archive.iter_files(persona)
+    yield from _iter_filesystem_records(archive, persona)
     # Duck-typed so lightweight test archives without a GitHub service are unaffected.
     services = getattr(archive, "services", None)
     iter_github = getattr(archive, "iter_github_files", None)

@@ -35,6 +35,8 @@ class UploadRequest(BaseModel):
     # for Google access (OAuth handles that).
     password: Optional[str] = Field(default=None, repr=False, exclude=True)
     services: Optional[list[str]] = Field(default=None, description="subset of drive,gmail,calendar")
+    # Local path to return the browser to after OAuth consent (operator UI only).
+    return_to: Optional[str] = Field(default=None, description="e.g. /onboard/authorize")
 
     @field_validator("email")
     @classmethod
@@ -43,21 +45,50 @@ class UploadRequest(BaseModel):
         if "@" not in v or "." not in v.split("@")[-1]:
             raise ValueError("email must be a valid address")
         return v
+
+
+class TaskLookupRequest(BaseModel):
+    """Body for POST /ui/task: look up an account for the reset page.
+
+    Preferred: a signed ``token`` (the freelancer link carries it) — the server
+    verifies it and derives the task id, so the freelancer can't point the page at
+    another account. Legacy (dev only, no secret set): raw task_allocation_id/email.
+    Everything is in the body, never the query string."""
+    token: Optional[str] = Field(default=None, description="Signed reset link token (preferred).")
+    task_allocation_id: Optional[str] = Field(default=None, description="Legacy raw id (dev only).")
+    email: Optional[str] = Field(default=None, description="Legacy raw email (dev only).")
 
 
 class FreelancerResetRequest(BaseModel):
-    """Minimal body for the freelancer reset UI. Persona is resolved server-side
-    from gab_accounts, so the freelancer never sees or supplies it."""
-    email: str = Field(..., description="Account to reset.")
-    task_allocation_id: str = Field(..., min_length=1, description="From Cosmo (reset table for now).")
+    """Body for the freelancer reset UI. With a signing secret configured, only the
+    signed ``token`` is honored — the account, task id and persona are all resolved
+    server-side from it, so the freelancer never supplies (or can tamper with) which
+    account is reset. email/task_allocation_id are the legacy dev-only fallback."""
+    token: Optional[str] = Field(default=None, description="Signed reset link token (preferred).")
+    email: Optional[str] = Field(default=None, description="Legacy raw email (dev only).")
+    task_allocation_id: Optional[str] = Field(default=None, description="Legacy raw id (dev only).")
 
     @field_validator("email")
     @classmethod
-    def _looks_like_email(cls, v: str) -> str:
+    def _looks_like_email(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
         v = v.strip()
         if "@" not in v or "." not in v.split("@")[-1]:
             raise ValueError("email must be a valid address")
         return v
+
+
+class ResetLinkRequest(BaseModel):
+    """Body for POST /api/reset-link (Bearer): mint a signed freelancer link."""
+    task_allocation_id: str = Field(..., min_length=1, description="Task to bind the link to.")
+    ttl_s: Optional[int] = Field(default=None, ge=60, description="Link lifetime in seconds (default from config).")
+
+
+class ResetLinkResponse(BaseModel):
+    token: str
+    reset_url: str
+    expires_at: int  # unix seconds
 
 
 class UploadResponse(BaseModel):
@@ -73,6 +104,18 @@ class UploadResponse(BaseModel):
     error: Optional[str] = None
 
 
+class ResetApiResponse(BaseModel):
+    """Public API shape for POST/GET /api/environment/reset (Cosmo contract).
+
+    ``url`` is the status endpoint for this reset: open it in a browser for the
+    live status page, or GET it from code for this same JSON. ``error`` is null
+    unless the reset ended in failure.
+    """
+    url: str
+    status: str  # in_progress | completed | failed
+    error: Optional[str] = None
+
+
 class ResetResponse(BaseModel):
     """Response/poll shape for a reset session (status transitions queued->completed)."""
     # None while the reset is still in progress; True/False once terminal.
@@ -80,6 +123,8 @@ class ResetResponse(BaseModel):
     reset_session_id: str
     status: str  # queued | running | completed | failed
     task_allocation_id: str
+    # Full URL of the live status page — open it in a browser to watch this reset.
+    status_url: Optional[str] = None
     message: Optional[str] = None
     error: Optional[str] = None
     started_at: Optional[datetime] = None

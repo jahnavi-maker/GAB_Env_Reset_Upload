@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -47,6 +48,14 @@ def _retry(fn, log: Callable[[str], None], tries: int = 8):
                 delay = min(delay * 2, 30)
                 continue
             raise
+        except (socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
+            # Network stall surfaced by the global socket timeout: retry instead
+            # of aborting the whole calendar step.
+            if i >= tries - 1:
+                raise
+            log(f"Google Calendar network stall ({type(exc).__name__}), retrying in {delay:.0f}s")
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
 
 
 def _event_key(event: dict[str, Any]) -> tuple[str, int] | None:
@@ -83,7 +92,26 @@ def _list_seeded_events(calendar, log: Callable[[str], None]) -> list[dict[str, 
 
 
 def wipe_seeded_events(calendar, log: Callable[[str], None]) -> int:
-    """FULL wipe: delete ALL primary-calendar events (no marker match)."""
+    """FULL wipe: clear the entire primary calendar.
+
+    Uses Calendars.clear() rather than list-then-delete. ``events.list`` is
+    eventually-consistent and can transiently return an empty page; the old
+    list-based wipe treated that empty page as "nothing to delete", silently
+    deleted 0 events and left stale data behind (then seeding skipped the
+    already-present events, so the account never got clean). ``clear()`` removes
+    every event on the primary calendar in one call regardless of index state.
+    The list-then-delete path is kept only as a fallback if clear() is denied.
+    """
+    try:
+        _retry(
+            lambda: calendar.calendars().clear(calendarId="primary").execute(),
+            log,
+        )
+        log("Full calendar wipe: cleared primary calendar")
+        return 1
+    except Exception as exc:  # clear() unavailable/denied -> fall back
+        log(f"calendars().clear() failed ({exc}); falling back to list-delete wipe")
+
     deleted = 0
     while True:
         resp = _retry(
@@ -111,7 +139,7 @@ def wipe_seeded_events(calendar, log: Callable[[str], None]) -> int:
                 deleted += 1
             except Exception:
                 pass  # e.g. read-only imported/birthday events on primary
-    log(f"Full calendar wipe: deleted {deleted} events")
+    log(f"Full calendar wipe (fallback): deleted {deleted} events")
     return deleted
 
 

@@ -19,7 +19,7 @@ import os
 import re
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from pathlib import Path
 
@@ -29,10 +29,15 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from . import __version__, engine, upload
 from .config import settings
 from .db import Store, make_store
+from . import links
 from .models import (
     FreelancerResetRequest,
+    ResetLinkRequest,
+    ResetLinkResponse,
     ResetRequest,
+    ResetApiResponse,
     ResetResponse,
+    TaskLookupRequest,
     UploadRequest,
     UploadResponse,
 )
@@ -47,12 +52,53 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _purge_expired_qc_logs() -> int:
+    """Delete QC logs whose last-modified time is older than the retention window.
+
+    DB audit rows are untouched. Returns the number of files removed. Never raises —
+    a failed purge must not take the service down."""
+    days = settings.qc_log_retention_days
+    if days <= 0:
+        return 0  # retention disabled -> keep logs forever
+    d = Path(settings.reset_log_dir)
+    if not d.exists():
+        return 0
+    cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
+    removed = 0
+    for p in d.glob("*.jsonl"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                removed += 1
+        except OSError as exc:
+            log.warning("qc-log purge: could not remove %s: %s", p, exc)
+    if removed:
+        log.info("qc-log purge: removed %d log(s) older than %d days", removed, days)
+    return removed
+
+
+async def _qc_retention_loop() -> None:
+    """Purge expired QC logs on startup, then once a day. Cancelled at shutdown."""
+    while True:
+        try:
+            await asyncio.to_thread(_purge_expired_qc_logs)
+        except Exception:  # noqa: BLE001 - background task must never crash the app
+            log.exception("qc-log retention pass failed")
+        await asyncio.sleep(86400)  # daily
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _ensure_store(app)
+    store = _ensure_store(app)
     if not settings.api_key:
         log.warning("RESET_API_KEY not set -> API authentication is DISABLED (dev only)")
+    retention_task = asyncio.create_task(_qc_retention_loop())
+    # Reap sessions left non-terminal by a crash/restart/DB-blip so no account stays
+    # blocked (runs immediately on startup, then on an interval).
+    reaper_task = asyncio.create_task(_reaper_loop(store))
     yield
+    retention_task.cancel()
+    reaper_task.cancel()
     store = getattr(app.state, "store", None)
     if store is not None:
         await store.aclose()
@@ -151,6 +197,47 @@ async def _decide_mode(store: Store, email: str, persona: str, explicit: str | N
     return "delta" if rows[0]["last_reset_persona"] == persona else "reseed"  # switch -> reseed
 
 
+async def _safe_update(store: Store, reset_session_id: str, fields: dict) -> None:
+    """Best-effort status write: retry once, NEVER raise. A failing write must not
+    crash the background task and leave the row stuck (which blocks the account via
+    the one-active-per-email lock). The reaper is the backstop if both attempts fail.
+    """
+    for attempt in (1, 2):
+        try:
+            await store.update(reset_session_id, fields)
+            return
+        except Exception as exc:  # noqa: BLE001
+            if attempt == 2:
+                log.warning("status write failed for %s (%s): %s", reset_session_id, fields.get("status"), exc)
+            else:
+                await asyncio.sleep(0.5)
+
+
+async def _reap_stuck_sessions(store: Store) -> None:
+    """Mark queued/running rows older than the TTL as failed, so a crashed/lost task
+    or a DB-outage-stuck row can't block an account forever. Best-effort."""
+    if not settings.use_supabase:
+        return  # local dev store has no shared rows to reap
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=settings.stuck_reset_ttl_s)).isoformat()
+    try:
+        await store.patch_table(
+            settings.supabase_table,
+            {"status": "in.(queued,running)", "created_at": f"lt.{cutoff}"},
+            {"status": "failed", "completed_at": _now(),
+             "error": f"reaped: no terminal status within {settings.stuck_reset_ttl_s}s "
+                      "(task lost, process restart, or DB outage)"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("stuck-session reaper failed: %s", exc)
+
+
+async def _reaper_loop(store: Store) -> None:
+    """Reap on startup, then every reaper_interval_s. Cancelled at shutdown."""
+    while True:
+        await _reap_stuck_sessions(store)
+        await asyncio.sleep(settings.reaper_interval_s)
+
+
 async def _run_and_record(
     store: Store,
     reset_session_id: str,
@@ -168,14 +255,17 @@ async def _run_and_record(
     the first upload runs the engine ``seed`` but is audited as ``mode='upload'``.
     """
     started = _now()
-    await store.update(reset_session_id, {"status": "running", "started_at": started})
+    # Best-effort so a DB blip on the "running" write can't crash the task (which would
+    # leave the row 'queued' forever and block the account). The reaper backstops it.
+    await _safe_update(store, reset_session_id, {"status": "running", "started_at": started})
     ok = False
     detail = None
     raw = None
     try:
         result = await asyncio.to_thread(engine.run_reset, email, persona, mode, services)
         ok, detail, raw = result.success, result.detail, result.raw
-        await store.update(
+        await _safe_update(
+            store,
             reset_session_id,
             {
                 "status": "completed" if ok else "failed",
@@ -198,8 +288,8 @@ async def _run_and_record(
     except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}"
         log.exception("reset %s crashed", reset_session_id)
-        await store.update(
-            reset_session_id, {"status": "failed", "completed_at": _now(), "error": detail}
+        await _safe_update(
+            store, reset_session_id, {"status": "failed", "completed_at": _now(), "error": detail}
         )
     finally:
         # Surface skips/omits so QC can treat them as tickets. The engine reports
@@ -340,6 +430,13 @@ async def ui_reset(req: ResetRequest, background: BackgroundTasks, store: Store 
     return {"reset_session_id": reset_session_id, "status": "in_progress", "mode": op_mode}
 
 
+@app.get("/reset/status/{reset_session_id}", response_class=HTMLResponse)
+async def ui_reset_status_page(reset_session_id: str) -> HTMLResponse:
+    """Browser-facing status page: reads the id from the path and polls the JSON
+    status endpoint. This is the URL to open in a browser after a POST reset."""
+    return HTMLResponse((STATIC_DIR / "status.html").read_text(encoding="utf-8"))
+
+
 @app.get("/ui/reset/{reset_session_id}")
 async def ui_reset_status(reset_session_id: str, store: Store = Depends(get_store)) -> dict:
     record = await store.get(reset_session_id)
@@ -347,6 +444,10 @@ async def ui_reset_status(reset_session_id: str, store: Store = Depends(get_stor
         raise HTTPException(status_code=404, detail="unknown reset_session_id")
     return {
         "reset_session_id": reset_session_id,
+        "task_allocation_id": record.get("task_allocation_id"),
+        "email": record.get("email"),
+        "persona": record.get("persona"),
+        "mode": record.get("mode"),
         "status": record.get("status"),
         "error": record.get("error"),
         "started_at": record.get("started_at"),
@@ -365,19 +466,57 @@ async def ui_freelancer_page() -> HTMLResponse:
     return HTMLResponse((STATIC_DIR / "reset.html").read_text(encoding="utf-8"))
 
 
-@app.get("/ui/task")
+def _task_id_from_request(token: str | None, raw_task: str | None) -> str | None:
+    """Resolve the task allocation id for a freelancer request.
+
+    With a signing secret configured, ONLY a valid signed token is accepted (the
+    freelancer can't tamper with which account is reset). Without a secret (dev),
+    fall back to the raw id. Returns the task id, or raises HTTPException.
+    """
+    if token:
+        try:
+            return links.verify(token)
+        except links.TokenError as exc:
+            raise HTTPException(status_code=403, detail=f"invalid or expired reset link: {exc}")
+    if links.enabled():
+        raise HTTPException(status_code=403, detail="a signed reset link is required")
+    return raw_task  # dev fallback only
+
+
+async def _email_for_task(store: Store, task_allocation_id: str) -> str | None:
+    """Resolve the account email bound to a task id (latest reset_sessions row)."""
+    try:
+        rows = await store.query(
+            settings.supabase_table,
+            {
+                "select": "email,created_at",
+                "task_allocation_id": f"eq.{task_allocation_id}",
+                "order": "created_at.desc",
+                "limit": "1",
+            },
+        )
+    except Exception as exc:
+        log.warning("email lookup failed for task %s: %s", task_allocation_id, exc)
+        return None
+    return (rows[0].get("email") or "").lower() or None if rows else None
+
+
+@app.post("/ui/task")
 async def ui_task(
-    task_allocation_id: str | None = None,
-    email: str | None = None,
+    req: TaskLookupRequest,
     store: Store = Depends(get_store),
 ) -> dict:
-    """Minimal freelancer lookup: task allocation id + account email + latest reset.
+    """Freelancer lookup for the reset page: account email + persona + latest reset.
 
-    Sourced from reset_sessions for now (Cosmo later). Returns only fields the
-    freelancer should see — never persona, tokens, or other internal data.
+    Identity comes from a signed ``token`` (the link) — verified server-side, so the
+    freelancer can't point the page at another account. Persona is returned for
+    display only. In dev (no secret) a raw task_allocation_id/email is accepted.
+    Everything is in the POST body, never the query string.
     """
+    task_allocation_id = _task_id_from_request(req.token, req.task_allocation_id)
+    email = None if req.token else ((req.email or "").lower() or None)
     if not (task_allocation_id or email):
-        raise HTTPException(status_code=400, detail="provide task_allocation_id or email")
+        raise HTTPException(status_code=400, detail="provide a reset link")
     params = {
         "select": "task_allocation_id,email,status,reset_session_id,created_at",
         "order": "created_at.desc",
@@ -386,16 +525,33 @@ async def ui_task(
     if task_allocation_id:
         params["task_allocation_id"] = f"eq.{task_allocation_id}"
     else:
-        params["email"] = f"eq.{email.lower()}"
+        params["email"] = f"eq.{email}"
     try:
         rows = await store.query(settings.supabase_table, params)
     except Exception as exc:
         log.warning("ui_task lookup failed: %s", exc)
         rows = []
     row = rows[0] if rows else {}
+    email = (row.get("email") or email or "").lower() or None
+
+    # Persona is shown (read-only) so the freelancer can see which environment they
+    # are resetting. Resolved from gab_accounts, same source the reset itself uses.
+    persona = None
+    if email:
+        try:
+            arows = await store.query(
+                settings.accounts_table,
+                {"select": "persona,last_reset_persona", "email": f"eq.{email}", "limit": "1"},
+            )
+            if arows:
+                persona = arows[0].get("last_reset_persona") or arows[0].get("persona")
+        except Exception as exc:
+            log.warning("ui_task persona lookup failed for %s: %s", email, exc)
+
     return {
         "task_allocation_id": task_allocation_id or row.get("task_allocation_id"),
-        "email": (row.get("email") or email or "").lower() or None,
+        "email": email,
+        "persona": persona,
         "last_status": row.get("status"),
         "last_reset_session_id": row.get("reset_session_id"),
     }
@@ -407,9 +563,24 @@ async def ui_task_reset(
     background: BackgroundTasks,
     store: Store = Depends(get_store),
 ) -> dict:
-    """Freelancer-triggered reset. Persona is resolved from gab_accounts here so
-    the UI never handles it. Auto-routes delta vs reseed like any reset."""
-    email = req.email.lower()
+    """Freelancer-triggered reset. The account, task id and persona are all resolved
+    server-side from the signed token, so the freelancer can neither see nor change
+    which account is reset. Auto-routes delta vs reseed like any reset."""
+    task_allocation_id = _task_id_from_request(req.token, req.task_allocation_id)
+    if not task_allocation_id:
+        raise HTTPException(status_code=400, detail="a signed reset link is required")
+
+    # In token mode the email is derived from the task (never trusted from the client).
+    if req.token:
+        email = await _email_for_task(store, task_allocation_id)
+        if not email:
+            raise HTTPException(status_code=404, detail="this task has no account on file")
+    else:
+        email = (req.email or "").lower()
+        if not email:
+            raise HTTPException(status_code=400, detail="email required")
+    email = email.lower()
+
     persona = None
     try:
         rows = await store.query(
@@ -424,7 +595,7 @@ async def ui_task_reset(
         raise HTTPException(status_code=400, detail="account not provisioned (no persona on file)")
     try:
         reset_session_id, op_mode = await _launch_reset(
-            store, background, email, persona, req.task_allocation_id, None, None
+            store, background, email, persona, task_allocation_id, None, None
         )
     except ActiveResetConflict:
         raise HTTPException(status_code=409, detail="a reset is already running for this account")
@@ -433,7 +604,7 @@ async def ui_task_reset(
 
 @app.post(
     "/api/environment/reset",
-    response_model=ResetResponse,
+    response_model=ResetApiResponse,
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(require_api_key)],
 )
@@ -441,7 +612,7 @@ async def create_reset(
     req: ResetRequest,
     background: BackgroundTasks,
     store: Store = Depends(get_store),
-) -> ResetResponse:
+) -> ResetApiResponse:
     try:
         reset_session_id, op_mode = await _launch_reset(
             store, background, req.email, req.persona, req.task_allocation_id, req.mode, req.services
@@ -452,12 +623,30 @@ async def create_reset(
         log.exception("failed to create session row")
         raise HTTPException(status_code=502, detail=f"session store error: {exc}") from exc
 
-    return ResetResponse(
-        success=None,
-        reset_session_id=reset_session_id,
-        status="in_progress",
-        task_allocation_id=req.task_allocation_id,
-        message=f"reset accepted (mode={op_mode}); poll GET /api/environment/reset/{{reset_session_id}}",
+    # url = the status endpoint for this reset. Open it in a browser for the live
+    # page, or GET it from code for JSON ({url, status, error}).
+    url = f"{settings.public_base_url.rstrip('/')}/api/environment/reset/{reset_session_id}"
+    return ResetApiResponse(url=url, status="in_progress", error=None)
+
+
+@app.post("/api/reset-link", response_model=ResetLinkResponse, dependencies=[Depends(require_api_key)])
+async def create_reset_link(req: ResetLinkRequest) -> ResetLinkResponse:
+    """Mint a signed, tamper-proof freelancer reset link for a task.
+
+    Cosmo (or an operator) calls this to get the link to hand a freelancer. The
+    token is opaque and signed, so the freelancer cannot edit it to reset another
+    account. Requires RESET_LINK_SECRET to be configured.
+    """
+    if not links.enabled():
+        raise HTTPException(status_code=400, detail="RESET_LINK_SECRET is not configured on the server")
+    try:
+        token, exp = links.mint(req.task_allocation_id, req.ttl_s)
+    except links.TokenError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ResetLinkResponse(
+        token=token,
+        reset_url=f"{settings.public_base_url}/reset#t={token}",
+        expires_at=exp,
     )
 
 
@@ -583,7 +772,16 @@ async def oauth_callback(
         background.add_task(
             _bounded_run, store, usid, tid, email, persona, "reseed", services, "upload",
         )
-    return RedirectResponse(f"{dest}?authorized=ok", status_code=303)
+
+    # Return the operator to WHERE THEY STARTED (e.g. the authorize workspace) so the
+    # loaded CSV + passwords are still there and they can copy the next password and
+    # authorize the next account — no re-upload. Only local paths are honored (never an
+    # open redirect to another site).
+    return_to = ctx.get("return_to")
+    if isinstance(return_to, str) and return_to.startswith("/") and not return_to.startswith("//"):
+        dest = return_to
+    sep = "&" if "?" in dest else "?"
+    return RedirectResponse(f"{dest}{sep}authorized=ok", status_code=303)
 
 
 @app.get("/api/environment/upload/{upload_session_id}", dependencies=[Depends(require_api_key)])
@@ -609,6 +807,15 @@ async def get_upload(upload_session_id: str, store: Store = Depends(get_store)) 
 @app.get("/onboard", response_class=HTMLResponse)
 async def ui_onboard_page() -> HTMLResponse:
     return HTMLResponse((STATIC_DIR / "onboard.html").read_text(encoding="utf-8"))
+
+
+@app.get("/onboard/authorize", response_class=HTMLResponse)
+async def ui_authorize_workspace() -> HTMLResponse:
+    """Dedicated manual-authorization workspace. Shows the account table with each
+    account's password (parsed from the operator's CSV, held only in the browser and
+    never sent to the server) so the operator can copy-paste it into Google's login
+    while authorizing accounts one by one."""
+    return HTMLResponse((STATIC_DIR / "authorize_all.html").read_text(encoding="utf-8"))
 
 
 @app.post("/ui/client")
@@ -697,7 +904,9 @@ async def ui_authorize(req: UploadRequest, store: Store = Depends(get_store)) ->
     """Operator step 2: authorize ONE account (consent only). On success the
     callback writes gab_accounts. No seeding here — that's the Bulk upload step."""
     try:
-        auth_url = upload.build_auth_url(req.email.lower(), req.persona, kind="authorize")
+        auth_url = upload.build_auth_url(
+            req.email.lower(), req.persona, kind="authorize", return_to=req.return_to
+        )
     except Exception as exc:
         log.exception("ui authorize init failed")
         raise HTTPException(status_code=502, detail=f"oauth init failed: {exc}") from exc
@@ -840,33 +1049,27 @@ async def ui_qc_read(task_allocation_id: str, store: Store = Depends(get_store))
     return {"task_allocation_id": task_allocation_id, "log_records": logs, "sessions": sessions}
 
 
-@app.post("/ui/qc/{task_allocation_id}/confirm")
-async def ui_qc_confirm(task_allocation_id: str) -> dict:
-    p = _qc_log_path(task_allocation_id)
-    purged = p.exists()
-    if purged:
-        p.unlink()
-    return {"task_allocation_id": task_allocation_id, "purged": purged}
+# NOTE: QC is review-only — there is intentionally no same-origin (unauthenticated)
+# purge endpoint. Purging happens via the retention job or the Bearer-protected
+# /api/qc/{task_allocation_id}/confirm (admin/automation), never from the QC page.
 
 
-@app.get(
-    "/api/environment/reset/{reset_session_id}",
-    response_model=ResetResponse,
-    dependencies=[Depends(require_api_key)],
-)
-async def get_reset(reset_session_id: str, store: Store = Depends(get_store)) -> ResetResponse:
+@app.get("/api/environment/reset/{reset_session_id}")
+async def get_reset(
+    reset_session_id: str,
+    accept: str | None = Header(default=None),
+    store: Store = Depends(get_store),
+):
+    # Opened in a browser (Accept: text/html) -> send them to the status UI page.
+    # Programmatic callers (curl/Postman/Cosmo, Accept: */* or application/json)
+    # still get the JSON body, so nothing that polls this endpoint breaks.
+    if accept and "text/html" in accept.lower():
+        return RedirectResponse(url=f"/reset/status/{reset_session_id}", status_code=303)
     record = await store.get(reset_session_id)
     if not record:
         raise HTTPException(status_code=404, detail="unknown reset_session_id")
-    st = record.get("status")
-    success = True if st == "completed" else False if st == "failed" else None
-    return ResetResponse(
-        success=success,
-        reset_session_id=reset_session_id,
-        status=st,
-        task_allocation_id=record.get("task_allocation_id"),
-        message=None,
-        error=record.get("error"),
-        started_at=record.get("started_at"),
-        completed_at=record.get("completed_at"),
-    )
+    st = (record.get("status") or "").lower()
+    # Contract states: in_progress | completed | failed (queued/running collapse to in_progress).
+    norm = "completed" if st == "completed" else "failed" if st == "failed" else "in_progress"
+    url = f"{settings.public_base_url.rstrip('/')}/api/environment/reset/{reset_session_id}"
+    return ResetApiResponse(url=url, status=norm, error=record.get("error"))

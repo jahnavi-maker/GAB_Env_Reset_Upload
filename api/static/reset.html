@@ -6,184 +6,265 @@
 <title>Environment Reset</title>
 <style>
   :root {
-    --bg: #f6f3f0; --card: #ffffff; --ink: #111113; --muted: #6b6b70;
-    --brand: #175fff; --ok: #12855a; --err: #c0392b; --line: #e6e2dd;
+    --bg:#f6f3f0; --card:#ffffff; --ink:#111113; --muted:#6b6b70;
+    --brand:#175fff; --ok:#12855a; --err:#c0392b; --line:#e6e2dd; --chip:#eef1f6;
   }
   @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) { --bg:#111113; --card:#1b1b1e; --ink:#f6f3f0; --muted:#9a9aa0; --line:#2c2c30; }
+    :root:not([data-theme="light"]) { --bg:#111113; --card:#1b1b1e; --ink:#f6f3f0; --muted:#9a9aa0; --line:#2c2c30; --chip:#23232a; }
   }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
-    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
-    display: flex; align-items: center; justify-content: center; padding: 16px;
-  }
-  .card {
-    background: var(--card); border: 1px solid var(--line); border-radius: 16px;
-    padding: 32px 28px; width: 100%; max-width: 420px;
-    box-shadow: 0 10px 40px rgba(0,0,0,.06);
-  }
-  h1 { font-size: 19px; margin: 0 0 20px; letter-spacing: -.01em; text-align: center; }
-  .field { margin-bottom: 14px; }
-  .label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 3px; }
-  .value { font-size: 14px; font-weight: 600; word-break: break-all; }
-  .value.empty { color: var(--muted); font-weight: 400; }
-  button {
-    appearance: none; border: 0; cursor: pointer; width: 100%; margin-top: 8px;
-    background: var(--brand); color: #fff; font-size: 16px; font-weight: 600;
-    padding: 15px; border-radius: 12px; transition: opacity .15s, transform .05s;
-  }
-  button:hover { opacity: .92; }
-  button:active { transform: translateY(1px); }
-  button:disabled { opacity: .5; cursor: default; }
-  .result { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); display: none; }
-  .result.show { display: block; }
-  .status { display: inline-flex; align-items: center; gap: 8px; font-weight: 700; font-size: 15px; }
-  .status.running { color: var(--brand); }
-  .status.completed { color: var(--ok); }
-  .status.failed { color: var(--err); }
-  .spinner {
-    width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent;
-    border-radius: 50%; animation: spin .7s linear infinite; display: inline-block;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .err-detail { color: var(--err); font-size: 12px; margin-top: 8px; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",sans-serif;
+    display:flex; align-items:flex-start; justify-content:center; padding:24px 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:16px;
+    width:100%; max-width:440px; box-shadow:0 10px 40px rgba(0,0,0,.06); overflow:hidden; }
+  .pad { padding:26px 26px; }
+  .divider { border-top:1px solid var(--line); }
+  h1 { font-size:22px; margin:0 0 4px; letter-spacing:-.01em; }
+  .subtle { color:var(--muted); font-size:13px; margin:0; }
+  .field { margin-bottom:14px; }
+  .label { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-bottom:3px; }
+  .value { font-size:14px; font-weight:600; word-break:break-all; }
+  .value.empty { color:var(--muted); font-weight:400; }
+  button { appearance:none; border:0; cursor:pointer; width:100%; margin-top:6px;
+    background:var(--brand); color:#fff; font-size:16px; font-weight:600; padding:15px; border-radius:12px;
+    transition:opacity .15s, transform .05s; }
+  button:hover { opacity:.92; } button:active { transform:translateY(1px); }
+  button:disabled { opacity:.5; cursor:default; }
+  /* progress header row */
+  .rid { font-family:ui-monospace,Menlo,monospace; font-weight:700; font-size:15px; letter-spacing:.02em; }
+  .who { color:var(--muted); font-size:13px; margin-top:4px; }
+  .pill { font-size:11px; font-weight:800; letter-spacing:.05em; padding:5px 11px; border-radius:999px; text-transform:uppercase; }
+  .pill.queued { background:var(--chip); color:var(--muted); }
+  .pill.running { background:rgba(23,95,255,.12); color:var(--brand); }
+  .pill.completed { background:rgba(18,133,90,.12); color:var(--ok); }
+  .pill.failed { background:rgba(192,57,43,.12); color:var(--err); }
+  .rowtop { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  /* progress bar */
+  .track { height:8px; background:var(--chip); border-radius:999px; overflow:hidden; margin:2px 0 8px; }
+  .track > div { height:100%; background:var(--brand); width:0; transition:width .4s ease; }
+  .track.completed > div { background:var(--ok); }
+  .track.failed > div { background:var(--err); }
+  .pcline { display:flex; justify-content:space-between; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin-bottom:6px; }
+  /* steps */
+  .steps { list-style:none; margin:14px 0 0; padding:0; }
+  .steps li { display:flex; align-items:center; gap:12px; padding:9px 0; font-size:15px; }
+  .dot { width:26px; height:26px; border-radius:50%; border:2px solid var(--line); display:flex; align-items:center; justify-content:center;
+    font-size:13px; color:var(--muted); flex:0 0 auto; }
+  .dot.done { border-color:var(--ok); background:var(--ok); color:#fff; }
+  .dot.active { border-color:var(--brand); color:var(--brand); }
+  .dot.failed { border-color:var(--err); background:var(--err); color:#fff; }
+  li.pending { color:var(--muted); } li.done, li.active { color:var(--ink); } li.failed { color:var(--err); }
+  .spin { width:12px; height:12px; border:2px solid currentColor; border-right-color:transparent; border-radius:50%; animation:spin .7s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .foot { font-size:13px; color:var(--muted); }
+  .err-detail { color:var(--err); font-size:12px; margin-top:8px; }
+  .hidden { display:none; }
 </style>
 </head>
 <body>
-  <div class="card">
-    <h1>Environment Reset</h1>
-
-    <div class="field">
-      <div class="label">Task Allocation ID</div>
-      <div class="value empty" id="taskId">—</div>
-    </div>
-    <div class="field">
-      <div class="label">Account</div>
-      <div class="value empty" id="email">—</div>
-    </div>
-
-    <button id="resetBtn" disabled>Reset environment</button>
-
-    <div class="result" id="result">
-      <div class="field">
-        <div class="label">Status</div>
-        <div class="status" id="statusWrap">—</div>
+  <div class="card" id="card">
+    <!-- lookup view -->
+    <div id="lookupView">
+      <div class="pad">
+        <h1>Environment Reset</h1>
+        <p class="subtle">Reset your assigned account to its baseline.</p>
       </div>
-      <div class="field">
-        <div class="label">Reset ID</div>
-        <div class="value" id="sid">—</div>
+      <div class="divider"></div>
+      <div class="pad">
+        <div class="field">
+          <div class="label">Task</div>
+          <div class="value empty" id="taskId">—</div>
+        </div>
+        <div class="field">
+          <div class="label">Account</div>
+          <div class="value empty" id="email">—</div>
+        </div>
+        <div class="field">
+          <div class="label">Persona</div>
+          <div class="value empty" id="persona">—</div>
+        </div>
+        <button id="resetBtn" disabled>Reset environment</button>
+        <div class="err-detail" id="lookupErr"></div>
       </div>
-      <div class="err-detail" id="errDetail"></div>
+    </div>
+
+    <!-- progress view -->
+    <div id="progressView" class="hidden">
+      <div class="pad">
+        <h1>Restore progress</h1>
+        <p class="subtle">Updates automatically while the worker runs.</p>
+      </div>
+      <div class="divider"></div>
+      <div class="pad">
+        <div class="rowtop">
+          <div>
+            <div class="rid" id="pRid">RST-—</div>
+            <div class="who" id="pWho">—</div>
+          </div>
+          <span class="pill queued" id="pPill">Queued</span>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div class="pad">
+        <div class="track queued" id="pTrack"><div id="pFill"></div></div>
+        <div class="pcline"><span id="pStatusLabel">Queued</span><span id="pPct">0%</span></div>
+        <ul class="steps" id="pSteps"></ul>
+      </div>
+      <div class="divider"></div>
+      <div class="pad">
+        <div class="foot" id="pFoot">Waiting for the central reset worker.</div>
+        <div class="err-detail" id="pErr"></div>
+        <button id="againBtn" class="hidden">Reset again</button>
+      </div>
     </div>
   </div>
 
 <script>
-  // Identity arrives in the link Cosmo builds, e.g.
-  //   /reset?task_allocation_id=<id>&email=<account>
-  // Either param is enough; the server fills in the rest from the reset table.
-  const q = new URLSearchParams(location.search);
+  // Identity arrives ONLY as a signed token in the URL fragment (#t=...), which the
+  // browser never sends to the server or its logs. Security comes from the signature:
+  // a freelancer cannot edit the token to reset another account. Dev fallback: legacy
+  // ?task_allocation_id= / ?email= query (used only when the server has no secret).
+  const hash = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+  const query = new URLSearchParams(location.search);
   const ctx = {
-    task_allocation_id: q.get("task_allocation_id") || q.get("task") || null,
-    email: q.get("email") || null,
+    token: hash.get("t") || hash.get("token") || null,
+    // legacy dev-only fallbacks:
+    task_allocation_id: query.get("task_allocation_id") || query.get("task") || null,
+    email: query.get("email") || null,
+    persona: null,
   };
 
-  const taskEl = document.getElementById("taskId");
-  const emailEl = document.getElementById("email");
-  const btn = document.getElementById("resetBtn");
-  const result = document.getElementById("result");
-  const sidEl = document.getElementById("sid");
-  const statusWrap = document.getElementById("statusWrap");
-  const errDetail = document.getElementById("errDetail");
+  const STEPS = ["Authenticate","Inspect changes","Restore Drive","Restore Gmail","Restore Calendar","Verify baseline","Complete"];
+  const $ = id => document.getElementById(id);
 
-  function setVal(el, text) {
-    if (text) { el.textContent = text; el.classList.remove("empty"); }
-    else { el.textContent = "—"; el.classList.add("empty"); }
+  function setVal(el, text){ if(text){ el.textContent=text; el.classList.remove("empty"); } else { el.textContent="—"; el.classList.add("empty"); } }
+  function shortRid(id){ return id ? ("RST-" + String(id).replace(/-/g,"").slice(0,12).toUpperCase()) : "RST-—"; }
+  function shortUser(email){ if(!email) return ""; const u = email.split("@")[0]; const m = u.match(/user\d+/i); return m ? m[0] : u; }
+
+  // Turn any engine error into a plain-language sentence the operator can act on.
+  function humanError(e){
+    if(!e) return "";
+    const s = String(e);
+    const low = s.toLowerCase();
+    if(low.includes("quota"))          return "Google quota reached for this account — try again after it resets (usually within 24 hours).";
+    if(low.includes("invalid_grant") || low.includes("re-authorize") || low.includes("refresherror"))
+                                       return "This account's sign-in expired — re-authorize it, then reset again.";
+    if(low.includes("timed out") || low.includes("timeout"))
+                                       return "The reset took too long / the network stalled — please try again.";
+    if(low.includes("config"))         return "Server configuration problem — contact the operator (the environment isn't set up).";
+    // Our classified messages are already readable; a raw {error, message} blob isn't.
+    try { const o = JSON.parse(s); if(o && (o.message || o.error)) return (o.message || o.error); } catch(_){}
+    return s.length > 200 ? s.slice(0,200) + "…" : s;
   }
 
-  function renderStatus(status) {
-    statusWrap.className = "status " + (status || "");
-    if (["running", "queued", "in_progress"].includes(status)) {
-      statusWrap.innerHTML = '<span class="spinner"></span> Resetting…';
-    } else if (status === "completed") {
-      statusWrap.textContent = "✅ Completed";
-    } else if (status === "failed") {
-      statusWrap.textContent = "❌ Failed";
-    } else {
-      statusWrap.textContent = status || "—";
+  // Map coarse status -> per-step state. The engine reports results at the end, so
+  // the three Restore steps run together and complete as a group.
+  function stepStates(status){
+    switch(status){
+      case "completed": return ["done","done","done","done","done","done","done"];
+      case "failed":    return ["done","done","failed","failed","failed","pending","pending"];
+      case "running":
+      case "in_progress":
+      case "queued_running": return ["done","done","active","active","active","pending","pending"];
+      default:          return ["pending","pending","pending","pending","pending","pending","pending"]; // queued
     }
   }
+  function pctFor(status){ return status==="completed"?100 : status==="failed"?55 : (status==="running"||status==="in_progress")?60 : 0; }
 
-  async function loadTask() {
-    if (!ctx.task_allocation_id && !ctx.email) {
-      setVal(taskEl, null); setVal(emailEl, null);
-      errDetailShow("No task in the link. Open the reset link from your task sheet.");
+  function renderSteps(states){
+    const ul = $("pSteps"); ul.innerHTML = "";
+    STEPS.forEach((name,i)=>{
+      const st = states[i] || "pending";
+      const li = document.createElement("li"); li.className = st;
+      const dot = document.createElement("span"); dot.className = "dot " + st;
+      dot.innerHTML = st==="done" ? "✓" : st==="failed" ? "✕" : st==="active" ? '<span class="spin"></span>' : "·";
+      const label = document.createElement("span"); label.textContent = name;
+      li.appendChild(dot); li.appendChild(label); ul.appendChild(li);
+    });
+  }
+
+  function renderProgress(status, error){
+    const s = (status||"queued").toLowerCase();
+    const disp = s==="in_progress" ? "running" : s;
+    const pillMap = { queued:"Queued", running:"Running", completed:"Completed", failed:"Failed" };
+    $("pPill").className = "pill " + (["queued","running","completed","failed"].includes(disp)?disp:"queued");
+    $("pPill").textContent = pillMap[disp] || "Queued";
+    const pct = pctFor(s);
+    $("pFill").style.width = pct + "%";
+    $("pTrack").className = "track " + (disp==="completed"?"completed":disp==="failed"?"failed":disp==="running"?"running":"queued");
+    $("pStatusLabel").textContent = (pillMap[disp]||"Queued");
+    $("pPct").textContent = pct + "%";
+    renderSteps(stepStates(disp==="running"?"running":s));
+    if (disp==="completed"){ $("pFoot").textContent = "Environment restored to baseline."; }
+    else if (disp==="failed"){ $("pFoot").textContent = "Reset did not complete — " + (humanError(error) || "please try again."); $("pErr").textContent = error && humanError(error) !== String(error) ? ("Details: " + String(error).slice(0,240)) : ""; }
+    else if (disp==="running"){ $("pFoot").textContent = "Restoring environment…"; }
+    else { $("pFoot").textContent = "Waiting for the central reset worker."; }
+    if (disp==="completed" || disp==="failed"){ $("againBtn").classList.remove("hidden"); }
+  }
+
+  async function loadTask(){
+    if (!ctx.token && !ctx.task_allocation_id && !ctx.email){
+      $("lookupErr").textContent = "No reset link. Open the link from your task sheet.";
       return;
     }
-    const params = new URLSearchParams();
-    if (ctx.task_allocation_id) params.set("task_allocation_id", ctx.task_allocation_id);
-    else if (ctx.email) params.set("email", ctx.email);
     try {
-      const r = await fetch("/ui/task?" + params.toString());
-      const d = await r.json();
-      ctx.task_allocation_id = d.task_allocation_id || ctx.task_allocation_id;
-      ctx.email = d.email || ctx.email;
-      setVal(taskEl, ctx.task_allocation_id);
-      setVal(emailEl, ctx.email);
-      btn.disabled = !(ctx.task_allocation_id && ctx.email);
-      if (btn.disabled) errDetailShow("Could not find your account for this task.");
-    } catch (e) {
-      setVal(taskEl, ctx.task_allocation_id);
-      setVal(emailEl, ctx.email);
-      btn.disabled = !(ctx.task_allocation_id && ctx.email);
-    }
-  }
-
-  function errDetailShow(msg) {
-    result.classList.add("show");
-    errDetail.textContent = msg;
-  }
-
-  async function poll(id) {
-    try {
-      const r = await fetch("/ui/reset/" + id);
-      const d = await r.json();
-      renderStatus(d.status);
-      if (d.status === "completed" || d.status === "failed") {
-        if (d.error) errDetail.textContent = d.error;
-        btn.disabled = false;
-        btn.textContent = "Reset again";
-        return;
-      }
-    } catch (e) { /* transient; keep polling */ }
-    setTimeout(() => poll(id), 2000);
-  }
-
-  btn.addEventListener("click", async () => {
-    btn.disabled = true;
-    btn.textContent = "Resetting…";
-    errDetail.textContent = "";
-    result.classList.add("show");
-    renderStatus("running");
-    sidEl.textContent = "…";
-    try {
-      const r = await fetch("/ui/task/reset", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: ctx.email, task_allocation_id: ctx.task_allocation_id }),
+      const r = await fetch("/ui/task", {
+        method:"POST", headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ token: ctx.token, task_allocation_id: ctx.task_allocation_id, email: ctx.email }),
       });
       const d = await r.json();
-      if (!r.ok) throw new Error(d.detail || ("HTTP " + r.status));
-      sidEl.textContent = d.reset_session_id;
-      poll(d.reset_session_id);
-    } catch (e) {
-      renderStatus("failed");
-      errDetail.textContent = "Could not start reset: " + e.message;
-      btn.disabled = false;
-      btn.textContent = "Reset environment";
+      if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
+      ctx.task_allocation_id = d.task_allocation_id || ctx.task_allocation_id;
+      ctx.email = d.email || ctx.email;
+      ctx.persona = d.persona || null;
+      setVal($("taskId"), ctx.task_allocation_id);
+      setVal($("email"), ctx.email);
+      setVal($("persona"), ctx.persona);
+      $("resetBtn").disabled = !ctx.email;
+      if (!ctx.email) $("lookupErr").textContent = "Could not find your account for this task.";
+    } catch(e){
+      $("lookupErr").textContent = e.message;
     }
-  });
+  }
 
+  async function poll(id){
+    try {
+      const r = await fetch("/ui/reset/" + encodeURIComponent(id));
+      const d = await r.json();
+      renderProgress(d.status, d.error);
+      if (d.status === "completed" || d.status === "failed") return;
+    } catch(e){ /* transient; keep polling */ }
+    setTimeout(()=>poll(id), 2000);
+  }
+
+  function showProgress(){
+    $("lookupView").classList.add("hidden");
+    $("progressView").classList.remove("hidden");
+    $("pWho").textContent = [shortUser(ctx.email), ctx.persona].filter(Boolean).join(" · ") || "—";
+  }
+
+  async function startReset(){
+    $("resetBtn").disabled = true;
+    showProgress();
+    renderProgress("queued", null);
+    try {
+      const r = await fetch("/ui/task/reset", {
+        method:"POST", headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ token: ctx.token, task_allocation_id: ctx.task_allocation_id, email: ctx.email }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
+      $("pRid").textContent = shortRid(d.reset_session_id);
+      renderProgress(d.status || "running", null);
+      poll(d.reset_session_id);
+    } catch(e){
+      renderProgress("failed", "Could not start reset: " + e.message);
+    }
+  }
+
+  $("resetBtn").addEventListener("click", startReset);
+  $("againBtn").addEventListener("click", ()=>{ location.reload(); });
   loadTask();
 </script>
 </body>

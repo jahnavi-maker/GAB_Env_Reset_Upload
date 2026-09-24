@@ -42,6 +42,10 @@
   .counts { font-size:13px; color:var(--muted); margin-left:auto; }
   .rid { font-family:ui-monospace,monospace; font-size:11px; color:var(--muted); word-break:break-all; }
   .actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .dropzone { display:block; border:2px dashed var(--line); border-radius:12px; padding:22px 18px; text-align:center;
+    cursor:pointer; background:var(--bg); transition:border-color .15s, background .15s; }
+  .dropzone:hover, .dropzone.drag { border-color:var(--brand); background:var(--chip); }
+  .dz-title { font-size:14px; font-weight:600; margin-bottom:6px; }
 </style>
 </head>
 <body>
@@ -63,8 +67,11 @@
   <!-- Step 2: client.json -->
   <div class="card">
     <div class="step">2 · OAuth client (client.json)</div>
-    <label class="file">Choose client.json<input id="clientFile" type="file" accept=".json,application/json" hidden></label>
-    <span id="clientName" class="hint">Checking…</span>
+    <label class="dropzone" id="clientDrop">
+      <input id="clientFile" type="file" accept=".json,application/json" hidden>
+      <div class="dz-title">Drop <b>client.json</b> here, or click to choose</div>
+      <div id="clientName" class="hint">Checking…</div>
+    </label>
     <div id="clientNote" class="note"></div>
   </div>
 
@@ -72,9 +79,7 @@
   <div class="card" id="tableCard" style="display:none">
     <div class="step">3 · Authorize &amp; upload</div>
     <div class="bar" style="margin-bottom:10px">
-      <button class="ghost" id="authAll">Authorize all</button>
-      <button class="primary" id="bulkUpload">Bulk upload all</button>
-      <button class="ghost" id="recoverAll">Retry skipped (all)</button>
+      <button class="ghost" id="authAll">Authorize all →</button>
       <button class="ghost" id="refreshAll">Refresh</button>
       <span class="counts" id="counts"></span>
     </div>
@@ -100,6 +105,8 @@
 
   let clientReady = false;
   const rows = [];  // {email, persona, rawP, valid, authorized, status, sid, uid}
+  // NOTE: this first page intentionally does NOT handle passwords. Passwords live
+  // only on the Authorize-all workspace page (/onboard/authorize).
 
   // --- Step 2: detect existing client, allow re-upload ---
   const clientNote = document.getElementById("clientNote");
@@ -112,8 +119,8 @@
     } catch(e){ clientReady=false; clientName.textContent="No client configured — upload client.json before authorizing."; }
     renderRows();
   }
-  document.getElementById("clientFile").addEventListener("change", async (e) => {
-    const f = e.target.files[0]; if (!f) return;
+  async function handleClientFile(f){
+    if (!f) return;
     clientName.textContent = f.name; clientNote.textContent = "Uploading…"; clientNote.className="note";
     const fd = new FormData(); fd.append("file", f);
     try {
@@ -125,7 +132,14 @@
       else { clientNote.className="note ok"; clientNote.textContent="Client saved ✓"; }
       renderRows();
     } catch(err){ clientReady=false; clientNote.className="note err"; clientNote.textContent="Rejected: "+err.message; }
-  });
+  }
+  document.getElementById("clientFile").addEventListener("change", (e)=> handleClientFile(e.target.files[0]));
+  // Drag-and-drop onto the zone (click still opens the file picker via the label).
+  const clientDrop = document.getElementById("clientDrop");
+  ["dragenter","dragover"].forEach(ev => clientDrop.addEventListener(ev, e => { e.preventDefault(); clientDrop.classList.add("drag"); }));
+  ["dragleave","dragend"].forEach(ev => clientDrop.addEventListener(ev, e => { e.preventDefault(); clientDrop.classList.remove("drag"); }));
+  clientDrop.addEventListener("drop", e => { e.preventDefault(); clientDrop.classList.remove("drag");
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]; if (f) handleClientFile(f); });
 
   // --- Step 1: CSV ---
   document.getElementById("csvFile").addEventListener("change", (e) => {
@@ -206,7 +220,7 @@
     const row=rows[i]; if(!clientReady||!row.valid) return;
     row.status="authorizing"; row.error=null; renderRows();
     try {
-      const r=await fetch("/ui/authorize",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:row.email,persona:row.persona})});
+      const r=await fetch("/ui/authorize",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:row.email,persona:row.persona,return_to:"/onboard"})});
       const d=await r.json(); if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
       row.authUrl=d.auth_url; window.open(d.auth_url,"_blank"); renderRows();
       pollAuth(i, 0);
@@ -247,9 +261,21 @@
     } catch(err){ row.status="failed"; row.error=err.message; renderRows(); }
   }
 
-  document.getElementById("authAll").addEventListener("click", ()=>{ rows.forEach((row,i)=>{ if(clientReady&&row.valid&&!row.authorized&&row.status!=="authorizing") startAuthorize(i); }); });
-  document.getElementById("bulkUpload").addEventListener("click", ()=>{ rows.forEach((row,i)=>{ if(row.authorized&&["idle","authorized","failed","completed"].includes(row.status)) startSeed(i); }); });
-  document.getElementById("recoverAll").addEventListener("click", ()=>{ rows.forEach((row,i)=>{ if(row.valid&&["completed","failed"].includes(row.status)) startRecover(i); }); });
+  // --- Authorize all: open the dedicated workspace page ---
+  // The workspace (/onboard/authorize) is where passwords are handled and shown for
+  // copy-paste. We pass the loaded accounts (email + persona only — NO passwords) via
+  // sessionStorage so the workspace pre-fills the table; the operator uploads the
+  // password CSV there.
+  document.getElementById("authAll").addEventListener("click", ()=>{
+    if (rows.length){
+      try {
+        sessionStorage.setItem("gab_auth_rows", JSON.stringify(
+          rows.map(r=>({ email:r.email, persona:r.persona, rawP:r.rawP, valid:r.valid }))
+        ));
+      } catch(e){ /* sessionStorage unavailable; the workspace can load its own CSV */ }
+    }
+    window.location.href = "/onboard/authorize";
+  });
   document.getElementById("refreshAll").addEventListener("click", ()=>{ rows.forEach((r,i)=>{ refreshAuth(i); if(r.uid) pollSeed(i); }); });
 
   checkClient();

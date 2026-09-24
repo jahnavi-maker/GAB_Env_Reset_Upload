@@ -42,10 +42,12 @@ class ResetApiTest(unittest.TestCase):
         r = self.client.post("/api/environment/reset", json=BODY, headers=AUTH)
         self.assertEqual(r.status_code, 202)
         data = r.json()
-        sid = data["reset_session_id"]
+        # Public contract: {url, status, error}. url carries the session id.
+        self.assertEqual(data["status"], "in_progress")
+        self.assertIsNone(data["error"])
+        self.assertIn("/api/environment/reset/", data["url"])
+        sid = data["url"].rstrip("/").split("/")[-1]
         self.assertTrue(sid)
-        self.assertEqual(data["task_allocation_id"], BODY["task_allocation_id"])
-        self.assertIsNone(data["success"])
 
         # TestClient runs background tasks synchronously after the response,
         # so by the time we poll the simulated reset has finished.
@@ -54,13 +56,12 @@ class ResetApiTest(unittest.TestCase):
         self.assertEqual(g.status_code, 200)
         gd = g.json()
         self.assertEqual(gd["status"], "completed")
-        self.assertTrue(gd["success"])
-        self.assertIsNotNone(gd["started_at"])
-        self.assertIsNotNone(gd["completed_at"])
+        self.assertIsNone(gd["error"])
+        self.assertTrue(gd["url"].endswith(sid))
 
     def test_password_not_persisted(self) -> None:
         r = self.client.post("/api/environment/reset", json=BODY, headers=AUTH)
-        sid = r.json()["reset_session_id"]
+        sid = r.json()["url"].rstrip("/").split("/")[-1]
         with open(os.environ["LOCAL_STORE_PATH"], encoding="utf-8") as fh:
             raw = fh.read()
         self.assertIn(sid, raw)
@@ -119,19 +120,23 @@ class FreelancerUiTest(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(app)
 
-    def test_page_served_and_hides_internal_fields(self) -> None:
+    def test_page_served_and_shows_persona_readonly(self) -> None:
         r = self.client.get("/reset")
         self.assertEqual(r.status_code, 200)
-        self.assertIn("Task Allocation ID", r.text)
-        # Freelancer must never see persona or other internal machinery.
-        self.assertNotIn("persona", r.text.lower())
+        self.assertIn("Environment Reset", r.text)
+        # Persona is shown (read-only) so the freelancer sees which environment they're
+        # resetting; it's fetched from /ui/task, never editable here.
+        self.assertIn("Persona", r.text)
+        # The staged progress card is part of the page.
+        self.assertIn("Restore progress", r.text)
 
     def test_task_lookup_requires_param(self) -> None:
-        r = self.client.get("/ui/task")
+        # Task id/email go in the POST body now (not the query string).
+        r = self.client.post("/ui/task", json={})
         self.assertEqual(r.status_code, 400)
 
     def test_task_lookup_echoes_task_id(self) -> None:
-        r = self.client.get("/ui/task?task_allocation_id=TASK-123")
+        r = self.client.post("/ui/task", json={"task_allocation_id": "TASK-123"})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["task_allocation_id"], "TASK-123")
 
@@ -143,6 +148,45 @@ class FreelancerUiTest(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 400)
         self.assertIn("provisioned", r.json()["detail"])
+
+
+class ResetLinkTokenTest(unittest.TestCase):
+    """Signed reset links: mint, verify, and reject tampering."""
+
+    def _with_secret(self):
+        import dataclasses
+        from reset_service import config, links
+        return links, dataclasses.replace(config.settings, reset_link_secret="unit-secret")
+
+    def test_mint_verify_roundtrip(self) -> None:
+        links, secret_settings = self._with_secret()
+        orig = links.settings
+        links.settings = secret_settings
+        try:
+            token, exp = links.mint("TASK-9", 3600)
+            self.assertGreater(exp, time.time())
+            self.assertEqual(links.verify(token), "TASK-9")
+        finally:
+            links.settings = orig
+
+    def test_tampered_token_rejected(self) -> None:
+        links, secret_settings = self._with_secret()
+        orig = links.settings
+        links.settings = secret_settings
+        try:
+            token, _ = links.mint("TASK-9", 3600)
+            forged = ("Z" if token[0] != "Z" else "Y") + token[1:]  # flip a char
+            with self.assertRaises(links.TokenError):
+                links.verify(forged)
+        finally:
+            links.settings = orig
+
+    def test_disabled_without_secret(self) -> None:
+        from reset_service import links
+        # No secret configured in the test env -> tokens are disabled.
+        self.assertFalse(links.enabled())
+        with self.assertRaises(links.TokenError):
+            links.mint("TASK-9", 3600)
 
 
 if __name__ == "__main__":

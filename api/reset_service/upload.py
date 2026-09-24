@@ -120,7 +120,8 @@ def _write_pending(state: str, entry: dict[str, Any]) -> None:
 
 def build_auth_url(email: str, persona: str, *, kind: str = "authorize",
                    upload_session_id: str | None = None,
-                   services: list[str] | None = None) -> str:
+                   services: list[str] | None = None,
+                   return_to: str | None = None) -> str:
     """Create a consent URL and remember the handshake keyed by OAuth state.
 
     ``kind`` tells the callback what to do after consent:
@@ -141,6 +142,9 @@ def build_auth_url(email: str, persona: str, *, kind: str = "authorize",
         "kind": kind,
         "upload_session_id": upload_session_id,
         "services": services,
+        # Local path to send the browser back to after consent (e.g. the authorize
+        # workspace) so the operator lands where they were. Validated in the callback.
+        "return_to": return_to,
         # PKCE: the verifier generated for THIS auth URL must be replayed at
         # token exchange, or Google rejects with "Missing code verifier".
         "code_verifier": getattr(flow, "code_verifier", None),

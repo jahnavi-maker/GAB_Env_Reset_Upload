@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import mimetypes
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -25,23 +26,14 @@ MY_DRIVE_ROOT = "root"
 MAX_FILE_BYTES = 40 * 1024 * 1024
 
 _GH_SLOTS: threading.Semaphore | None = None
-_GH_SLOTS_N: int | None = None
 _GH_SLOTS_GUARD = threading.Lock()
 
 
 def _github_slots() -> threading.Semaphore:
-    """Process-wide cap on concurrent Github Drive uploads.
-
-    Hot-reloadable: re-reads GAB_GITHUB_UPLOAD_SLOTS each call and rebuilds the
-    semaphore when the value changes, so an operator can tune the git slot count
-    live (no process restart — which is what lost in-flight work before).
-    """
-    global _GH_SLOTS, _GH_SLOTS_N
+    global _GH_SLOTS
     with _GH_SLOTS_GUARD:
-        n = github_upload_slots()
-        if _GH_SLOTS is None or _GH_SLOTS_N != n:
-            _GH_SLOTS = threading.Semaphore(n)
-            _GH_SLOTS_N = n
+        if _GH_SLOTS is None:
+            _GH_SLOTS = threading.Semaphore(github_upload_slots())
         return _GH_SLOTS
 
 
@@ -74,6 +66,49 @@ def wipe_my_drive_github(drive, log: Callable[[str], None]) -> int:
     )
     log("Moved previous My Drive Github folder to trash")
     return 1
+
+
+def _wipe_all_github_folders(drive, log: Callable[[str], None], max_rounds: int = 8) -> int:
+    """Trash EVERY root-level 'Github' folder, retrying until two consecutive
+    empty listings. Drive's files.list is eventually-consistent and can return
+    an empty page while a folder still exists; a single find-and-trash therefore
+    left stale folders behind, and the next upload stacked a duplicate. Looping
+    with a confirm makes the wipe reliable so a full push always starts clean.
+    """
+    trashed = 0
+    empties = 0
+    for _ in range(max_rounds):
+        resp = _retry(
+            lambda: drive.files()
+            .list(
+                q=(
+                    f"name = '{GITHUB_FOLDER}' and '{MY_DRIVE_ROOT}' in parents "
+                    "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+                ),
+                fields="files(id)",
+                pageSize=100,
+            )
+            .execute(),
+            log,
+        )
+        ids = [f["id"] for f in (resp.get("files") or [])]
+        if not ids:
+            empties += 1
+            if empties >= 2:
+                break
+            time.sleep(2)
+            continue
+        empties = 0
+        for fid in ids:
+            _retry(
+                lambda i=fid: drive.files().update(fileId=i, body={"trashed": True}).execute(),
+                log,
+            )
+            trashed += 1
+        time.sleep(2)
+    if trashed:
+        log(f"Wiped {trashed} existing Github folder(s) before fresh upload")
+    return trashed
 
 
 def iter_github_files(github_dir: Path) -> list[Path]:
@@ -136,14 +171,24 @@ def upload_github_folder(
 ) -> str:
     del parent_folder_id
     cache: dict[str, str] = {}
-    root_id = _ensure_folder(drive, GITHUB_FOLDER, MY_DRIVE_ROOT, cache, log)
     files = iter_github_files(github_dir)
     if only_relpaths is not None:
+        # Recovery / top-up: reuse the existing folder and upload ONLY the files
+        # that were skipped last time. find_child_file (below) checks each one,
+        # so no full-tree scan and no wipe.
+        root_id = _ensure_folder(drive, GITHUB_FOLDER, MY_DRIVE_ROOT, cache, log)
         wanted = {p.replace("\\", "/") for p in only_relpaths}
         files = [p for p in files if str(p.relative_to(github_dir)).replace("\\", "/") in wanted]
         log(f"Retrying {len(files)} skipped GitHub files only (no full folder scan)")
     else:
-        log(f"Uploading {len(files)} GitHub files into My Drive / {GITHUB_FOLDER} (parallel)")
+        # Full push: ALWAYS wipe every existing Github folder first, then upload
+        # fresh. Because the folder is empty afterwards there is nothing to skip
+        # and no index_folder_tree scan — that scan is what duplicated files (on a
+        # stale-empty wipe read) and hung on partial trees. Clean every time.
+        _wipe_all_github_folders(drive, log)
+        cache.clear()
+        root_id = _ensure_folder(drive, GITHUB_FOLDER, MY_DRIVE_ROOT, cache, log)
+        log(f"Uploading {len(files)} GitHub files into My Drive / {GITHUB_FOLDER} (fresh, parallel)")
     folder_ids = {"": root_id}
     parents = sorted(
         {"/".join(p.relative_to(github_dir).parts[:-1]) for p in files if len(p.relative_to(github_dir).parts) > 1},
@@ -151,10 +196,9 @@ def upload_github_folder(
     )
     for parent_rel in parents:
         folder_ids[parent_rel] = _ensure_path(drive, parent_rel, root_id, cache, log)
+    # Fresh folder on a full push -> nothing exists to skip. Only the recovery
+    # path consults per-file existence (find_child_file inside work()).
     existing: dict[str, tuple[int, str] | int] = {}
-    if only_relpaths is None:
-        existing = index_folder_tree(drive, root_id, log)
-        log(f"Github already has {len(existing)} files; same path+size kept, different size replaced")
     if creds is None:
         creds = getattr(getattr(drive, "_http", None), "credentials", None)
     if creds is None:

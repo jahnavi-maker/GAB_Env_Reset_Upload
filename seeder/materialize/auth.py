@@ -4,10 +4,18 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 from pathlib import Path
 import threading
 from typing import Any
 import uuid
+
+# Global backstop against infinite hangs. googleapiclient/httplib2 can stall
+# forever on a half-open socket (server keeps TCP alive but never responds),
+# which froze git uploads for 12+ min with no error. A process-wide default
+# socket timeout forces any such stall to raise instead of hang, so the
+# retry/skip logic can recover. Generous enough not to trip legit uploads.
+socket.setdefaulttimeout(int(os.environ.get("GAB_SOCKET_TIMEOUT", "120")))
 
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request

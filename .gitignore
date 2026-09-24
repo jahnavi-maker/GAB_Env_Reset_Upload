@@ -1,0 +1,39 @@
+# ---- Secrets (NEVER commit) ----
+.env
+.env.*
+!.env.example
+!deploy/.env.ec2.example
+**/credentials.json
+**/gab-sa.json
+**/client_secret*.json
+**/token*.json
+**/tokens/
+**/.oauth_pending.json
+
+# ---- Python ----
+**/.venv/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# ---- Runtime state / data (machine-local, not source) ----
+**/qc_logs/
+**/state/
+**/runs/
+**/uploads/
+**/persona_drive_cache/
+.reset_sessions.json
+*.manifest.json
+
+# ---- Large data artifacts ----
+*.zip
+PKJA_UltraEvals_Environments_/
+
+# ---- OS ----
+.DS_Store
+
+# ---- Engine drive cache (machine-local) ----
+**/drive-cache/
+GAB_Env_Reset_Upload/
+_old_clone_backup_*/
