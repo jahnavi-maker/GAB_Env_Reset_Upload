@@ -105,6 +105,25 @@
 
   let clientReady = false;
   const rows = [];  // {email, persona, rawP, valid, authorized, status, sid, uid}
+  // Persist the loaded table so navigating away/back or a refresh never wipes it
+  // (browser-only, sessionStorage; no passwords are on the onboard page).
+  const ONB_KEY = "gab_onboard_rows";
+  function persistRows(){
+    try { sessionStorage.setItem(ONB_KEY, JSON.stringify(rows)); } catch(e){}
+  }
+  function restoreRows(){
+    try {
+      const raw = sessionStorage.getItem(ONB_KEY);
+      if (!raw) return false;
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr) || !arr.length) return false;
+      rows.length = 0; arr.forEach(r => rows.push(r));
+      document.getElementById("tableCard").style.display = "block";
+      renderRows();
+      rows.forEach((row,i)=> refreshAuth(i));  // re-sync authorized state from the server
+      return true;
+    } catch(e){ return false; }
+  }
   // NOTE: this first page intentionally does NOT handle passwords. Passwords live
   // only on the Authorize-all workspace page (/onboard/authorize).
 
@@ -191,6 +210,7 @@
       tb.appendChild(tr);
     });
     updateCounts();
+    persistRows();  // keep the table saved so back/refresh never wipes it
   }
   function statusLabel(row){
     if(!row.valid) return "unknown persona";
@@ -278,6 +298,7 @@
   });
   document.getElementById("refreshAll").addEventListener("click", ()=>{ rows.forEach((r,i)=>{ refreshAuth(i); if(r.uid) pollSeed(i); }); });
 
+  restoreRows();   // re-fill the table from the last session so going back doesn't wipe it
   checkClient();
 </script>
 </body>
