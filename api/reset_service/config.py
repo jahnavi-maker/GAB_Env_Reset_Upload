@@ -123,6 +123,9 @@ class Settings:
     # then checks that email against the freelancers table. When empty (dev), the page
     # falls back to a plain email box. NOT a secret — safe to expose to the browser.
     google_client_id: str = os.environ.get("GOOGLE_CLIENT_ID", "")
+    # Browser origins allowed to call the API (CORS). Comma-separated. Cosmo's
+    # frontend calls the reset API from the browser, so its origin must be listed.
+    cors_allow_origins: str = os.environ.get("CORS_ALLOW_ORIGINS", "https://cosmo.deccanexperts.ai")
 
     # --- Freelancer reset links (tamper-proof) ------------------------------
     # HMAC secret for signing freelancer reset links. When set, the freelancer

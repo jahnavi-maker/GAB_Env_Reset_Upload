@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from . import __version__, engine, upload
@@ -110,6 +111,19 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="GAB Environment Reset API", version=__version__, lifespan=lifespan)
+
+# CORS: allow the platform frontend(s) (e.g. Cosmo) to call the API from the browser.
+# Origins come from CORS_ALLOW_ORIGINS (comma-separated). No credentials/cookies are
+# used (auth is a Bearer header), so allow_credentials stays False.
+_cors_origins = [o.strip().rstrip("/") for o in settings.cors_allow_origins.split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        allow_credentials=False,
+    )
 
 
 @app.exception_handler(Exception)
