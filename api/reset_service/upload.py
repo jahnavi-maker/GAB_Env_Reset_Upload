@@ -197,14 +197,16 @@ def complete_callback(code: str | None, state: str | None, error: str | None) ->
     try:
         flow.fetch_token(code=code)
     except Exception as exc:  # noqa: BLE001 - surface any token-exchange failure
-        raise UploadError(f"token exchange failed: {exc}") from exc
+        # Do NOT embed the exception text: a google-auth error can include the raw
+        # authorization code. The chained `from exc` keeps the traceback for debugging.
+        raise UploadError("token exchange failed") from exc
 
     creds = flow.credentials
     expected = pending["email"]
     try:
         got = auth.connected_email(creds)
     except Exception as exc:  # noqa: BLE001
-        raise UploadError(f"could not verify account email: {exc}") from exc
+        raise UploadError("could not verify account email") from exc
 
     if got != expected:
         # Wrong Google account picked at the consent screen. Do not persist.

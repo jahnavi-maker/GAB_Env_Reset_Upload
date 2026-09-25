@@ -10,6 +10,22 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def _int_env(name: str, default: int) -> int:
+    """Parse an int env var, falling back to the default on a bad value instead of
+    crashing startup with a raw ValueError traceback."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        import logging
+        logging.getLogger("reset_service.config").warning(
+            "invalid int for %s=%r; using default %d", name, raw, default
+        )
+        return default
+
+
 def _load_dotenv() -> None:
     """Load KEY=VALUE lines from the nearest .env into os.environ.
 
@@ -28,7 +44,12 @@ def _load_dotenv() -> None:
         if env_path in seen or not env_path.exists():
             continue
         seen.add(env_path)
-        for line in env_path.read_text(encoding="utf-8").splitlines():
+        try:
+            text = env_path.read_text(encoding="utf-8")
+        except OSError:
+            # An unreadable/locked .env must not crash startup — real env vars still apply.
+            continue
+        for line in text.splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
@@ -68,24 +89,22 @@ class Settings:
     # every account/op — see engine._resolve_services. This value is retained for
     # reference/back-compat but is intentionally ignored by the resolver.
     reset_services: str = os.environ.get("GAB_RESET_SERVICES", "")
-    reset_timeout_s: int = int(os.environ.get("GAB_RESET_TIMEOUT_S", "5400"))  # 90 min
+    reset_timeout_s: int = _int_env("GAB_RESET_TIMEOUT_S", 5400)  # 90 min
     # A queued/running session older than this is presumed dead (task crashed, DB
     # write blipped, or the process restarted) and is reaped -> 'failed', so the
     # one-active-per-email lock can't block an account forever. Must exceed the max
     # legit runtime (reset_timeout_s) + a buffer.
-    stuck_reset_ttl_s: int = int(
-        os.environ.get("STUCK_RESET_TTL_S") or (int(os.environ.get("GAB_RESET_TIMEOUT_S", "5400")) + 1800)
-    )
-    reaper_interval_s: int = int(os.environ.get("REAPER_INTERVAL_S", "600"))  # sweep every 10 min
+    stuck_reset_ttl_s: int = _int_env("STUCK_RESET_TTL_S", _int_env("GAB_RESET_TIMEOUT_S", 5400) + 1800)
+    reaper_interval_s: int = _int_env("REAPER_INTERVAL_S", 600)  # sweep every 10 min
 
     # --- Parallelism + routing + QC logging ---------------------------------
     # Max resets running concurrently across accounts. Each account still runs
     # serially inside the engine; this caps parallelism + total Google quota use.
-    reset_concurrency: int = int(os.environ.get("RESET_CONCURRENCY", "10"))
+    reset_concurrency: int = _int_env("RESET_CONCURRENCY", 10)
     # Separate, lower cap for git+quota-heavy seed/reseed (first upload). delta/reset
     # use reset_concurrency; seed/reseed use this. ~6-8 is the safe ceiling per quota
     # bucket before Drive backoff kicks in on big batches.
-    seed_concurrency: int = int(os.environ.get("SEED_CONCURRENCY", "6"))
+    seed_concurrency: int = _int_env("SEED_CONCURRENCY", 6)
     # Auto-decide delta vs reseed from gab_accounts.last_reset_persona.
     reset_auto_route: bool = _flag("RESET_AUTO_ROUTE", True)
     # Compact per-task QC logs (purged on QC confirm).
@@ -95,8 +114,15 @@ class Settings:
     # QC logs are auto-purged this many days after they were last written. DB audit
     # rows are always kept. QC itself can no longer purge (review-only); this job and
     # the Bearer-protected /api/qc/{id}/confirm are the only ways a log is deleted.
-    qc_log_retention_days: int = int(os.environ.get("QC_LOG_RETENTION_DAYS", "15"))
+    qc_log_retention_days: int = _int_env("QC_LOG_RETENTION_DAYS", 15)
     accounts_table: str = os.environ.get("SUPABASE_ACCOUNTS_TABLE", "gab_accounts")
+    # Allow-list of freelancers permitted to open the reset page (email-only check).
+    freelancers_table: str = os.environ.get("SUPABASE_FREELANCERS_TABLE", "freelancers")
+    # OAuth web client id for "Sign in with Google" on the reset page (public value).
+    # When set, the reset page requires a Google sign-in (email proven by Google) and
+    # then checks that email against the freelancers table. When empty (dev), the page
+    # falls back to a plain email box. NOT a secret — safe to expose to the browser.
+    google_client_id: str = os.environ.get("GOOGLE_CLIENT_ID", "")
 
     # --- Freelancer reset links (tamper-proof) ------------------------------
     # HMAC secret for signing freelancer reset links. When set, the freelancer
@@ -105,7 +131,7 @@ class Settings:
     # Leave empty ONLY in dev (falls back to the legacy raw-id path, with a warning).
     reset_link_secret: str = os.environ.get("RESET_LINK_SECRET", "")
     # How long a freelancer link stays valid (default 7 days).
-    reset_link_ttl_s: int = int(os.environ.get("RESET_LINK_TTL_S", str(7 * 24 * 3600)))
+    reset_link_ttl_s: int = _int_env("RESET_LINK_TTL_S", 7 * 24 * 3600)
 
     # When set, do NOT call Google at all — simulate a short successful reset.
     # Lets the whole API + Supabase path be tested without credentials.

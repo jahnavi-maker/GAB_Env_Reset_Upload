@@ -15,11 +15,17 @@ os.environ["GAB_RESET_SIMULATE"] = "1"
 os.environ["RESET_API_KEY"] = "test-key"
 os.environ["SUPABASE_URL"] = ""
 os.environ["SUPABASE_KEY"] = ""
+os.environ["GOOGLE_CLIENT_ID"] = ""  # keep Google sign-in OFF for these tests
 os.environ["LOCAL_STORE_PATH"] = os.path.join(tempfile.mkdtemp(), "sessions.json")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
 from reset_service.app import app  # noqa: E402
+from reset_service.config import settings  # noqa: E402
+
+# The store writes to settings.local_store_path (fixed at first import). Read that,
+# not os.environ, so another test module setting LOCAL_STORE_PATH can't mislead us.
+STORE_PATH = settings.local_store_path
 
 AUTH = {"Authorization": "Bearer test-key"}
 BODY = {
@@ -62,7 +68,7 @@ class ResetApiTest(unittest.TestCase):
     def test_password_not_persisted(self) -> None:
         r = self.client.post("/api/environment/reset", json=BODY, headers=AUTH)
         sid = r.json()["url"].rstrip("/").split("/")[-1]
-        with open(os.environ["LOCAL_STORE_PATH"], encoding="utf-8") as fh:
+        with open(STORE_PATH, encoding="utf-8") as fh:
             raw = fh.read()
         self.assertIn(sid, raw)
         self.assertNotIn("should-not-be-stored", raw)
@@ -106,7 +112,7 @@ class UploadApiTest(unittest.TestCase):
         self.assertEqual(gd["status"], "completed")
 
         # The upload row is audited as mode='upload' even though the engine ran `seed`.
-        with open(os.environ["LOCAL_STORE_PATH"], encoding="utf-8") as fh:
+        with open(STORE_PATH, encoding="utf-8") as fh:
             raw = fh.read()
         self.assertIn(usid, raw)
         self.assertNotIn("should-not-be-stored", raw)

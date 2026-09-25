@@ -129,3 +129,50 @@ class ResetResponse(BaseModel):
     error: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+
+
+# --- Freelancer allow-list (email-only access gate for the reset page) ---------
+class FreelancerItem(BaseModel):
+    email: str = Field(..., min_length=3)
+    name: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def _norm(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if "@" not in v:
+            raise ValueError("email must contain @")
+        return v
+
+
+class FreelancerUpsertRequest(BaseModel):
+    """Add/update freelancers. Accepts a single {email,name} or a bulk list.
+
+    Used by the Cosmo / Deccan Experts platform to populate the allow-list.
+    """
+    email: Optional[str] = None
+    name: Optional[str] = None
+    freelancers: Optional[list[FreelancerItem]] = None
+
+    def items(self) -> list[FreelancerItem]:
+        rows: list[FreelancerItem] = list(self.freelancers or [])
+        if self.email:
+            rows.append(FreelancerItem(email=self.email, name=self.name))
+        return rows
+
+
+class FreelancerVerifyRequest(BaseModel):
+    """Body for POST /ui/freelancer/verify — the reset page's login check.
+
+    Prefer ``credential`` (a Google ID token) so the email is PROVEN by Google and
+    can't be spoofed. ``email`` is the dev fallback used only when Google sign-in is
+    not configured on the server (no GOOGLE_CLIENT_ID).
+    """
+    credential: Optional[str] = None
+    email: Optional[str] = None
+
+
+class FreelancerVerifyResponse(BaseModel):
+    verified: bool
+    name: Optional[str] = None
+    email: Optional[str] = None

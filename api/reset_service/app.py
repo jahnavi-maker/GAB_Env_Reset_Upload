@@ -13,6 +13,7 @@ inside the engine, and one-active-per-email is enforced by a DB partial index.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -31,7 +32,11 @@ from .config import settings
 from .db import Store, make_store
 from . import links
 from .models import (
+    FreelancerItem,
     FreelancerResetRequest,
+    FreelancerUpsertRequest,
+    FreelancerVerifyRequest,
+    FreelancerVerifyResponse,
     ResetLinkRequest,
     ResetLinkResponse,
     ResetRequest,
@@ -134,7 +139,7 @@ async def require_api_key(authorization: str | None = Header(default=None)) -> N
     if not settings.api_key:
         return  # dev mode, auth disabled (warned at startup)
     expected = f"Bearer {settings.api_key}"
-    if authorization != expected:
+    if not authorization or not hmac.compare_digest(authorization, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing or invalid bearer token",
@@ -191,6 +196,9 @@ async def _decide_mode(store: Store, email: str, persona: str, explicit: str | N
             {"select": "last_reset_persona", "email": f"eq.{email}", "limit": "1"},
         )
     except Exception:
+        # A lookup failure here would silently route to a full wipe (reseed); log it
+        # loudly so an outage is visible and not mistaken for a first-time account.
+        log.exception("mode-routing lookup failed for %s; defaulting to reseed", email)
         rows = []
     if not rows or not rows[0].get("last_reset_persona"):
         return "reseed"                       # unknown account / never reset -> establish baseline
@@ -373,61 +381,16 @@ async def healthz() -> dict:
 # Single-button UI (same-origin; not the platform's Bearer-protected API).     #
 # The page passes the logged-in user's email/persona via query string.         #
 # --------------------------------------------------------------------------- #
-@app.get("/", response_class=HTMLResponse)
-async def ui_index() -> HTMLResponse:
-    # The reset dashboard is the main page; the single-button page stays at /simple.
-    return HTMLResponse((STATIC_DIR / "dashboard.html").read_text(encoding="utf-8"))
-
-
-@app.get("/simple", response_class=HTMLResponse)
-async def ui_simple() -> HTMLResponse:
-    return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+@app.get("/")
+async def ui_root() -> RedirectResponse:
+    # No public landing/dashboard: send operators to the onboarding page.
+    return RedirectResponse(url="/onboard", status_code=307)
 
 
 @app.get("/authorized", response_class=HTMLResponse)
 async def ui_authorized_landing() -> HTMLResponse:
     """Where the OAuth consent tab lands (clear 'authorized / return to onboarding')."""
     return HTMLResponse((STATIC_DIR / "authorized.html").read_text(encoding="utf-8"))
-
-
-@app.get("/ui/accounts")
-async def ui_accounts(store: Store = Depends(get_store)) -> list:
-    """Accounts from gab_accounts for the dashboard (non-sensitive fields)."""
-    table = os.environ.get("SUPABASE_ACCOUNTS_TABLE", "gab_accounts")
-    try:
-        return await store.query(table, {
-            "select": "email,persona,authorized,status,last_reset_persona,last_reset_at",
-            "order": "email.asc",
-        })
-    except Exception as exc:
-        log.warning("ui_accounts query failed: %s", exc)
-        return []
-
-
-@app.get("/ui/sessions")
-async def ui_sessions(store: Store = Depends(get_store)) -> list:
-    """Recent operations from reset_sessions for the dashboard."""
-    table = settings.supabase_table
-    try:
-        return await store.query(table, {
-            "select": "reset_session_id,email,persona,mode,status,task_allocation_id,started_at,completed_at,created_at",
-            "order": "created_at.desc",
-            "limit": "25",
-        })
-    except Exception as exc:
-        log.warning("ui_sessions query failed: %s", exc)
-        return []
-
-
-@app.post("/ui/reset")
-async def ui_reset(req: ResetRequest, background: BackgroundTasks, store: Store = Depends(get_store)) -> dict:
-    try:
-        reset_session_id, op_mode = await _launch_reset(
-            store, background, req.email, req.persona, req.task_allocation_id, req.mode, req.services
-        )
-    except ActiveResetConflict:
-        raise HTTPException(status_code=409, detail="an active reset already exists for this account")
-    return {"reset_session_id": reset_session_id, "status": "in_progress", "mode": op_mode}
 
 
 @app.get("/reset/status/{reset_session_id}", response_class=HTMLResponse)
@@ -621,7 +584,7 @@ async def create_reset(
         raise HTTPException(status_code=409, detail="an active reset already exists for this account")
     except Exception as exc:
         log.exception("failed to create session row")
-        raise HTTPException(status_code=502, detail=f"session store error: {exc}") from exc
+        raise HTTPException(status_code=502, detail="could not create the reset session; please retry") from exc
 
     # url = the status endpoint for this reset. Open it in a browser for the live
     # page, or GET it from code for JSON ({url, status, error}).
@@ -648,6 +611,100 @@ async def create_reset_link(req: ResetLinkRequest) -> ResetLinkResponse:
         reset_url=f"{settings.public_base_url}/reset#t={token}",
         expires_at=exp,
     )
+
+
+# --------------------------------------------------------------------------- #
+# FREELANCER ALLOW-LIST. The Cosmo / Deccan Experts platform manages the list   #
+# of verified freelancers here (Bearer-protected). The reset page then checks a  #
+# freelancer's OWN email against it (same-origin /ui/freelancer/verify) before   #
+# showing the reset flow. This is an identity gate only; it does not change      #
+# which environment a freelancer resets.                                         #
+# --------------------------------------------------------------------------- #
+@app.post("/api/freelancers", dependencies=[Depends(require_api_key)])
+async def upsert_freelancers(
+    req: FreelancerUpsertRequest, store: Store = Depends(get_store)
+) -> dict:
+    rows = req.items()
+    if not rows:
+        raise HTTPException(status_code=422, detail="provide 'email' (and optional 'name') or 'freelancers'")
+    saved: list[str] = []
+    for item in rows:
+        await store.upsert_freelancer(item.email, item.name)
+        saved.append(item.email)
+    return {"upserted": len(saved), "emails": saved}
+
+
+@app.get("/api/freelancers", dependencies=[Depends(require_api_key)])
+async def list_freelancers(store: Store = Depends(get_store)) -> dict:
+    rows = await store.list_freelancers()
+    return {"count": len(rows), "freelancers": rows}
+
+
+@app.delete("/api/freelancers/{email}", dependencies=[Depends(require_api_key)])
+async def delete_freelancer(email: str, store: Store = Depends(get_store)) -> dict:
+    await store.delete_freelancer(email)
+    return {"deleted": email.strip().lower()}
+
+
+@app.get("/ui/auth-config")
+async def ui_auth_config() -> dict:
+    """Public: tells the reset page whether Google sign-in is enabled and, if so,
+    which client id to use. Empty client id -> the page uses the email fallback."""
+    return {"google_client_id": settings.google_client_id or ""}
+
+
+def _verify_google_credential(credential: str) -> str | None:
+    """Verify a Google ID token and return its verified email, or None.
+
+    Checks the signature against Google's public keys, the audience (our client id),
+    and that Google marked the email verified. Any failure returns None (no trust)."""
+    if not settings.google_client_id:
+        return None
+    try:
+        from google.oauth2 import id_token as google_id_token
+        from google.auth.transport import requests as google_requests
+
+        info = google_id_token.verify_oauth2_token(
+            credential, google_requests.Request(), settings.google_client_id
+        )
+    except Exception:  # noqa: BLE001 - a bad/expired/forged token is simply untrusted
+        log.warning("google credential verification failed")
+        return None
+    if info.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+        return None
+    if not info.get("email") or not info.get("email_verified"):
+        return None
+    return str(info["email"]).strip().lower()
+
+
+@app.post("/ui/freelancer/verify", response_model=FreelancerVerifyResponse)
+async def verify_freelancer(
+    req: FreelancerVerifyRequest, store: Store = Depends(get_store)
+) -> FreelancerVerifyResponse:
+    """Login check for the reset page. When Google sign-in is configured, the email is
+    taken from a verified Google ID token (can't be spoofed); otherwise it falls back
+    to a plain email (dev only). The resolved email is then checked against the
+    freelancers allow-list. Returns {verified, name, email}."""
+    if settings.google_client_id:
+        # Google enabled -> ONLY trust an email proven by a Google ID token.
+        email = _verify_google_credential(req.credential or "")
+        if not email:
+            return FreelancerVerifyResponse(verified=False)
+    else:
+        # Dev fallback: no Google configured, accept the typed email.
+        email = (req.email or "").strip().lower()
+        if not email or "@" not in email:
+            return FreelancerVerifyResponse(verified=False)
+
+    try:
+        row = await store.get_freelancer(email)
+    except Exception:  # noqa: BLE001 - a store hiccup must not leak details to the page
+        log.exception("freelancer verify lookup failed")
+        raise HTTPException(status_code=503, detail="verification temporarily unavailable")
+    # active defaults to True when the column/field is absent.
+    if row and row.get("active", True):
+        return FreelancerVerifyResponse(verified=True, name=row.get("name"), email=email)
+    return FreelancerVerifyResponse(verified=False, email=email)
 
 
 # --------------------------------------------------------------------------- #
@@ -721,7 +778,7 @@ async def create_upload(
         usid, tid, auth_url = await _start_upload(store, background, req.email, req.persona, req.services)
     except Exception as exc:
         log.exception("failed to start upload")
-        raise HTTPException(status_code=502, detail=f"upload start failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail="could not start the upload; please retry") from exc
     return UploadResponse(
         upload_session_id=usid,
         task_allocation_id=tid,
@@ -846,7 +903,7 @@ async def ui_upload(
         usid, tid, auth_url = await _start_upload(store, background, req.email, req.persona, req.services)
     except Exception as exc:
         log.exception("ui upload start failed")
-        raise HTTPException(status_code=502, detail=f"upload start failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail="could not start the upload; please retry") from exc
     return {
         "upload_session_id": usid,
         "task_allocation_id": tid,
@@ -909,7 +966,7 @@ async def ui_authorize(req: UploadRequest, store: Store = Depends(get_store)) ->
         )
     except Exception as exc:
         log.exception("ui authorize init failed")
-        raise HTTPException(status_code=502, detail=f"oauth init failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail="could not start Google authorization; please retry") from exc
     return {"email": req.email.lower(), "persona": req.persona, "auth_url": auth_url}
 
 
@@ -922,6 +979,7 @@ async def ui_account(email: str, store: Store = Depends(get_store)) -> dict:
             {"select": "email,persona,authorized,last_reset_persona", "email": f"eq.{email.lower()}", "limit": "1"},
         )
     except Exception:
+        log.warning("ui_account lookup failed for %s", email, exc_info=True)
         rows = []
     r = rows[0] if rows else {}
     return {
@@ -947,6 +1005,8 @@ async def ui_seed(
             {"select": "authorized", "email": f"eq.{email}", "limit": "1"},
         )
     except Exception:
+        # Don't mask a store outage as "not authorized" silently — log it.
+        log.warning("authorized-state lookup failed for %s", email, exc_info=True)
         acct = []
     if not acct or not acct[0].get("authorized"):
         raise HTTPException(status_code=400, detail="account not authorized yet")
@@ -956,7 +1016,7 @@ async def ui_seed(
         if "409" in str(exc) or "duplicate" in str(exc).lower() or "conflict" in str(exc).lower():
             raise HTTPException(status_code=409, detail="an operation is already running for this account") from exc
         log.exception("ui seed failed")
-        raise HTTPException(status_code=502, detail=f"seed failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail="seeding could not start; please retry") from exc
     return {"reset_session_id": rsid, "task_allocation_id": tid, "status": "in_progress"}
 
 
@@ -1005,6 +1065,7 @@ async def qc_read(task_allocation_id: str, store: Store = Depends(get_store)) ->
             "order": "created_at.desc",
         })
     except Exception:
+        log.warning("qc sessions lookup failed for %s", task_allocation_id, exc_info=True)
         sessions = []
     return {"task_allocation_id": task_allocation_id, "log_records": logs, "sessions": sessions}
 
@@ -1045,6 +1106,7 @@ async def ui_qc_read(task_allocation_id: str, store: Store = Depends(get_store))
             "order": "created_at.desc",
         })
     except Exception:
+        log.warning("qc sessions lookup failed for %s", task_allocation_id, exc_info=True)
         sessions = []
     return {"task_allocation_id": task_allocation_id, "log_records": logs, "sessions": sessions}
 

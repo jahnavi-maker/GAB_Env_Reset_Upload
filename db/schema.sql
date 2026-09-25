@@ -56,3 +56,22 @@ create index if not exists idx_reset_sessions_status on reset_sessions (status);
 create unique index if not exists uniq_active_reset_per_email
     on reset_sessions (email)
     where status in ('queued', 'running');
+
+-- ---------------------------------------------------------------------------
+-- freelancers : the allow-list of people permitted to open the reset page.
+-- Populated by the Cosmo / Deccan Experts platform (POST /api/freelancers).
+-- The reset page verifies the logged-in freelancer's OWN email against this
+-- table (email-only check); it does NOT decide which environment they reset.
+-- ---------------------------------------------------------------------------
+create table if not exists freelancers (
+    email       text primary key,                      -- stored lowercased
+    name        text,
+    active      boolean     not null default true,      -- flip to false to revoke access
+    created_at  timestamptz not null default now(),
+    updated_at  timestamptz not null default now()
+);
+create index if not exists idx_freelancers_active on freelancers (active);
+
+drop trigger if exists trg_freelancers_updated on freelancers;
+create trigger trg_freelancers_updated before update on freelancers
+    for each row execute function set_updated_at();

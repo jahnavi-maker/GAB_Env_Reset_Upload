@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -37,8 +38,29 @@ class Store:
     async def get(self, reset_session_id: str) -> Optional[dict[str, Any]]:
         raise NotImplementedError
 
+    # --- freelancers allow-list (email-only access check for the reset page) ---
+    async def upsert_freelancer(self, email: str, name: str | None = None) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def get_freelancer(self, email: str) -> Optional[dict[str, Any]]:
+        raise NotImplementedError
+
+    async def list_freelancers(self) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    async def delete_freelancer(self, email: str) -> None:
+        raise NotImplementedError
+
     async def aclose(self) -> None:
         pass
+
+
+def _norm_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class SupabaseStore(Store):
@@ -96,6 +118,44 @@ class SupabaseStore(Store):
         r = await self._client.patch(f"{base}/rest/v1/{table}", params=params, json=fields)
         r.raise_for_status()
 
+    def _fl_url(self) -> str:
+        return f"{settings.supabase_url.rstrip('/')}/rest/v1/{settings.freelancers_table}"
+
+    async def upsert_freelancer(self, email: str, name: str | None = None) -> dict[str, Any]:
+        rec: dict[str, Any] = {"email": _norm_email(email)}
+        if name is not None:
+            rec["name"] = name
+        r = await self._client.post(
+            self._fl_url(),
+            json=rec,
+            headers={"Prefer": "resolution=merge-duplicates,return=representation"},
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else rec
+
+    async def get_freelancer(self, email: str) -> Optional[dict[str, Any]]:
+        r = await self._client.get(
+            self._fl_url(), params={"email": f"eq.{_norm_email(email)}", "limit": "1"}
+        )
+        if r.status_code == 400:
+            return None
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else None
+
+    async def list_freelancers(self) -> list[dict[str, Any]]:
+        r = await self._client.get(
+            self._fl_url(),
+            params={"select": "email,name,active,created_at", "order": "created_at.desc"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def delete_freelancer(self, email: str) -> None:
+        r = await self._client.delete(self._fl_url(), params={"email": f"eq.{_norm_email(email)}"})
+        r.raise_for_status()
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
@@ -105,6 +165,8 @@ class LocalJsonStore(Store):
 
     def __init__(self, path: str) -> None:
         self._path = Path(path)
+        # Freelancers live in a sibling file so they don't mix with session rows.
+        self._fl_path = self._path.with_name(self._path.stem + ".freelancers.json")
         self._lock = asyncio.Lock()
         if not self._path.exists():
             self._path.write_text("{}", encoding="utf-8")
@@ -146,6 +208,41 @@ class LocalJsonStore(Store):
     async def patch_table(self, table: str, params: dict[str, str], fields: dict[str, Any]) -> None:
         # Dev fallback: no gab_accounts locally; no-op.
         return None
+
+    def _read_fl(self) -> dict[str, Any]:
+        try:
+            return json.loads(self._fl_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _write_fl(self, data: dict[str, Any]) -> None:
+        self._fl_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+
+    async def upsert_freelancer(self, email: str, name: str | None = None) -> dict[str, Any]:
+        async with self._lock:
+            data = self._read_fl()
+            key = _norm_email(email)
+            rec = data.get(key) or {"email": key, "active": True, "created_at": _now_iso()}
+            if name is not None:
+                rec["name"] = name
+            rec.setdefault("active", True)
+            data[key] = rec
+            self._write_fl(data)
+        return rec
+
+    async def get_freelancer(self, email: str) -> Optional[dict[str, Any]]:
+        async with self._lock:
+            return self._read_fl().get(_norm_email(email))
+
+    async def list_freelancers(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            return list(self._read_fl().values())
+
+    async def delete_freelancer(self, email: str) -> None:
+        async with self._lock:
+            data = self._read_fl()
+            if data.pop(_norm_email(email), None) is not None:
+                self._write_fl(data)
 
 
 def make_store() -> Store:
