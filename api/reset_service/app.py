@@ -460,6 +460,26 @@ def _task_id_from_request(token: str | None, raw_task: str | None) -> str | None
     return raw_task  # dev fallback only
 
 
+def _resolve_from_request(
+    token: str | None, raw_task: str | None
+) -> tuple[str | None, str | None, str | None]:
+    """Like ``_task_id_from_request`` but also returns any account (email, persona)
+    bound INTO a signed token. Returns (task_allocation_id, email, persona); email and
+    persona are None unless the token carried them. Raises HTTPException on a bad/absent
+    token when signing is enforced."""
+    if token:
+        try:
+            payload = links.verify_full(token)
+        except links.TokenError as exc:
+            raise HTTPException(status_code=403, detail=f"invalid or expired reset link: {exc}")
+        email = (payload.get("eml") or "").strip().lower() or None
+        persona = (payload.get("per") or "").strip() or None
+        return str(payload["tid"]), email, persona
+    if links.enabled():
+        raise HTTPException(status_code=403, detail="a signed reset link is required")
+    return raw_task, None, None  # dev fallback only
+
+
 async def _email_for_task(store: Store, task_allocation_id: str) -> str | None:
     """Resolve the account email bound to a task id (latest reset_sessions row)."""
     try:
@@ -490,8 +510,8 @@ async def ui_task(
     display only. In dev (no secret) a raw task_allocation_id/email is accepted.
     Everything is in the POST body, never the query string.
     """
-    task_allocation_id = _task_id_from_request(req.token, req.task_allocation_id)
-    email = None if req.token else ((req.email or "").lower() or None)
+    task_allocation_id, tok_email, tok_persona = _resolve_from_request(req.token, req.task_allocation_id)
+    email = tok_email or (None if req.token else ((req.email or "").lower() or None))
     if not (task_allocation_id or email):
         raise HTTPException(status_code=400, detail="provide a reset link")
     params = {
@@ -509,12 +529,13 @@ async def ui_task(
         log.warning("ui_task lookup failed: %s", exc)
         rows = []
     row = rows[0] if rows else {}
-    email = (row.get("email") or email or "").lower() or None
+    email = (tok_email or row.get("email") or email or "").lower() or None
 
     # Persona is shown (read-only) so the freelancer can see which environment they
-    # are resetting. Resolved from gab_accounts, same source the reset itself uses.
-    persona = None
-    if email:
+    # are resetting. Prefer the persona bound into the signed link; else resolve from
+    # gab_accounts, the same source the reset itself uses.
+    persona = tok_persona
+    if not persona and email:
         try:
             arows = await store.query(
                 settings.accounts_table,
@@ -543,13 +564,14 @@ async def ui_task_reset(
     """Freelancer-triggered reset. The account, task id and persona are all resolved
     server-side from the signed token, so the freelancer can neither see nor change
     which account is reset. Auto-routes delta vs reseed like any reset."""
-    task_allocation_id = _task_id_from_request(req.token, req.task_allocation_id)
+    task_allocation_id, tok_email, tok_persona = _resolve_from_request(req.token, req.task_allocation_id)
     if not task_allocation_id:
         raise HTTPException(status_code=400, detail="a signed reset link is required")
 
-    # In token mode the email is derived from the task (never trusted from the client).
+    # In token mode the account is derived from the signed token / task, never trusted
+    # from the client. Prefer the email bound into the token; else the latest reset row.
     if req.token:
-        email = await _email_for_task(store, task_allocation_id)
+        email = tok_email or await _email_for_task(store, task_allocation_id)
         if not email:
             raise HTTPException(status_code=404, detail="this task has no account on file")
     else:
@@ -558,16 +580,18 @@ async def ui_task_reset(
             raise HTTPException(status_code=400, detail="email required")
     email = email.lower()
 
-    persona = None
-    try:
-        rows = await store.query(
-            settings.accounts_table,
-            {"select": "persona,last_reset_persona", "email": f"eq.{email}", "limit": "1"},
-        )
-        if rows:
-            persona = rows[0].get("last_reset_persona") or rows[0].get("persona")
-    except Exception as exc:
-        log.warning("persona lookup failed for %s: %s", email, exc)
+    # Prefer the persona bound into the signed link; else resolve from gab_accounts.
+    persona = tok_persona
+    if not persona:
+        try:
+            rows = await store.query(
+                settings.accounts_table,
+                {"select": "persona,last_reset_persona", "email": f"eq.{email}", "limit": "1"},
+            )
+            if rows:
+                persona = rows[0].get("last_reset_persona") or rows[0].get("persona")
+        except Exception as exc:
+            log.warning("persona lookup failed for %s: %s", email, exc)
     if not persona:
         raise HTTPException(status_code=400, detail="account not provisioned (no persona on file)")
     try:
@@ -617,7 +641,11 @@ async def create_reset_link(req: ResetLinkRequest) -> ResetLinkResponse:
     if not links.enabled():
         raise HTTPException(status_code=400, detail="RESET_LINK_SECRET is not configured on the server")
     try:
-        token, exp = links.mint(req.task_allocation_id, req.ttl_s)
+        token, exp = links.mint(
+            req.task_allocation_id, req.ttl_s,
+            email=(req.email or "").strip().lower() or None,
+            persona=(req.persona or "").strip() or None,
+        )
     except links.TokenError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return ResetLinkResponse(

@@ -46,19 +46,38 @@ def _sign(body: str) -> str:
     return _b64u(mac.digest())
 
 
-def mint(task_allocation_id: str, ttl_s: int | None = None) -> tuple[str, int]:
-    """Sign a token for a task. Returns (token, expires_at_unix). Requires a secret."""
+def mint(
+    task_allocation_id: str,
+    ttl_s: int | None = None,
+    *,
+    email: str | None = None,
+    persona: str | None = None,
+) -> tuple[str, int]:
+    """Sign a token for a task. Returns (token, expires_at_unix). Requires a secret.
+
+    ``email`` and ``persona`` (optional) bind the demo account + persona to the link
+    so the reset page can resolve them WITHOUT a pre-existing reset_sessions row (the
+    "authenticate, then reset" flow). They are HMAC-signed, so the freelancer can see
+    but never change which account is reset. Omit them to keep the legacy task-only
+    token (resolved from reset_sessions/gab_accounts as before).
+    """
     if not enabled():
         raise TokenError("RESET_LINK_SECRET is not set; cannot mint signed links")
     if not task_allocation_id:
         raise TokenError("task_allocation_id is required")
     exp = int(time.time()) + int(ttl_s if ttl_s is not None else settings.reset_link_ttl_s)
-    body = _b64u(json.dumps({"tid": task_allocation_id, "exp": exp}, separators=(",", ":")).encode("utf-8"))
+    payload: dict = {"tid": task_allocation_id, "exp": exp}
+    if email:
+        payload["eml"] = str(email)
+    if persona:
+        payload["per"] = str(persona)
+    body = _b64u(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     return f"{body}.{_sign(body)}", exp
 
 
-def verify(token: str) -> str:
-    """Verify a token and return its task_allocation_id, or raise TokenError."""
+def verify_full(token: str) -> dict:
+    """Verify a token and return its full payload dict ({tid, exp, eml?, per?}),
+    or raise TokenError. Signature + expiry are checked here."""
     if not enabled():
         raise TokenError("RESET_LINK_SECRET is not set; token verification disabled")
     if not token or "." not in token:
@@ -75,4 +94,9 @@ def verify(token: str) -> str:
         raise TokenError("token payload missing task id")
     if int(payload.get("exp", 0)) < time.time():
         raise TokenError("token expired")
-    return str(payload["tid"])
+    return payload
+
+
+def verify(token: str) -> str:
+    """Verify a token and return its task_allocation_id, or raise TokenError."""
+    return str(verify_full(token)["tid"])

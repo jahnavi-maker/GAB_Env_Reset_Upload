@@ -126,7 +126,7 @@
       <div class="pad">
         <div class="rowtop">
           <div>
-            <div class="rid" id="pRid">RST-—</div>
+            <div class="rid" id="pRid">Environment reset</div>
             <div class="who" id="pWho">—</div>
           </div>
           <span class="pill queued" id="pPill">Queued</span>
@@ -142,6 +142,12 @@
       <div class="pad">
         <div class="foot" id="pFoot">Waiting for the central reset worker.</div>
         <div class="err-detail" id="pErr"></div>
+        <!-- Session ID: revealed ONLY when the reset is completed, to copy into Cosmo -->
+        <div id="sidBox" class="field hidden" style="margin-top:14px;">
+          <div class="label">Reset Session ID — paste this into Cosmo</div>
+          <div class="value" id="sidVal" style="margin:4px 0 10px;">—</div>
+          <button id="copyBtn" type="button">Copy Session ID</button>
+        </div>
         <button id="againBtn" class="hidden">Reset again</button>
       </div>
     </div>
@@ -164,6 +170,16 @@
 
   const STEPS = ["Authenticate","Inspect changes","Restore Drive","Restore Gmail","Restore Calendar","Verify baseline","Complete"];
   const $ = id => document.getElementById(id);
+
+  // The reset session id is held back until the reset COMPLETES, then shown with a
+  // Copy button so the freelancer can paste it into Cosmo. It is never displayed while
+  // the reset is queued/running or on failure.
+  let RESET_ID = null;
+  function revealSessionId(id){
+    if(!id) return;
+    $("sidVal").textContent = id;
+    $("sidBox").classList.remove("hidden");
+  }
 
   function setVal(el, text){ if(text){ el.textContent=text; el.classList.remove("empty"); } else { el.textContent="—"; el.classList.add("empty"); } }
   function shortRid(id){ return id ? ("RST-" + String(id).replace(/-/g,"").slice(0,12).toUpperCase()) : "RST-—"; }
@@ -260,7 +276,8 @@
       const r = await fetch("/ui/reset/" + encodeURIComponent(id));
       const d = await r.json();
       renderProgress(d.status, d.error);
-      if (d.status === "completed" || d.status === "failed") return;
+      if (d.status === "completed"){ revealSessionId(RESET_ID || id); return; }
+      if (d.status === "failed") return;
     } catch(e){ /* transient; keep polling */ }
     setTimeout(()=>poll(id), 2000);
   }
@@ -282,7 +299,7 @@
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
-      $("pRid").textContent = shortRid(d.reset_session_id);
+      RESET_ID = d.reset_session_id;   // held back; shown only on completion
       renderProgress(d.status || "running", null);
       poll(d.reset_session_id);
     } catch(e){
@@ -292,6 +309,20 @@
 
   $("resetBtn").addEventListener("click", startReset);
   $("againBtn").addEventListener("click", ()=>{ location.reload(); });
+  $("copyBtn").addEventListener("click", async ()=>{
+    const id = $("sidVal").textContent || "";
+    if(!id || id === "—") return;
+    try { await navigator.clipboard.writeText(id); }
+    catch(_){
+      // Fallback for browsers/contexts without the async clipboard API.
+      const range = document.createRange(); range.selectNodeContents($("sidVal"));
+      const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      try { document.execCommand("copy"); } catch(e){}
+      sel.removeAllRanges();
+    }
+    const b = $("copyBtn"), t = b.textContent; b.textContent = "Copied ✓";
+    setTimeout(()=>{ b.textContent = t; }, 1500);
+  });
 
   // ----- Freelancer login gate ------------------------------------------------
   // The freelancer must prove their OWN email before the task is shown. When the

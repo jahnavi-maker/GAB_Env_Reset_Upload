@@ -82,6 +82,8 @@ class FreelancerResetRequest(BaseModel):
 class ResetLinkRequest(BaseModel):
     """Body for POST /api/reset-link (Bearer): mint a signed freelancer link."""
     task_allocation_id: str = Field(..., min_length=1, description="Task to bind the link to.")
+    email: Optional[str] = Field(default=None, description="Demo account to reset; bound into the signed link so the reset page can resolve it without a prior reset.")
+    persona: Optional[str] = Field(default=None, description="Persona for that account; bound into the signed link. If omitted, resolved from gab_accounts at reset time.")
     ttl_s: Optional[int] = Field(default=None, ge=60, description="Link lifetime in seconds (default from config).")
 
 
