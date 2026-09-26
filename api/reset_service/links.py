@@ -52,14 +52,16 @@ def mint(
     *,
     email: str | None = None,
     persona: str | None = None,
+    reset_session_id: str | None = None,
 ) -> tuple[str, int]:
     """Sign a token for a task. Returns (token, expires_at_unix). Requires a secret.
 
     ``email`` and ``persona`` (optional) bind the demo account + persona to the link
     so the reset page can resolve them WITHOUT a pre-existing reset_sessions row (the
-    "authenticate, then reset" flow). They are HMAC-signed, so the freelancer can see
-    but never change which account is reset. Omit them to keep the legacy task-only
-    token (resolved from reset_sessions/gab_accounts as before).
+    "authenticate, then reset" flow). ``reset_session_id`` (optional) pins the id the
+    reset will run under, so the caller (Cosmo) knows it up front and can match what
+    the freelancer pastes back. All are HMAC-signed — the freelancer can see but never
+    change them. Omit them for the legacy task-only token.
     """
     if not enabled():
         raise TokenError("RESET_LINK_SECRET is not set; cannot mint signed links")
@@ -71,6 +73,8 @@ def mint(
         payload["eml"] = str(email)
     if persona:
         payload["per"] = str(persona)
+    if reset_session_id:
+        payload["sid"] = str(reset_session_id)
     body = _b64u(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     return f"{body}.{_sign(body)}", exp
 

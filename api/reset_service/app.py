@@ -352,15 +352,31 @@ async def _launch_reset(
     task_allocation_id: str,
     mode: str | None = None,
     services: list[str] | None = None,
+    reset_session_id: str | None = None,
 ) -> tuple[str, str]:
     """Create a queued session, dispatch to the bounded pool. Returns (id, op_mode).
 
     The reset runs as a BackgroundTask that first acquires the global semaphore
     (bounded concurrency). Real clients get their 202 immediately; the task runs
     after the response is sent.
+
+    ``reset_session_id`` (optional) pins the id — used when Cosmo pre-generated it at
+    link-mint time so it can match what the freelancer pastes back. If that id is
+    already taken (e.g. a "reset again" reusing an old link), we fall back to a fresh
+    uuid so the reset still runs rather than colliding.
     """
     op_mode = await _decide_mode(store, email, persona, mode)
-    reset_session_id = str(uuid.uuid4())
+    pinned = str(reset_session_id) if reset_session_id else None
+    if pinned:
+        # If the pre-generated id was already used (e.g. a retry on an old link), fall
+        # back to a fresh id so the reset still runs instead of colliding on the PK.
+        try:
+            if await store.get(pinned):
+                log.info("pinned reset id %s already used; issuing a fresh id", pinned)
+                pinned = None
+        except Exception:  # noqa: BLE001 - a lookup hiccup must not block the reset
+            pass
+    reset_session_id = pinned or str(uuid.uuid4())
     record = {
         "reset_session_id": reset_session_id,
         "task_allocation_id": task_allocation_id,
@@ -462,11 +478,12 @@ def _task_id_from_request(token: str | None, raw_task: str | None) -> str | None
 
 def _resolve_from_request(
     token: str | None, raw_task: str | None
-) -> tuple[str | None, str | None, str | None]:
-    """Like ``_task_id_from_request`` but also returns any account (email, persona)
-    bound INTO a signed token. Returns (task_allocation_id, email, persona); email and
-    persona are None unless the token carried them. Raises HTTPException on a bad/absent
-    token when signing is enforced."""
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Like ``_task_id_from_request`` but also returns the account (email, persona) and
+    any pinned reset id bound INTO a signed token. Returns
+    (task_allocation_id, email, persona, reset_session_id); the last three are None
+    unless the token carried them. Raises HTTPException on a bad/absent token when
+    signing is enforced."""
     if token:
         try:
             payload = links.verify_full(token)
@@ -474,10 +491,11 @@ def _resolve_from_request(
             raise HTTPException(status_code=403, detail=f"invalid or expired reset link: {exc}")
         email = (payload.get("eml") or "").strip().lower() or None
         persona = (payload.get("per") or "").strip() or None
-        return str(payload["tid"]), email, persona
+        sid = (payload.get("sid") or "").strip() or None
+        return str(payload["tid"]), email, persona, sid
     if links.enabled():
         raise HTTPException(status_code=403, detail="a signed reset link is required")
-    return raw_task, None, None  # dev fallback only
+    return raw_task, None, None, None  # dev fallback only
 
 
 async def _email_for_task(store: Store, task_allocation_id: str) -> str | None:
@@ -510,7 +528,7 @@ async def ui_task(
     display only. In dev (no secret) a raw task_allocation_id/email is accepted.
     Everything is in the POST body, never the query string.
     """
-    task_allocation_id, tok_email, tok_persona = _resolve_from_request(req.token, req.task_allocation_id)
+    task_allocation_id, tok_email, tok_persona, _tok_sid = _resolve_from_request(req.token, req.task_allocation_id)
     email = tok_email or (None if req.token else ((req.email or "").lower() or None))
     if not (task_allocation_id or email):
         raise HTTPException(status_code=400, detail="provide a reset link")
@@ -564,7 +582,7 @@ async def ui_task_reset(
     """Freelancer-triggered reset. The account, task id and persona are all resolved
     server-side from the signed token, so the freelancer can neither see nor change
     which account is reset. Auto-routes delta vs reseed like any reset."""
-    task_allocation_id, tok_email, tok_persona = _resolve_from_request(req.token, req.task_allocation_id)
+    task_allocation_id, tok_email, tok_persona, tok_sid = _resolve_from_request(req.token, req.task_allocation_id)
     if not task_allocation_id:
         raise HTTPException(status_code=400, detail="a signed reset link is required")
 
@@ -596,7 +614,8 @@ async def ui_task_reset(
         raise HTTPException(status_code=400, detail="account not provisioned (no persona on file)")
     try:
         reset_session_id, op_mode = await _launch_reset(
-            store, background, email, persona, task_allocation_id, None, None
+            store, background, email, persona, task_allocation_id, None, None,
+            reset_session_id=tok_sid,
         )
     except ActiveResetConflict:
         raise HTTPException(status_code=409, detail="a reset is already running for this account")
@@ -640,11 +659,15 @@ async def create_reset_link(req: ResetLinkRequest) -> ResetLinkResponse:
     """
     if not links.enabled():
         raise HTTPException(status_code=400, detail="RESET_LINK_SECRET is not configured on the server")
+    # Pre-generate the id the reset will run under and bind it into the token, so the
+    # caller (Cosmo) knows it up front and can match what the freelancer pastes back.
+    reset_session_id = str(uuid.uuid4())
     try:
         token, exp = links.mint(
             req.task_allocation_id, req.ttl_s,
             email=(req.email or "").strip().lower() or None,
             persona=(req.persona or "").strip() or None,
+            reset_session_id=reset_session_id,
         )
     except links.TokenError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -652,6 +675,7 @@ async def create_reset_link(req: ResetLinkRequest) -> ResetLinkResponse:
         token=token,
         reset_url=f"{settings.public_base_url}/reset#t={token}",
         expires_at=exp,
+        reset_session_id=reset_session_id,
     )
 
 

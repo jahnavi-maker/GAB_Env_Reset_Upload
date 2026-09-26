@@ -91,6 +91,7 @@ class ResetLinkResponse(BaseModel):
     token: str
     reset_url: str
     expires_at: int  # unix seconds
+    reset_session_id: str  # the id the reset will run under — store it to match what the freelancer pastes back
 
 
 class UploadResponse(BaseModel):
