@@ -10,6 +10,80 @@ http://127.0.0.1:8791
 
 ---
 
+## Architectural changes (how the system is shaped now)
+
+### Before (two apps)
+
+```
+Browser / curl
+    │
+    ├─ Seeder UI :8765     →  first upload (OAuth, seed Gmail/Drive/Calendar)
+    │                         tokens + SQLite jobs + manifest on disk
+    │
+    └─ Reset API :8791     →  reset only, expected a separate engine config (GAB_CONFIG)
+                              easy to be “up” while the other app was down
+```
+
+Login emails and reset Gmails were easy to mix up. Reset did not always share the same OAuth tokens the seeder just saved.
+
+### After (one platform)
+
+```
+Browser / Cosmo / curl
+              │
+              ▼
+     One FastAPI process :8791
+     ┌─────────────────────────────────────────────┐
+     │  /onboard     first upload (OAuth + seed)   │
+     │  POST /api/environment/reset   Cosmo reset  │
+     │  /reset/status/<id>            progress UI  │
+     │  /logins + POST /api/logins    who may sign in │
+     │                                             │
+     │  Seeder code is imported *inside* this app  │
+     │  (same tokens, same persona folder)         │
+     │  If GAB_CONFIG is empty, reset uses that    │
+     │  same seeder pipeline (not a second server) │
+     └───────────────┬─────────────────────────────┘
+                     │
+         ┌───────────┴───────────┐
+         ▼                       ▼
+   Supabase (shared)      This machine (heavy work)
+   gab_accounts           tokens, persona files
+   reset_sessions         manifest, SQLite job queue
+   freelancers            Drive cache
+```
+
+The old seeder on **:8765** can still run, but it is optional. Prefer **:8791** so upload and reset are one process.
+
+### Split that used to be muddy
+
+| Piece | Old habit | Now |
+|---|---|---|
+| Who gets **reset** (the Gmail inbox) | Sometimes mixed with “who can open the page” | **`gab_accounts` only** |
+| Who may **sign in** to the reset page | Same table / leftover `gab_logins` | **`freelancers` only** (login UI is off until you turn it back on) |
+| Job of 9,000 Drive/Gmail pieces | Tempting to dump into Supabase | Stays **local SQLite**. Supabase only stores account + session status |
+| Same vs different persona | Easy to always full-wipe | **Same persona → delta**, **switch → reseed**, using last persona on `gab_accounts` |
+| Cosmo / POST contract | Ad-hoc | Always `{ url, status, error, reset_session_id }` |
+| Engine config | Reset died if `GAB_CONFIG` was empty | Empty config → **seeder pipeline fallback** on the same server |
+| Supabase key | Publishable key “connected” but saw zero rows | Needs **service_role**. Otherwise writes 401 and sessions fall back to a **local JSON** file |
+
+### How a reset is decided (architecture, not UI)
+
+1. Cosmo (or you) **POST**s email + persona to `:8791`.
+2. API reads **`gab_accounts`** in Supabase for that email.
+3. **Same persona** as stored → **delta** (read the **local manifest**, only push the diff).
+4. **Different persona** or **no row** → **reseed** (wipe Google, full upload from the **local** persona folder).
+5. Worker runs **on this machine**. Google is called from here. Supabase only gets “queued / running / failed / done.”
+
+### What we did *not* change
+
+- Persona archives still live on disk (`GAB_PERSONA_ROOT`).
+- Google tokens still live in `seeder/tokens/`.
+- Same Supabase **project** (no new cloud DB).
+- GitHub for the environment is still the **Drive “Github” folder** from the persona tree, not a new github.com app.
+
+---
+
 ## What we changed recently (this local work)
 
 - **Upload and reset live on the same server** (`:8791`). You do not need a second app just to reset.
@@ -229,3 +303,95 @@ curl -sS http://127.0.0.1:8791/healthz
 ```
 
 Then POST reset again and open the **new** `reset_session_id` status URL. Do not refresh an old queued link.
+
+---
+
+## What is yet to be done
+
+Not finished / not proven yet. Do these before calling the platform “production ready.”
+
+### Must do before delta will work
+
+| Item | Why it is still open |
+|---|---|
+| Put the real **service_role** JWT in `.env` (`eyJ…`) and restart `:8791` | `sb_publishable_` / `sb_secret_` still cannot see `gab_accounts`. Reset thinks there is no last persona and **reseeds**. |
+| Confirm **`test02gemini@gmail.com` exists in Supabase `gab_accounts`** with persona `Backend_software_engineer` | First upload never wrote the row (401). Until that row exists, same-persona **delta cannot run**. Add it in Table Editor or authorize again after the good key. |
+| **POST reset once more** and check the log says `mode=delta` | We have not yet seen a successful same-persona delta on this machine. |
+| Watch the **new** status URL, not an old queued one | Old session ids stay “waiting” because they were saved locally and never updated in Supabase. |
+
+### Login (you said you will do this later)
+
+| Item | Notes |
+|---|---|
+| Turn **Google sign-in back on** for `/reset` and `/reset/status/<id>` | Code exists; the gate is **off** so you can test reset. |
+| Register Google redirect `http://127.0.0.1:8791/ui/google/callback` (and localhost) on the OAuth web client | Needed when login uses “Google email + password.” |
+| Add `http://127.0.0.1:8791` as a JavaScript origin if you use the Google button | Already listed in `seeder/credentials.json`; confirm in Google Cloud Console. |
+| Prove **`jahnavi@deccan.ai` (or whoever) is in `freelancers`** and the API can **read** that row | Same key problem: empty list = RLS, not “user missing.” |
+| Decide: people not on `freelancers` must get **403** on the status link | Logic was written, then bypassed. Re-enable the gate when login ships. |
+
+### Data / keys hygiene
+
+| Item | Notes |
+|---|---|
+| Stop using the publishable key in `.env.example` as if it were the server key | Easy to copy the wrong key again. |
+| After a successful seed/reset, **`last_reset_persona` must stay updated** in `gab_accounts` | Writes fail today, so the next reset cannot trust that column. |
+| Drop or ignore unused **`gab_logins`** so nobody writes login emails there | Sign-in list is **`freelancers`**. |
+| Do not commit `.env` or `credentials.json` client secret | Already the rule; keep it that way on EC2 too. |
+
+### Product / deploy later
+
+| Item | Notes |
+|---|---|
+| **EC2 (or any host)** | Same `.env` keys. Set `PUBLIC_BASE_URL=https://your-host`. Add that origin + `/ui/google/callback` (if login is on) and `/oauth/callback` on the Google web client. |
+| Wire Cosmo to this **same POST** and open the returned `url` | Contract is ready; Cosmo integration is not done here. |
+| Optional: run the **engine** with a real `GAB_CONFIG` | Today reset uses the **seeder pipeline** because `GAB_CONFIG` is empty. Fine for local; decide what EC2 should run. |
+| **github.com repo** (if you still want a real GitHub repo) | First upload’s GitHub.com create failed (bad/missing PAT). Environment GitHub files still go to **Drive**. Separate from reset. |
+| Persona-switch **reseed** test | We have not cleanly tested “was Backend, now Student → wipe + full upload.” |
+| Status page should show **failed** when the worker dies, even if Supabase insert failed | Partially fixed (local JSON update). Confirm after service_role is in. |
+
+### Nice-to-have (not blocking a local delta test)
+
+- Progress bar that tracks real job counts (9,702/…) instead of a coarse queued/running/done pill.
+- One “active reset per email” lock that works when sessions are only local (Supabase unique index does not see local JSON).
+- Clean up leftover local session files (`.reset_sessions.json`, `.reset_sessions.freelancers.json`) so they are not mistaken for source of truth.
+
+**Minimum path to “delta works”:** service_role in `.env` → restart → `gab_accounts` row for test02 → POST reset → log shows `mode=delta`.
+
+---
+
+## What has to be moved to Supabase (if anything)
+
+**No new tables.** Do not move the job queue, tokens, or manifests to Supabase. Those stay on the machine that runs the worker.
+
+The tables you need are **already designed**. What is missing is **rows** that never got written because the key could not write.
+
+### Already supposed to live in Supabase — just make sure the rows are there
+
+| Data | Table | Move? |
+|---|---|---|
+| Which Gmails we seed/reset + last persona | `gab_accounts` | **Yes — the missing rows.** Example: add `test02gemini@gmail.com` / `Backend_software_engineer` (or re-authorize after service_role). |
+| Each upload/reset job status (`url` / session id) | `reset_sessions` | **Yes — new jobs should insert here.** Old ones stuck in `api/.reset_sessions.json` can stay as leftovers; do not bulk-upload 10k job lines. |
+| Who may sign in later | `freelancers` | **Already the right table.** If you only saved emails in local JSON, add those emails here (e.g. `jahnavi@deccan.ai`). |
+| Last persona after a successful seed/reset | `gab_accounts.last_reset_persona` | **Yes — keep this column updated** so the next reset can be a delta. |
+
+### Do **not** move to Supabase
+
+| Data | Why it stays local |
+|---|---|
+| `provision.sqlite` / thousands of Drive/Gmail/Calendar **jobs** | Work queue. Huge, short-lived, one machine. |
+| Seed **manifest** (ids + fingerprints) | Used on the worker for delta. Not a shared Cosmo table. |
+| `seeder/tokens/*.json` | Google refresh tokens. Secret. Files on disk (or a secrets store later), not a public table. |
+| Persona archives (`GAB_PERSONA_ROOT`) | Source files for upload. Gigabytes. |
+| Drive persona cache | Speedup cache on disk. |
+| OAuth `credentials.json` | Google app client. File / secret manager. |
+| QC log files (`qc_logs/`) | Optional local debug. Session **status** is enough in `reset_sessions`. |
+
+### Unused — do not migrate into this
+
+| Thing | Action |
+|---|---|
+| `gab_logins` | **Do not move login users here.** Use `freelancers`. |
+| Local `.reset_sessions.freelancers.json` | Copy any emails you still need into **`freelancers`**, then ignore the file. |
+| Local `.reset_sessions.json` | Only a fallback when writes failed. After service_role works, **stop relying on it**. |
+
+**One-line rule:** Supabase = “who is the account, who may log in, did this reset start/finish.” Everything that talks to Google or holds files stays on the server disk.
