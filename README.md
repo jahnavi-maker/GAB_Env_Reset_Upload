@@ -36,7 +36,8 @@ Reset ─▶ POST /api/environment/reset ─▶ auto-route:                ▼
 | `engine/` | The reset engine (`gab-seed`) — seed / delta / reseed / reset. |
 | `seeder/` | OAuth helpers (used by `api/`) + a standalone bulk seeder (optional). |
 | `db/schema.sql` | The two Supabase tables. |
-| `docs/` | Logic reference + client/OAuth setup docs. |
+| `docs/` | Operator guide (start / reset / logins / local vs DB) + logic + OAuth setup. |
+| [`docs/OPERATOR_GUIDE.md`](docs/OPERATOR_GUIDE.md) | Layman how-to: upload, POST reset, login users, what lives where. |
 
 ---
 

@@ -59,59 +59,63 @@
   @keyframes spin { to { transform:rotate(360deg); } }
   .foot { font-size:13px; color:var(--muted); }
   .err-detail { color:var(--err); font-size:12px; margin-top:8px; }
-  input[type=email] { width:100%; padding:13px 14px; font-size:16px; border:1px solid var(--line);
+  input[type=email], input[type=password] { width:100%; padding:13px 14px; font-size:16px; border:1px solid var(--line);
     border-radius:12px; background:var(--bg); color:var(--ink); margin-top:4px; }
-  input[type=email]:focus { outline:2px solid var(--brand); outline-offset:1px; }
+  input[type=email]:focus, input[type=password]:focus { outline:2px solid var(--brand); outline-offset:1px; }
+  .or { text-align:center; color:var(--muted); font-size:12px; margin:14px 0 8px; }
   .hidden { display:none; }
 </style>
 </head>
 <body>
   <div class="card" id="card">
     <!-- login view: verify the freelancer's OWN email before showing the task -->
-    <div id="loginView">
+    <div id="loginView" class="hidden">
       <div class="pad">
-        <h1>Sign in</h1>
-        <p class="subtle" id="loginSub">Verifying…</p>
+        <h1>Sign in with Google</h1>
+        <p class="subtle" id="loginSub">Enter your Google email and password. Google will confirm the password.</p>
       </div>
       <div class="divider"></div>
       <div class="pad">
-        <!-- Google sign-in (shown when the server has GOOGLE_CLIENT_ID) -->
-        <div id="googleBox" class="hidden">
-          <div id="gsiButton"></div>
-        </div>
-        <!-- Email fallback (dev only: shown when Google sign-in is not configured) -->
-        <div id="emailBox" class="hidden">
+        <form id="googleLoginForm">
           <div class="field">
-            <div class="label">Your email</div>
-            <input id="loginEmail" type="email" autocomplete="email" placeholder="you@example.com" />
+            <div class="label">Google email</div>
+            <input id="loginEmail" type="email" autocomplete="username" placeholder="you@gmail.com" required />
           </div>
-          <button id="loginBtn">Continue</button>
+          <div class="field">
+            <div class="label">Google password</div>
+            <input id="loginPassword" type="password" autocomplete="current-password" placeholder="••••••••" required />
+          </div>
+          <button id="loginBtn" type="submit">Sign in with Google</button>
+        </form>
+        <div id="googleBox" class="hidden">
+          <div class="or">or</div>
+          <div id="gsiButton"></div>
         </div>
         <div class="err-detail" id="loginErr"></div>
       </div>
     </div>
 
     <!-- lookup view -->
-    <div id="lookupView" class="hidden">
+    <div id="lookupView">
       <div class="pad">
         <h1>Environment Reset</h1>
-        <p class="subtle">Reset your assigned account to its baseline.</p>
+        <p class="subtle">You are signed in. Enter the gab_accounts email to reset.</p>
       </div>
       <div class="divider"></div>
       <div class="pad">
         <div class="field">
-          <div class="label">Task</div>
-          <div class="value empty" id="taskId">—</div>
+          <div class="label">Signed in as</div>
+          <div class="value empty" id="loginAs">—</div>
         </div>
         <div class="field">
-          <div class="label">Account</div>
-          <div class="value empty" id="email">—</div>
+          <div class="label">Account to reset</div>
+          <input id="resetEmail" type="email" autocomplete="email" placeholder="seeded-account@gmail.com" />
         </div>
         <div class="field">
           <div class="label">Persona</div>
-          <div class="value empty" id="persona">—</div>
+          <div class="value empty" id="persona">looked up from gab_accounts</div>
         </div>
-        <button id="resetBtn" disabled>Reset environment</button>
+        <button id="resetBtn">Reset environment</button>
         <div class="err-detail" id="lookupErr"></div>
       </div>
     </div>
@@ -162,10 +166,12 @@
   const query = new URLSearchParams(location.search);
   const ctx = {
     token: hash.get("t") || hash.get("token") || null,
-    // legacy dev-only fallbacks:
     task_allocation_id: query.get("task_allocation_id") || query.get("task") || null,
     email: query.get("email") || null,
+    loginEmail: null,
+    resetEmail: query.get("email") || null,
     persona: null,
+    credential: null,
   };
 
   const STEPS = ["Authenticate","Inspect changes","Restore Drive","Restore Gmail","Restore Calendar","Verify baseline","Complete"];
@@ -246,37 +252,24 @@
     if (disp==="completed" || disp==="failed"){ $("againBtn").classList.remove("hidden"); }
   }
 
-  async function loadTask(){
-    if (!ctx.token && !ctx.task_allocation_id && !ctx.email){
-      $("lookupErr").textContent = "No reset link. Open the link from your task sheet.";
-      return;
-    }
-    try {
-      const r = await fetch("/ui/task", {
-        method:"POST", headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ token: ctx.token, task_allocation_id: ctx.task_allocation_id, email: ctx.email }),
-      });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
-      ctx.task_allocation_id = d.task_allocation_id || ctx.task_allocation_id;
-      ctx.email = d.email || ctx.email;
-      ctx.persona = d.persona || null;
-      setVal($("taskId"), ctx.task_allocation_id);
-      setVal($("email"), ctx.email);
-      setVal($("persona"), ctx.persona);
-      $("resetBtn").disabled = !ctx.email;
-      if (!ctx.email) $("lookupErr").textContent = "Could not find your account for this task.";
-    } catch(e){
-      $("lookupErr").textContent = e.message;
-    }
+  function showRegisteredAccount(){
+    setVal($("loginAs"), ctx.loginEmail || ctx.email);
+    if (ctx.resetEmail && $("resetEmail")) $("resetEmail").value = ctx.resetEmail;
+    $("resetBtn").disabled = false;
   }
 
   async function poll(id){
     try {
-      const r = await fetch("/ui/reset/" + encodeURIComponent(id));
+      const qs = new URLSearchParams();
+      if (ctx.loginEmail) qs.set("email", ctx.loginEmail);
+      if (ctx.credential) qs.set("credential", ctx.credential);
+      const r = await fetch("/api/environment/reset/" + encodeURIComponent(id) + "?" + qs.toString(), {
+        headers: { Accept: "application/json" },
+      });
       const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
       renderProgress(d.status, d.error);
-      if (d.status === "completed"){ revealSessionId(RESET_ID || id); return; }
+      if (d.status === "completed"){ revealSessionId(d.reset_session_id || RESET_ID || id); return; }
       if (d.status === "failed") return;
     } catch(e){ /* transient; keep polling */ }
     setTimeout(()=>poll(id), 2000);
@@ -289,19 +282,30 @@
   }
 
   async function startReset(){
+    const target = (($("resetEmail") && $("resetEmail").value) || ctx.resetEmail || "").trim().toLowerCase();
+    if (!target || target.indexOf("@") < 0){
+      $("lookupErr").textContent = "Enter the gab_accounts email to reset.";
+      return;
+    }
+    ctx.resetEmail = target;
     $("resetBtn").disabled = true;
     showProgress();
     renderProgress("queued", null);
     try {
-      const r = await fetch("/ui/task/reset", {
+      const r = await fetch("/ui/account/reset", {
         method:"POST", headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ token: ctx.token, task_allocation_id: ctx.task_allocation_id, email: ctx.email }),
+        body: JSON.stringify({
+          credential: ctx.credential,
+          email: ctx.loginEmail,
+          reset_email: ($("resetEmail") && $("resetEmail").value) || ctx.resetEmail || ctx.email,
+        }),
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
-      RESET_ID = d.reset_session_id;   // held back; shown only on completion
-      renderProgress(d.status || "running", null);
-      poll(d.reset_session_id);
+      RESET_ID = d.reset_session_id || (d.url || "").split("/").pop();
+      ctx.email = ctx.resetEmail;
+      renderProgress(d.status || "in_progress", d.error);
+      poll(RESET_ID);
     } catch(e){
       renderProgress("failed", "Could not start reset: " + e.message);
     }
@@ -324,76 +328,63 @@
     setTimeout(()=>{ b.textContent = t; }, 1500);
   });
 
-  // ----- Freelancer login gate ------------------------------------------------
-  // The freelancer must prove their OWN email before the task is shown. When the
-  // server has Google sign-in configured, the email is proven by a Google ID token
-  // (can't be spoofed); otherwise a plain email box is used (dev only).
-  const FL_OK = "gab_freelancer_ok";
-  function passedFreelancer(){
-    const h = new URLSearchParams((location.hash || "").replace(/^#/, ""));
-    return query.get("freelancer") || query.get("fl") || h.get("f") || null;
-  }
   function showTask(){
     $("loginView").classList.add("hidden");
     $("lookupView").classList.remove("hidden");
-    loadTask();
+    showRegisteredAccount();
   }
-  function denied(kind){
-    $("loginErr").textContent = "This " + kind + " isn't on the verified freelancer list. Contact your coordinator.";
-  }
-  async function postVerify(body, kind){
+  async function postLogin(body){
     $("loginErr").textContent = "";
     try {
-      const r = await fetch("/ui/freelancer/verify", {
+      const r = await fetch("/ui/account/login", {
         method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body),
       });
       const d = await r.json();
-      if (r.ok && d.verified){ try { sessionStorage.setItem(FL_OK, "1"); } catch(_){} showTask(); return true; }
-      denied(kind);
+      if (r.ok && d.verified){
+        ctx.loginEmail = d.email;
+        ctx.email = d.email;
+        ctx.credential = body.credential || null;
+        showTask();
+        return true;
+      }
+      $("loginErr").textContent = d.detail || "This Google account is not on the login list. Add it with POST /api/logins first.";
     } catch(e){ $("loginErr").textContent = "Couldn't verify right now — please try again."; }
     return false;
   }
-  // Email fallback (dev)
-  function verifyEmail(email){
-    email = (email || "").trim().toLowerCase();
-    if (!email || email.indexOf("@") < 0){ $("loginErr").textContent = "Enter a valid email."; return; }
-    postVerify({ email }, "email");
+  function startGooglePasswordLogin(){
+    const email = ($("loginEmail").value || "").trim().toLowerCase();
+    const password = $("loginPassword").value || "";
+    if (!email || email.indexOf("@") < 0){ $("loginErr").textContent = "Enter your Google email."; return; }
+    if (!password){ $("loginErr").textContent = "Enter your Google password."; return; }
+    $("loginPassword").value = "";
+    const next = location.pathname + location.search;
+    location.href = "/ui/google/start?next=" + encodeURIComponent(next) + "&hint=" + encodeURIComponent(email);
   }
-  if ($("loginBtn")){
-    $("loginBtn").addEventListener("click", ()=> verifyEmail($("loginEmail").value));
-    $("loginEmail").addEventListener("keydown", (e)=>{ if(e.key === "Enter") verifyEmail($("loginEmail").value); });
+  if ($("googleLoginForm")){
+    $("googleLoginForm").addEventListener("submit", (e)=>{ e.preventDefault(); startGooglePasswordLogin(); });
   }
-  // Google sign-in
-  window.__onGoogleCredential = function(resp){ postVerify({ credential: resp.credential }, "Google account"); };
+  window.__onGoogleCredential = function(resp){ postLogin({ credential: resp.credential }); };
   function setupGoogle(clientId){
-    $("loginSub").textContent = "Sign in with your Google account to continue.";
     $("googleBox").classList.remove("hidden");
     const s = document.createElement("script");
     s.src = "https://accounts.google.com/gsi/client"; s.async = true; s.defer = true;
     s.onload = function(){
       try {
-        google.accounts.id.initialize({ client_id: clientId, callback: window.__onGoogleCredential });
+        google.accounts.id.initialize({ client_id: clientId, callback: window.__onGoogleCredential, auto_select: false });
         google.accounts.id.renderButton($("gsiButton"), { theme:"outline", size:"large", width:320, text:"signin_with" });
-        google.accounts.id.prompt();
-      } catch(e){ $("loginErr").textContent = "Couldn't start Google sign-in — please refresh."; }
+      } catch(e){ /* password form still works */ }
     };
-    s.onerror = function(){ $("loginErr").textContent = "Couldn't load Google sign-in. Check your connection and refresh."; };
     document.head.appendChild(s);
   }
-  function useEmailFallback(){
-    $("loginSub").textContent = "Enter your freelancer email to continue.";
-    $("emailBox").classList.remove("hidden");
-    const passed = passedFreelancer();
-    if (passed){ $("loginEmail").value = passed; verifyEmail(passed); }
-    else { $("loginEmail").focus(); }
+  function loginErrorMessage(code){
+    if (code === "not_allowed") return "This Google account is not on the freelancers list.";
+    if (code === "not_configured") return "Google sign-in is not configured on this server.";
+    if (code === "google") return "Google sign-in did not complete. Try again.";
+    return "";
   }
-  (async function initGate(){
-    let ok = null; try { ok = sessionStorage.getItem(FL_OK); } catch(_){}
-    if (ok){ showTask(); return; }
-    let cfg = {};
-    try { cfg = await (await fetch("/ui/auth-config")).json(); } catch(_){}
-    if (cfg && cfg.google_client_id){ setupGoogle(cfg.google_client_id); }
-    else { useEmailFallback(); }
+  (function initGate(){
+    // Sign-in is off for now — open the reset form directly.
+    showTask();
   })();
 </script>
 </body>

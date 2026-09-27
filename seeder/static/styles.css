@@ -217,6 +217,50 @@ input.sr-file {
   grid-template-columns: 1fr 1fr;
   gap: 8px;
 }
+.steps.accounts-steps {
+  grid-template-columns: 1fr;
+}
+#m-accounts > .step {
+  margin-bottom: 10px;
+}
+.add-grid {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 4px;
+}
+.add-grid-row {
+  grid-template-columns: minmax(180px, 1.4fr) minmax(160px, 1.2fr) minmax(140px, 1fr) auto;
+  align-items: end;
+}
+.add-action {
+  display: flex;
+  align-items: end;
+}
+.add-action button {
+  white-space: nowrap;
+}
+.add-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.csv-format {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: #050706;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.csv-format pre {
+  margin: 6px 0;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
 .step {
   border: 1px solid var(--line);
   background: var(--surface-2);
@@ -227,6 +271,44 @@ input.sr-file {
 .step.done { border-color: var(--ok); }
 .step h3 { display: block; margin: 0 0 6px; font-size: 14px; font-weight: 600; color: var(--text); letter-spacing: 0; text-transform: none; }
 .step-kicker { display: none; }
+.push-progress {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+.push-progress-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+  margin-bottom: 8px;
+}
+.push-progress-top strong { color: var(--accent); font-variant-numeric: tabular-nums; }
+.push-progress-top span, .push-progress-svc {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.push-progress-svc {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 8px;
+}
+.bar {
+  height: 8px;
+  background: #050706;
+  border-radius: 999px;
+  overflow: hidden;
+}
+.bar-fill {
+  height: 100%;
+  background: var(--accent);
+  width: 0;
+  transition: width 0.3s ease;
+}
 .log {
   background: #050706;
   border: 1px solid var(--line);
@@ -251,7 +333,7 @@ input.sr-file {
 
 @media (max-width: 960px) {
   main { padding: 12px; }
-  .steps, .drops { grid-template-columns: 1fr; }
+  .steps, .steps.accounts-steps, .drops, .add-grid-row { grid-template-columns: 1fr; }
   .table-wrap { max-height: min(360px, 60vh); }
   .log { height: min(280px, 50vh); }
 }

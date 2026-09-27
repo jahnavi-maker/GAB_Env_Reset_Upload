@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from materialize.csv_ingest import normalize_persona_key, parse_accounts_csv
+from materialize.csv_ingest import account_from_fields, normalize_persona_key, parse_accounts_csv
 
 
 CSV = (
@@ -104,6 +104,16 @@ class CsvIngestTests(unittest.TestCase):
         )
         self.assertEqual(parsed["accounts"][0]["persona_key"], "student")
         self.assertEqual(parsed["accounts"][1]["persona_key"], "startup_founder")
+
+    def test_account_from_fields_matches_csv_row(self):
+        row = account_from_fields("geminiapp.gab.demo.user410@gmail.com", "Student")
+        self.assertEqual(row["email"], "geminiapp.gab.demo.user410@gmail.com")
+        self.assertEqual(row["persona_key"], "student")
+        self.assertIn(row["persona_status"], ("matched", "unmatched"))
+        with self.assertRaises(ValueError):
+            account_from_fields("not-an-email", "Student")
+        with self.assertRaises(ValueError):
+            account_from_fields("user@gmail.com", "")
 
     def test_non_email_row_skipped(self):
         raw = (

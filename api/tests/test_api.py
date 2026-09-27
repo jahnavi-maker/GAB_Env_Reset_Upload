@@ -45,15 +45,21 @@ class ResetApiTest(unittest.TestCase):
         self.assertEqual(r.status_code, 401)
 
     def test_reset_lifecycle(self) -> None:
+        self.client.post(
+            "/api/accounts",
+            json={"email": BODY["email"], "persona": BODY["persona"]},
+            headers=AUTH,
+        )
         r = self.client.post("/api/environment/reset", json=BODY, headers=AUTH)
         self.assertEqual(r.status_code, 202)
         data = r.json()
-        # Public contract: {url, status, error}. url carries the session id.
+        # Public contract: {url, status, error, reset_session_id}.
         self.assertEqual(data["status"], "in_progress")
         self.assertIsNone(data["error"])
         self.assertIn("/api/environment/reset/", data["url"])
-        sid = data["url"].rstrip("/").split("/")[-1]
+        sid = data["reset_session_id"]
         self.assertTrue(sid)
+        self.assertTrue(data["url"].endswith("/api/environment/reset/" + sid))
 
         # TestClient runs background tasks synchronously after the response,
         # so by the time we poll the simulated reset has finished.
@@ -66,6 +72,11 @@ class ResetApiTest(unittest.TestCase):
         self.assertTrue(gd["url"].endswith(sid))
 
     def test_password_not_persisted(self) -> None:
+        self.client.post(
+            "/api/accounts",
+            json={"email": BODY["email"], "persona": BODY["persona"]},
+            headers=AUTH,
+        )
         r = self.client.post("/api/environment/reset", json=BODY, headers=AUTH)
         sid = r.json()["url"].rstrip("/").split("/")[-1]
         with open(STORE_PATH, encoding="utf-8") as fh:

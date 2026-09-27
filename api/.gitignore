@@ -1,5 +1,7 @@
 .env
 .reset_sessions.json
+.reset_sessions.logins.json
+*.logins.json
 __pycache__/
 *.pyc
 .venv/

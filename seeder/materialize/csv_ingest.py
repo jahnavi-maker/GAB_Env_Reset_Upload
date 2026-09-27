@@ -27,6 +27,26 @@ ROLE_HEADERS = (
     "profile",
 )
 
+CSV_FORMAT = {
+    "required": "email, persona",
+    "optional": "password",
+    "headers": {
+        "email": list(EMAIL_HEADERS),
+        "password": list(PASSWORD_HEADERS),
+        "persona": list(ROLE_HEADERS),
+    },
+    "example": (
+        "email,password,persona\n"
+        "user410@gmail.com,secret410,Student\n"
+        "user411@gmail.com,secret411,Applied ML and Data Scientist\n"
+    ),
+    "notes": [
+        "One row per Google account. Header names are case-insensitive.",
+        "password is optional and never stored on the server — the UI keeps it so you can copy it for Gemini login.",
+        "persona is matched to a folder name (spaces and punctuation become underscores).",
+    ],
+}
+
 
 def _norm_header(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "").replace("\ufeff", "").strip().lower())
@@ -61,6 +81,41 @@ def _looks_like_email(value: str) -> bool:
         return False
     local, _, domain = value.partition("@")
     return bool(local) and "." in domain
+
+
+def account_from_fields(email: str, persona: str) -> dict[str, Any]:
+    """Build one run-account row from typed email + persona (no CSV)."""
+    email = (email or "").strip().lower()
+    if not email:
+        raise ValueError("email is required")
+    if not _looks_like_email(email):
+        raise ValueError(f"not a valid email: {email}")
+    role = (persona or "").strip()
+    if not role:
+        raise ValueError("persona is required")
+    key = normalize_persona_key(role)
+    folders = persona_folders()
+    folder_by_key = {normalize_persona_key(name): name for name in folders}
+    matched = folder_by_key.get(key)
+    files = validate_persona_files(matched, {}) if matched else None
+    return {
+        "email": email,
+        "persona_raw": role,
+        "persona_key": key,
+        "persona_dir": matched,
+        "persona_status": "matched" if matched else "unmatched",
+        "persona_files": files,
+        "auth": {
+            "backend": "consumer_oauth",
+            "state": "none",
+            "verified_email": None,
+            "expires_at": None,
+            "got_email": None,
+        },
+        "drops": {"calendar": False, "gmail": False, "filesystem": False},
+        "push": {"state": "idle", "last_run": None},
+        "github": {"repo_url": None, "state": "none"},
+    }
 
 
 def parse_accounts_csv(raw: bytes) -> dict[str, Any]:

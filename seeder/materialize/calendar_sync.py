@@ -323,3 +323,77 @@ def _unix_to_rfc3339(ts: float) -> str:
     return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
+
+
+def build_event_body(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Build a Calendar insert body, or None if the record is unusable."""
+    start = _coerce_ts(item.get("start_datetime") or item.get("start"))
+    end = _coerce_ts(item.get("end_datetime") or item.get("end"))
+    if start is None or end is None:
+        return None
+    if end <= start:
+        end = start + 1800
+    title = item.get("title") or item.get("summary") or "(untitled)"
+    body: dict[str, Any] = {
+        "summary": str(title)[:1024],
+        "description": str(item.get("description") or ""),
+        "location": str(item.get("location") or ""),
+        "start": {"dateTime": _unix_to_rfc3339(start), "timeZone": "UTC"},
+        "end": {"dateTime": _unix_to_rfc3339(end), "timeZone": "UTC"},
+        "extendedProperties": {
+            "private": {
+                SEED_PROP: "true",
+                "gabEventId": str(item.get("event_id") or ""),
+                "gabTag": str(item.get("tag") or ""),
+            }
+        },
+    }
+    attendees = [
+        a for a in (item.get("attendees") or [])
+        if isinstance(a, str) and "@" in a
+    ]
+    if attendees:
+        extra = "Attendees: " + ", ".join(attendees[:20])
+        body["description"] = (body["description"] + "\n" + extra).strip()
+    return body
+
+
+def seeded_event_index(calendar, log: Callable[[str], None]) -> tuple[dict[tuple[str, int], dict[str, Any]], dict[str, dict[str, Any]]]:
+    items = _list_seeded_events(calendar, log)
+    by_key = {k: ev for ev in items if (k := _event_key(ev))}
+    by_gab_id: dict[str, dict[str, Any]] = {}
+    for ev in items:
+        gab_id = str(((ev.get("extendedProperties") or {}).get("private") or {}).get("gabEventId") or "")
+        if gab_id:
+            by_gab_id[gab_id] = ev
+    return by_key, by_gab_id
+
+
+def match_seeded_event(
+    item: dict[str, Any],
+    by_key: dict[tuple[str, int], dict[str, Any]],
+    by_gab_id: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    body = build_event_body(item)
+    if not body:
+        return None
+    gab_id = str(item.get("event_id") or "")
+    start = _coerce_ts(item.get("start_datetime") or item.get("start"))
+    title = str(item.get("title") or item.get("summary") or "(untitled)")[:1024]
+    key = (title, int(round(start))) if start is not None else None
+    match = by_gab_id.get(gab_id) if gab_id else None
+    if match and key and _event_key(match) == key:
+        return match
+    if key and key in by_key:
+        return by_key[key]
+    return match
+
+
+def insert_event(calendar, body: dict[str, Any], log: Callable[[str], None]) -> str:
+    result = _retry(
+        lambda: calendar.events()
+        .insert(calendarId="primary", body=body, sendUpdates="none")
+        .execute(),
+        log,
+    )
+    return str(result["id"])

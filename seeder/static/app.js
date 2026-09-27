@@ -21,11 +21,16 @@ const state = {
   log: [],
   skipped: null,
   csvMsg: "",
+  addMsg: "",
+  addEmail: "",
+  addPersona: "",
+  addPassword: "",
   oauthMsg: "",
   csvQuoted: false,
   pushOpts: { ...DEFAULT_PUSH_OPTS },
   pushThreads: 10,
   pushUsersPerThread: 20,
+  progress: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -50,7 +55,7 @@ function pushTone(s) {
 
 function disableReason() {
   const row = selectedRow();
-  if (!state.run) return "upload a CSV first";
+  if (!state.run) return "add an account or upload a CSV first";
   if (!row) return "select an account";
   if (row.persona_status !== "matched") return "persona not matched";
   if (state.run.auth_interactive !== false && row.auth.state !== "authorized") {
@@ -182,7 +187,7 @@ function blockIfBusy(what) {
 function installBusyGuard() {
   if (state._guardOn) return;
   state._guardOn = true;
-  const allow = (el) => el.closest("#log, #copy-emails, #copy-emails-reset, [data-reveal], [data-copy-pw], a[target='_blank']");
+  const allow = (el) => el.closest("#log, #copy-emails, #copy-emails-reset, #add-account, #add-email, #add-persona, #add-password, [data-reveal], [data-copy-pw], a[target='_blank']");
   document.addEventListener("click", (e) => {
     if (!workInProgress()) return;
     const t = e.target.closest("button, label.btn, tr[data-key], select.persona-fix, input[type=file]");
@@ -279,7 +284,7 @@ function oauthStepHtml() {
         <span class="note">Web client · drop or pick</span>
       </div>
     </div>
-    ${missing.length ? `<p class="reason">Add these redirects, then re-download: ${missing.map(escapeHtml).join(" · ")}</p>` : ""}
+    ${missing.length ? `<p class="reason">This Web client has no local redirect (${missing.map(escapeHtml).join(" · ")}). Add http://127.0.0.1:8765/oauth/callback in Google Cloud. You do not need to re-download the JSON.</p>` : ""}
     ${state.oauthMsg ? `<p class="${ready && !state.oauthMsg.startsWith("That") ? "note" : "reason"}">${escapeHtml(state.oauthMsg)}</p>` : ""}
   `;
 }
@@ -295,7 +300,7 @@ async function uploadOauthBlob(blob, filename) {
     state.oauthMsg = "Service-account key saved. Accounts authorize automatically.";
   } else {
     state.oauthMsg = missing.length
-      ? "Saved, but the JSON is missing redirect URIs. Add them in Google Cloud and re-download."
+      ? "Saved. Add a local redirect (127.0.0.1 or localhost on port 8765) in Google Cloud."
       : "Web OAuth client saved.";
   }
   paint();
@@ -360,22 +365,51 @@ function renderAccounts() {
   }
   const summary = run
     ? `${run.summary.accounts} · ${run.summary.authorized} auth · ${run.summary.seeded} seeded${run.summary.unmatched ? ` · ${run.summary.unmatched} unmatched` : ""}`
-    : "No CSV yet";
+    : "No accounts yet";
+  const folders = (run && run.folders) || (state.bootstrap && state.bootstrap.folders) || [];
   const savedTableScroll = (el.querySelector(".table-wrap") || {}).scrollTop || 0;
   el.innerHTML = `
     <h2>01 · Accounts</h2>
     ${setupWarnings.map((m) => `<p class="reason">${escapeHtml(m)}</p>`).join("")}
-    <div class="steps">
-      <div class="step ${csvReady ? "done" : "next"}">
-        <h3>CSV</h3>
-        <div class="row">
-          <label class="btn" for="csv">Choose CSV</label>
-          <input id="csv" class="sr-file" type="file" accept=".csv,text/csv,text/plain" />
+    <div class="step ${csvReady ? "done" : "next"}">
+      <h3>Add accounts here (no CSV)</h3>
+      <p class="note">Type email, persona, and password, then Add. Repeat for each small-batch account. Password stays in this browser so you can copy it for Gemini login.</p>
+      <div class="add-grid add-grid-row">
+        <label>Email
+          <input id="add-email" type="email" autocomplete="username" placeholder="user@gmail.com" value="${escapeHtml(state.addEmail || "")}" />
+        </label>
+        <label>Persona
+          ${folders.length
+            ? `<select id="add-persona"><option value="">Select persona</option>${folders.map((f) => `<option value="${escapeHtml(f)}"${f === state.addPersona ? " selected" : ""}>${escapeHtml(f)}</option>`).join("")}</select>`
+            : `<input id="add-persona" type="text" placeholder="Student" value="${escapeHtml(state.addPersona || "")}" />`}
+        </label>
+        <label>Password
+          <input id="add-password" type="password" autocomplete="new-password" placeholder="optional" value="${escapeHtml(state.addPassword || "")}" />
+        </label>
+        <div class="add-action">
+          <button type="button" class="primary" id="add-account">Add account</button>
         </div>
-        ${state.csvMsg ? `<p class="reason">${escapeHtml(state.csvMsg)}</p>` : ""}
-        ${state.csvQuoted ? `<p class="reason">Quoted fields — check passwords that contain a comma.</p>` : ""}
-        <div class="summary">${summary}</div>
       </div>
+      ${state.addMsg ? `<p class="reason">${escapeHtml(state.addMsg)}</p>` : ""}
+    </div>
+    <div class="step ${csvReady ? "done" : ""}">
+      <h3>Or upload a CSV</h3>
+      <p class="note">Use this for many accounts. The file must have a header row in this format:</p>
+      <div class="csv-format">
+        <pre>email,password,persona
+user410@gmail.com,secret410,Student
+user411@gmail.com,secret411,Applied ML and Data Scientist</pre>
+        <p class="note">Accepted headers: <code>email</code> / <code>Google account</code> / <code>gmail</code> / <code>email-id</code> · <code>password</code> / <code>pass</code> / <code>pwd</code> (optional) · <code>persona</code> / <code>role</code> / <code>Benchmark persona/profile</code></p>
+      </div>
+      <div class="row">
+        <label class="btn" for="csv">Choose CSV</label>
+        <input id="csv" class="sr-file" type="file" accept=".csv,text/csv,text/plain" />
+        <span class="summary">${summary}</span>
+      </div>
+      ${state.csvMsg ? `<p class="reason">${escapeHtml(state.csvMsg)}</p>` : ""}
+      ${state.csvQuoted ? `<p class="reason">Quoted fields — check passwords that contain a comma.</p>` : ""}
+    </div>
+    <div class="steps">
       <div class="step ${oauthReady ? "done" : (csvReady ? "next" : "")}">
         <h3>${((state.bootstrap && state.bootstrap.auth) || {}).interactive === false ? "Service account" : "OAuth"}</h3>
         ${oauthStepHtml()}
@@ -389,6 +423,49 @@ function renderAccounts() {
     </div>` : ""}
     ${run ? `<div class="table-wrap">${tableHtml(run)}</div>` : ""}
   `;
+  const addBtn = $("add-account");
+  if (addBtn) addBtn.onclick = async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (blockIfBusy("adding another account")) return;
+    const email = (($("add-email") && $("add-email").value) || "").trim();
+    const persona = (($("add-persona") && $("add-persona").value) || "").trim();
+    const password = (($("add-password") && $("add-password").value) || "").trim();
+    state.addEmail = email;
+    state.addPersona = persona;
+    state.addPassword = password;
+    if (!email || !persona) {
+      state.addMsg = "Email and persona are required.";
+      paint();
+      return;
+    }
+    state.localBusy = true;
+    try {
+      state.run = await api("/api/run/account", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email,
+          persona,
+          password: password || null,
+          run_id: state.run && state.run.run_id,
+        }),
+      });
+      const added = state.run.accounts.find((a) => a.email === email.toLowerCase() && (a.persona_dir === persona || a.persona_raw === persona));
+      state.selected = added ? rowKey(added) : (state.run.accounts[0] && rowKey(state.run.accounts[0]));
+      if (password) state.passwords[email.toLowerCase()] = password;
+      state.addEmail = "";
+      state.addPersona = "";
+      state.addPassword = "";
+      state.addMsg = "";
+      paint();
+    } catch (err) {
+      state.addMsg = String(err.message || err);
+      paint();
+    } finally {
+      state.localBusy = false;
+    }
+  };
   const csvInput = $("csv");
   if (csvInput) csvInput.onchange = async (ev) => {
     const file = ev.target.files[0];
@@ -496,7 +573,7 @@ function parsePasswordsClient(text) {
   if (!lines.length) return {};
   state.csvQuoted = /"/.test(text);
   const headers = csvLine(lines[0]).map((h) => h.trim().toLowerCase().replace(/\s+/g, " "));
-  const ei = headers.findIndex((h) => ["email", "google account", "account", "gmail"].includes(h));
+  const ei = headers.findIndex((h) => ["email", "email-id", "email_id", "email id", "google account", "account", "gmail"].includes(h));
   const pi = headers.findIndex((h) => ["password", "pass", "pwd"].includes(h));
   const out = {};
   if (ei < 0 || pi < 0) return out;
@@ -708,7 +785,7 @@ function renderPush() {
     : "";
   el.innerHTML = `
     <h2>05 · Push</h2>
-    <p class="lede">Upload a CSV, then Push all. Each matched account gets Calendar, Gmail (real attachments from filesystem/Drive; missing files are omitted, not empty placeholders), Drive, and the persona GitHub folder when it exists. No wipe.</p>
+    <p class="lede">Add accounts above (one-by-one or CSV), then Push all. First load uploads the persona. Same-persona reset only changes what is missing. A different persona wipes and uploads again. Calendar, Gmail, Drive, and the persona GitHub folder when it exists.</p>
     <div class="row">
       <button class="primary${running ? " busy" : ""}" id="go" ${why && !running ? "disabled" : ""}>${running ? "Pushing…" : "Push into Google account"}</button>
       ${canBatch ? `<button id="go-all">Push all matched accounts</button>` : ""}
@@ -716,6 +793,7 @@ function renderPush() {
       ${canBatch ? `<button id="go-atts">Fix email attachments</button>` : ""}
       <span class="reason" id="push-busy">${escapeHtml(busyNote || (anyRunning && !running ? "Wait for the current uploads to finish." : ""))}</span>
     </div>
+    ${progressHtml()}
     <div class="log" id="log"></div>
     ${durableLinks}
   `;
@@ -735,6 +813,40 @@ function logClass(msg) {
   if (/FAIL |ERROR|Skip |failed/i.test(msg)) return "err";
   if (/ok|Created|Inserted|Verify .*\/|Rewriting|Pushed GitHub/i.test(msg)) return "ok";
   return "";
+}
+
+function progressHtml() {
+  const p = state.progress;
+  if (!p || !p.total) {
+    return `<div class="push-progress hidden" id="push-progress"></div>`;
+  }
+  const left = Math.max(0, p.left != null ? p.left : p.total - p.done);
+  const pct = Math.min(100, Math.round(((p.done || 0) / p.total) * 100));
+  const svc = ["calendar", "gmail", "drive"].map((name) => {
+    const row = (p.services && p.services[name]) || {};
+    const total = row.total || 0;
+    const done = row.done || 0;
+    const remain = row.left != null ? row.left : Math.max(0, total - done);
+    if (!total) return `<span class="note">${name}: —</span>`;
+    return `<span>${name}: ${done}/${total} · ${remain} left${row.retrying ? ` · ${row.retrying} retry` : ""}</span>`;
+  }).join("");
+  return `<div class="push-progress" id="push-progress">
+    <div class="push-progress-top">
+      <strong>${pct}%</strong>
+      <span>${p.done || 0} done · ${left} left · ${p.total} total${p.retrying ? ` · ${p.retrying} retrying` : ""}${p.failed ? ` · ${p.failed} failed` : ""}</span>
+    </div>
+    <div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>
+    <div class="push-progress-svc">${svc}</div>
+  </div>`;
+}
+
+function drawProgress() {
+  const el = $("push-progress");
+  if (!el) return;
+  const wrap = document.createElement("div");
+  wrap.innerHTML = progressHtml();
+  const next = wrap.firstElementChild;
+  if (next) el.replaceWith(next);
 }
 
 function drawLog() {
@@ -765,6 +877,7 @@ async function startPushAll(persona, onlySkipped, fixAtts) {
   });
   state.jobId = data.job_id;
   state.log = [];
+  state.progress = null;
   attachStream(data.job_id);
 }
 
@@ -791,6 +904,7 @@ async function startPush() {
     }
     state.jobId = data.job_id;
     state.log = [];
+    state.progress = null;
     paint();
     attachStream(data.job_id);
   } catch (err) {
@@ -823,6 +937,10 @@ function attachStream(jobId) {
       p = JSON.parse(ev.data);
     } catch {
       return;
+    }
+    if (p.kind === "progress") {
+      state.progress = p;
+      drawProgress();
     }
     if (p.kind === "log") {
       state.log.push(p.message);

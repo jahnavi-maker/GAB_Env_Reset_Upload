@@ -116,6 +116,10 @@ class Settings:
     # the Bearer-protected /api/qc/{id}/confirm are the only ways a log is deleted.
     qc_log_retention_days: int = _int_env("QC_LOG_RETENTION_DAYS", 15)
     accounts_table: str = os.environ.get("SUPABASE_ACCOUNTS_TABLE", "gab_accounts")
+    # Google sign-in allow-list for /reset. Not the accounts that get reset.
+    # Same table as /ui/freelancer/verify. gab_logins is not used for sign-in.
+    logins_table: str = os.environ.get("SUPABASE_LOGINS_TABLE", "freelancers")
+    logins_use_supabase: bool = _flag("LOGINS_USE_SUPABASE", True)
     # Allow-list of freelancers permitted to open the reset page (email-only check).
     freelancers_table: str = os.environ.get("SUPABASE_FREELANCERS_TABLE", "freelancers")
     # OAuth web client id for "Sign in with Google" on the reset page (public value).
@@ -167,6 +171,10 @@ class Settings:
     @property
     def use_supabase(self) -> bool:
         return bool(self.supabase_url and self.supabase_key)
+
+    @property
+    def use_supabase_logins(self) -> bool:
+        return self.use_supabase and self.logins_use_supabase
 
 
 settings = Settings()

@@ -7,15 +7,14 @@ import shutil
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from materialize.auth import migrate_known_account_tokens
@@ -27,12 +26,19 @@ from materialize.authbackend import (
     is_service_account_info,
     save_service_account_key,
 )
-from materialize.csv_ingest import parse_accounts_csv
+from materialize.csv_ingest import CSV_FORMAT, account_from_fields, parse_accounts_csv
 from materialize.github_repo import ensure_private_repo, github_user, push_github_tree
 from materialize.fail import fail_line, log_fail, log_warn, next_for, persist_fail
 from materialize.jobs import account_log_path, batch_since, create_job, finish, get_job, logger
 from materialize.skip_retry import plan_account_skips, plan_has_work, summarize_run_skips
 from materialize.json_util import inspect_and_normalize
+from materialize.provision.pipeline import AccountWork, provision_accounts
+from materialize.provision.route import (
+    apply_mode,
+    decide_provision_mode,
+    describe_mode,
+    last_seeded_persona,
+)
 from materialize.runner import (
     attachment_fs_matches,
     attachment_message_count,
@@ -51,6 +57,7 @@ from materialize.runstate import (
     resolve_sources,
     recover_interrupted_runs,
     latest_run_id,
+    merge_accounts,
     batch_pool_settings,
     chunk_accounts,
     matched_for_push,
@@ -244,6 +251,7 @@ def bootstrap():
             "domain": getattr(backend, "domain", None),
         },
         "folders": persona_folders(),
+        "csv_format": CSV_FORMAT,
         "latest_run": latest,
         "github_pat": bool(GITHUB_PAT.get("token")),
         "github_login": GITHUB_PAT.get("login"),
@@ -309,6 +317,48 @@ async def create_run(file: UploadFile = File(...)):
     return _public(run_id)
 
 
+class ManualAccount(BaseModel):
+    email: str
+    persona: str
+    password: str | None = Field(default=None, repr=False)
+    run_id: str | None = None
+
+
+@app.post("/api/run/account")
+def add_manual_account(body: ManualAccount):
+    """Add one email + persona without a CSV (small batches). Password is not stored."""
+    try:
+        row = account_from_fields(body.email, body.persona)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    has_pw = bool((body.password or "").strip())
+    run_id = (body.run_id or "").strip()
+    if run_id:
+        manifest = _require_run(run_id)
+        existing = {
+            ((a.get("email") or "").lower(), row_persona_key(a))
+            for a in (manifest.get("accounts") or [])
+        }
+        key = (row["email"], row["persona_key"])
+        if key in existing:
+            raise HTTPException(409, f"{row['email']} + {row['persona_raw']} is already in this run")
+        merge_accounts(run_id, [row], [], has_passwords=has_pw)
+    else:
+        run_id = new_run(
+            [row],
+            [],
+            has_passwords=has_pw,
+            auth_backend=get_backend().name,
+        )
+
+    def refresh(manifest: dict[str, Any]) -> None:
+        for acc in manifest.get("accounts") or []:
+            _refresh_auth_row(acc)
+
+    update_manifest(run_id, refresh)
+    return _public(run_id)
+
+
 @app.get("/api/run/{run_id}/skipped")
 def get_skipped(run_id: str):
     manifest = _require_run(run_id)
@@ -353,15 +403,22 @@ def set_persona(run_id: str, email: str, body: PersonaFix, persona: str | None =
     return _public(run_id)
 
 
+def _oauth_redirect(request: Request) -> str:
+    host = (request.headers.get("host") or "").split(",")[0].strip().lower()
+    if host.startswith("localhost"):
+        return "http://localhost:8765/oauth/callback"
+    return "http://127.0.0.1:8765/oauth/callback"
+
+
 @app.post("/api/run/{run_id}/account/{email}/authorize")
-def authorize(run_id: str, email: str, persona: str | None = None):
+def authorize(run_id: str, email: str, request: Request, persona: str | None = None):
     email = email.lower()
     backend = get_backend()
     if not backend.interactive:
         raise HTTPException(400, "this auth backend does not use per-account consent")
     _require_account(run_id, email, persona)
     try:
-        started = backend.begin(run_id, email)
+        started = backend.begin(run_id, email, redirect_uri=_oauth_redirect(request))
     except AuthError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"ok": True, **(started or {})}
@@ -736,8 +793,17 @@ def _execute_push(
         _bind_persona_sources(run_id, email, pkey)
         sources = resolve_sources(run_id, email, persona, persona_key=pkey)
         body = _fixed_push_body(body, row, sources)
+        last_persona = last_seeded_persona(_manifest, email, row)
+        mode = decide_provision_mode(
+            target_persona=persona,
+            last_persona=last_persona,
+            only_skipped=bool(body.only_skipped or body.fix_gmail_attachments),
+        )
+        flags = apply_mode(mode)
+        body = body.model_copy(update={"wipe": bool(flags["wipe"])})
         log(f"Target Google account: {email}")
         log(f"Persona: {persona}")
+        log(describe_mode(mode, last_persona=last_persona, target_persona=persona))
         retry_plan = _skip_plan_for(run_id, row) if body.only_skipped else None
         if retry_plan is not None:
             log(
@@ -789,6 +855,7 @@ def _execute_push(
             job_id=job_id,
             retry_plan=retry_plan,
             replace_gmail_attachments=body.fix_gmail_attachments,
+            mode=mode,
         )
         log(f"END populate status_keys={sorted(result.keys())}")
         if body.github:
@@ -840,6 +907,7 @@ def _execute_push(
             acc["push"] = {
                 "state": overall if overall != "failed" else "failed",
                 "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "last_persona": persona if overall != "failed" else (acc.get("push") or {}).get("last_persona"),
                 "job_id": job_id,
                 "attachments_started": bool((acc.get("push") or {}).get("attachments_started")),
                 "attachments_fixed": bool(
@@ -856,6 +924,11 @@ def _execute_push(
             data["github"] = github_state
 
         update_state(run_id, email, merge_state, persona_key=pkey)
+        if overall != "failed":
+            def remember(manifest: dict[str, Any]) -> None:
+                manifest.setdefault("last_persona_by_email", {})[email] = persona
+
+            update_manifest(run_id, remember)
         log(f"DONE overall={overall} thread={threading.current_thread().name}")
         finish(job_id, overall)
         # DB HOOK 2: on push/seed completion, log an 'upload' row in reset_sessions
@@ -1024,66 +1097,172 @@ def push_all(run_id: str, body: PushBody, persona: str | None = None):
         },
     )
 
-    def run_one(row: dict[str, Any], thread_no: int) -> str:
-        email = row["email"]
-        pkey = row_persona_key(row)
-        child = uuid.uuid4().hex
-        create_job(child, {"run_id": run_id, "email": email, "persona": pkey, "thread": thread_no})
-        log = logger(job_id)
-        log(f"— thread {thread_no} {email} / {pkey or row.get('persona_dir') or '?'}")
-        try:
-            _execute_push(child, run_id, email, body, mirror_id=job_id, persona=pkey)
-        except Exception as exc:
-            log_fail(log, email, "push", exc, run_id=run_id, job_id=child)
-            return "failed"
-        child_job = get_job(child) or {}
-        return str(child_job.get("status") or "failed")
-
-    def run_chunk(thread_no: int, chunk: list[dict[str, Any]]) -> list[str]:
-        log = logger(job_id)
-        first = (chunk[0].get("email") or "?").split("@", 1)[0]
-        last = (chunk[-1].get("email") or "?").split("@", 1)[0]
-        log(f"Thread {thread_no} started users {first}–{last} ({len(chunk)} accounts, mixed personas)")
-        statuses: list[str] = []
-        with ThreadPoolExecutor(max_workers=max(1, len(chunk))) as inner:
-            futs = [inner.submit(run_one, row, thread_no) for row in chunk]
-            for fut in as_completed(futs):
-                try:
-                    statuses.append(fut.result())
-                except Exception as exc:
-                    statuses.append("failed")
-                    log_fail(log, "(batch)", "push", exc, run_id=run_id, job_id=job_id)
-        return statuses
-
     def run_batch() -> None:
+        from materialize.provision.config import load_config
+
         log = logger(job_id)
+        cfg = load_config()
         scope = f" persona={persona}" if persona else ""
         log(
             f"Push-all {len(matched)} accounts{scope} via {backend.name} "
-            f"({threads} threads × {users_per_thread} users)"
+            f"(queue pipeline: drive={cfg.drive_workers} calendar={cfg.calendar_workers} "
+            f"gmail={cfg.gmail_workers} workers; {len(chunks)} account groups of up to {users_per_thread})"
         )
         if body.fix_gmail_attachments:
             log(
                 f"Attachment repair skipped already-done={skipped_done} "
                 f"no-filesystem-filename={skipped_no_fs}"
             )
+        works: list[AccountWork] = []
+        child_ids: dict[str, str] = {}
+        held: dict[str, threading.Lock] = {}
+        statuses: list[str] = []
         try:
-            statuses: list[str] = []
-            with ThreadPoolExecutor(max_workers=threads) as outer:
-                futs = [
-                    outer.submit(run_chunk, index + 1, chunk)
-                    for index, chunk in enumerate(chunks)
-                ]
-                for fut in as_completed(futs):
+            for row in matched:
+                email = row["email"]
+                pkey = row_persona_key(row)
+                lock = _account_lock(email)
+                if not lock.acquire(blocking=False):
+                    log(f"— {email} already running; left for the next batch")
+                    statuses.append("failed")
+                    continue
+                held[email] = lock
+                child = uuid.uuid4().hex
+                child_ids[email] = child
+                create_job(child, {"run_id": run_id, "email": email, "persona": pkey, "thread": 0})
+                child_log = logger(child, mirror_id=job_id, prefix=f"[{email}] ")
+                try:
+                    _manifest, acc = update_account(
+                        run_id, email, lambda a, _m: _refresh_auth_row(a), persona=pkey
+                    )
+                    creds = backend.credentials_for(email)
+                    backend.verify(creds, email)
+                    _bind_persona_sources(run_id, email, pkey)
+                    sources = resolve_sources(run_id, email, acc["persona_dir"], persona_key=pkey)
+                    fixed = _fixed_push_body(body, acc, sources)
+                    last_persona = last_seeded_persona(_manifest, email, acc)
+                    mode = decide_provision_mode(
+                        target_persona=acc["persona_dir"],
+                        last_persona=last_persona,
+                        only_skipped=bool(fixed.only_skipped or fixed.fix_gmail_attachments),
+                    )
+                    flags = apply_mode(mode)
+                    fixed = fixed.model_copy(update={"wipe": bool(flags["wipe"])})
+                    child_log(describe_mode(mode, last_persona=last_persona, target_persona=acc["persona_dir"]))
+                    retry_plan = _skip_plan_for(run_id, acc) if fixed.only_skipped else None
+                    github_dir = ENV_ROOT / acc["persona_dir"] / "services" / "github"
+                    if not github_dir.exists():
+                        github_dir = None
+
+                    def mark_running(a: dict[str, Any], _m: dict[str, Any]) -> None:
+                        a.setdefault("push", {})
+                        a["push"]["state"] = "running"
+                        a["push"]["job_id"] = child
+                        if fixed.fix_gmail_attachments:
+                            a["push"]["attachments_started"] = True
+
+                    update_account(run_id, email, mark_running, persona=pkey)
+                    works.append(
+                        AccountWork(
+                            email=email,
+                            persona=acc["persona_dir"],
+                            persona_key=pkey,
+                            environment_id=acc["persona_dir"],
+                            creds=creds,
+                            calendar_json=Path(sources["calendar"]["path"]) if sources["calendar"]["path"] else None,
+                            gmail_json=Path(sources["gmail"]["path"]) if sources["gmail"]["path"] else None,
+                            drive_json=Path(sources["filesystem"]["path"]) if sources["filesystem"]["path"] else None,
+                            github_dir=github_dir if fixed.github_zip else None,
+                            do_calendar=fixed.calendar,
+                            do_gmail=fixed.gmail,
+                            do_drive=fixed.drive,
+                            do_github=bool(fixed.github_zip),
+                            wipe=fixed.wipe,
+                            retry_plan=retry_plan,
+                            replace_gmail_attachments=fixed.fix_gmail_attachments,
+                            mode=mode,
+                            log=child_log,
+                            ui_job_id=child,
+                        )
+                    )
+                    child_log(f"Queued into shared Drive/Calendar/Gmail workers persona={acc['persona_dir']}")
+                except Exception as exc:
+                    log_fail(log, email, "push", exc, run_id=run_id, job_id=child)
+                    finish(child, "failed")
+                    statuses.append("failed")
+                    held.pop(email).release()
+            if works:
+                results = provision_accounts(
+                    works, run_id=run_id, log=log, verify=False, progress_job_ids=[job_id]
+                )
+                by_email = {w.email: w for w in works}
+                for email, work in by_email.items():
+                    child = child_ids[email]
+                    child_log = work.log or log
                     try:
-                        statuses.extend(fut.result())
+                        account_result = (results.get("accounts") or {}).get(email) or {}
+                        expect = account_result.get("expect") or {}
+                        services = account_result.get("services") or {}
+                        verify = verify_seed(
+                            work.creds,
+                            persona=work.persona,
+                            expect_calendar=expect.get("calendar") if work.do_calendar else None,
+                            expect_gmail=expect.get("gmail") if work.do_gmail else None,
+                            expect_drive=expect.get("drive") if work.do_drive else None,
+                            folder_id=account_result.get("folder_id"),
+                            log=child_log,
+                            calendar=services.get("calendar"),
+                            gmail=services.get("gmail"),
+                            drive=services.get("drive"),
+                        )
+                        overall = verify.get("overall") or account_result.get("status") or "partial"
+                        if overall == "failed":
+                            log_fail(child_log, email, "verify", "read-back found nothing against a non-zero source", run_id=run_id, job_id=child)
+                        pkey = work.persona_key
+
+                        def finish_ok(acc: dict[str, Any], _m: dict[str, Any], ov=overall, cid=child, pers=work.persona) -> None:
+                            acc["push"] = {
+                                "state": ov if ov != "failed" else "failed",
+                                "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                "last_persona": pers if ov != "failed" else (acc.get("push") or {}).get("last_persona"),
+                                "job_id": cid,
+                            }
+
+                        update_account(run_id, email, finish_ok, persona=pkey)
+                        if overall != "failed":
+                            def remember(manifest: dict[str, Any], em=email, pers=work.persona) -> None:
+                                manifest.setdefault("last_persona_by_email", {})[em] = pers
+
+                            update_manifest(run_id, remember)
+                        update_state(
+                            run_id,
+                            email,
+                            lambda data, v=verify, ar=account_result: data.update(
+                                {"verify": v, "skips": ar.get("skips") or {}}
+                            ),
+                            persona_key=pkey,
+                        )
+                        child_log(f"DONE overall={overall}")
+                        finish(child, overall)
+                        try:
+                            import db_hooks
+                            db_hooks.on_push_success(email, work.persona)
+                        except Exception as hook_exc:
+                            child_log(f"db_hook on_push_success failed: {hook_exc}")
+                        statuses.append(overall)
                     except Exception as exc:
+                        log_fail(log, email, "push", exc, run_id=run_id, job_id=child)
+                        finish(child, "failed")
                         statuses.append("failed")
-                        log_fail(log, "(batch)", "push", exc, run_id=run_id, job_id=job_id)
             overall = batch_status(statuses)
             log(f"Push-all finished: {overall} ({', '.join(statuses)})")
             finish(job_id, overall)
         finally:
+            for lock in held.values():
+                try:
+                    lock.release()
+                except Exception:
+                    pass
             try:
                 def clear_batch(data: dict[str, Any]) -> None:
                     if data.get("batch_job_id") == job_id:
@@ -1111,6 +1290,7 @@ def stream_job(job_id: str):
 
     def gen():
         last_seq = 0
+        last_prog = 0
         while True:
             with job["cv"]:
                 timed_out = False
@@ -1118,17 +1298,24 @@ def stream_job(job_id: str):
                     batch, new_last, dropped = batch_since(job, last_seq)
                     done = job["done"]
                     status = job["status"]
-                    if batch or done:
+                    prog = job.get("progress")
+                    prog_seq = int(job.get("progress_seq") or 0)
+                    if batch or done or prog_seq > last_prog:
                         break
                     timed_out = not job["cv"].wait(timeout=15)
                     if timed_out:
                         batch, new_last, dropped = batch_since(job, last_seq)
                         done = job["done"]
                         status = job["status"]
+                        prog = job.get("progress")
+                        prog_seq = int(job.get("progress_seq") or 0)
                         break
-            if timed_out and not batch and not done:
+            if timed_out and not batch and not done and prog_seq <= last_prog:
                 yield ": ping\n\n"
                 continue
+            if prog and prog_seq > last_prog:
+                last_prog = prog_seq
+                yield f"data: {json.dumps({'kind': 'progress', **prog})}\n\n"
             if dropped:
                 yield f"data: {json.dumps({'kind': 'log', 'message': f'… {dropped} earlier lines dropped from the buffer'})}\n\n"
             for line in batch:

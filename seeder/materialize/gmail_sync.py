@@ -242,6 +242,47 @@ def trash_seeded_message(gmail, msg_id: str, log: Callable[[str], None]) -> None
     )
 
 
+def insert_one_message(
+    gmail,
+    item: dict[str, Any],
+    file_index: dict[str, bytes],
+    log: Callable[[str], None],
+    *,
+    label_id: str,
+    thread_id: str | None = None,
+) -> dict[str, str]:
+    """Insert one mailbox message. Returns {id, threadId}."""
+    raw, _internal_ms, omitted = _build_raw(item, file_index)
+    eid = item.get("email_id") or ""
+    if omitted:
+        log(
+            f"Email {eid}: sent without missing attachments "
+            + ", ".join(omitted)
+        )
+    folder = str(item.get("folder") or "INBOX").upper()
+    labels = [label_id]
+    if folder == "SENT":
+        labels.append("SENT")
+    else:
+        labels.append("INBOX")
+    if folder != "SENT" and not item.get("is_read", True):
+        labels.append("UNREAD")
+    body: dict[str, Any] = {"raw": raw, "labelIds": labels}
+    if thread_id:
+        body["threadId"] = thread_id
+    result = _retry(
+        lambda b=body: gmail.users()
+        .messages()
+        .insert(userId="me", body=b, internalDateSource="dateHeader")
+        .execute(),
+        log,
+    )
+    return {
+        "id": result["id"],
+        "threadId": result.get("threadId") or result["id"],
+    }
+
+
 def populate_gmail(
     gmail,
     data: dict[str, Any],

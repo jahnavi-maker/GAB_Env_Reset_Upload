@@ -232,6 +232,16 @@ def batch_since(job: dict[str, Any], last_seq: int) -> tuple[list[dict[str, Any]
     return batch, new_last, dropped
 
 
+def set_progress(job_id: str, payload: dict[str, Any]) -> None:
+    job = _lookup(job_id)
+    if not job:
+        return
+    with job["cv"]:
+        job["progress"] = dict(payload or {})
+        job["progress_seq"] = int(job.get("progress_seq") or 0) + 1
+        job["cv"].notify_all()
+
+
 def finish(job_id: str, status: str) -> None:
     job = _lookup(job_id)
     if not job:

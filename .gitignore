@@ -24,6 +24,8 @@
 **/uploads/
 **/persona_drive_cache/
 .reset_sessions.json
+.reset_sessions.logins.json
+*.logins.json
 *.manifest.json
 
 # ---- Large data artifacts ----

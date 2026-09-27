@@ -18,21 +18,35 @@ import json
 import logging
 import os
 import re
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from pathlib import Path
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from . import __version__, engine, upload
+from . import __version__, engine, google_login, upload
+from .accounts import (
+    CSV_FORMAT,
+    LOGIN_CSV_FORMAT,
+    parse_account_csv,
+    parse_login_csv,
+    public_account,
+    resolve_google_client_id,
+)
 from .config import settings
 from .db import Store, make_store
 from . import links
 from .models import (
+    AccountLoginRequest,
+    AccountLoginResponse,
+    AccountUpsertRequest,
+    LoginUpsertRequest,
     FreelancerItem,
     FreelancerResetRequest,
     FreelancerUpsertRequest,
@@ -198,25 +212,105 @@ def _write_qc_log(record: dict) -> None:
         log.warning("qc log write failed", exc_info=True)
 
 
+class AlreadySeeded(Exception):
+    """Raised when /upload is called on an account that already has a persona."""
+
+    def __init__(self, email: str, last_persona: str) -> None:
+        self.email = email
+        self.last_persona = last_persona
+        super().__init__(email)
+
+
+def _seeder_token_exists(email: str) -> bool:
+    """True if the seeder already saved a Google refresh token for this email."""
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        return False
+    try:
+        seeder = str(Path(settings.seeder_dir).expanduser().resolve())
+        if seeder not in sys.path:
+            sys.path.insert(0, seeder)
+        from materialize.auth import token_path  # type: ignore
+
+        return token_path(email).exists()
+    except Exception:
+        return False
+
+
+async def _persona_from_sessions(store: Store, email: str) -> str:
+    email = (email or "").strip().lower()
+    try:
+        rows = await store.query(
+            settings.supabase_table,
+            {"select": "persona,email,created_at", "email": f"eq.{email}", "order": "created_at.desc"},
+        )
+    except Exception:
+        return ""
+    hits = [r for r in (rows or []) if (r.get("email") or "").lower() == email and r.get("persona")]
+    hits.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    return str((hits[0] if hits else {}).get("persona") or "").strip()
+
+
+async def _resolve_reset_account(
+    store: Store, email: str, persona: str | None = None
+) -> dict[str, Any] | None:
+    """Registered if gab_accounts has the row, or the seeder already authorized it.
+
+    First uploads often happen on the seeder and never call POST /api/accounts.
+    Those accounts still have a token on disk (and maybe a prior reset_sessions row).
+    """
+    email = (email or "").strip().lower()
+    rec = await store.get_account(email)
+    if rec:
+        return rec
+    session_persona = await _persona_from_sessions(store, email)
+    if not (_seeder_token_exists(email) or session_persona):
+        return None
+    resolved = (persona or session_persona or "").strip()
+    rec = {
+        "email": email,
+        "persona": resolved,
+        "last_reset_persona": resolved,
+        "authorized": True,
+        "status": "active",
+    }
+    if resolved:
+        try:
+            saved = await store.upsert_account(email, resolved)
+            if saved:
+                saved["authorized"] = True
+                return saved
+        except Exception:
+            log.warning("gab_accounts write skipped for %s (read-only Supabase key?)", email)
+    return rec if resolved or session_persona else rec
+
+
+def _persona_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (value or "").lower()).strip("_")
+
+
+async def _last_reset_persona(store: Store, email: str) -> str:
+    """Last known persona from Supabase gab_accounts (last_reset_persona, else persona)."""
+    try:
+        rec = await store.get_account(email)
+    except Exception:
+        log.exception("gab_accounts persona lookup failed for %s", email)
+        return ""
+    if not rec:
+        return ""
+    return str(rec.get("last_reset_persona") or rec.get("persona") or "").strip()
+
+
 async def _decide_mode(store: Store, email: str, persona: str, explicit: str | None) -> str:
-    """Route delta vs reseed: same persona -> delta; new/first persona -> reseed."""
+    """Same persona as Supabase gab_accounts -> delta; different or unknown -> reseed."""
     if explicit:
         return explicit
     if not settings.reset_auto_route:
         return settings.reset_mode
-    try:
-        rows = await store.query(
-            settings.accounts_table,
-            {"select": "last_reset_persona", "email": f"eq.{email}", "limit": "1"},
-        )
-    except Exception:
-        # A lookup failure here would silently route to a full wipe (reseed); log it
-        # loudly so an outage is visible and not mistaken for a first-time account.
-        log.exception("mode-routing lookup failed for %s; defaulting to reseed", email)
-        rows = []
-    if not rows or not rows[0].get("last_reset_persona"):
-        return "reseed"                       # unknown account / never reset -> establish baseline
-    return "delta" if rows[0]["last_reset_persona"] == persona else "reseed"  # switch -> reseed
+    last = await _last_reset_persona(store, email)
+    if not last:
+        return "reseed"
+    return "delta" if _persona_key(last) == _persona_key(persona) else "reseed"
 
 
 async def _safe_update(store: Store, reset_session_id: str, fields: dict) -> None:
@@ -365,6 +459,13 @@ async def _launch_reset(
     already taken (e.g. a "reset again" reusing an old link), we fall back to a fresh
     uuid so the reset still runs rather than colliding.
     """
+    account = await _resolve_reset_account(store, email, persona)
+    if not account:
+        raise HTTPException(
+            status_code=404,
+            detail="this Google account has not been uploaded yet — authorize it on /onboard first",
+        )
+    persona = persona or account.get("last_reset_persona") or account.get("persona")
     op_mode = await _decide_mode(store, email, persona, mode)
     pinned = str(reset_session_id) if reset_session_id else None
     if pinned:
@@ -402,9 +503,21 @@ async def _launch_reset(
     return reset_session_id, op_mode
 
 
+def _reset_accepted(reset_session_id: str, status: str = "in_progress", error: str | None = None) -> ResetApiResponse:
+    url = f"{settings.public_base_url.rstrip('/')}/api/environment/reset/{reset_session_id}"
+    return ResetApiResponse(url=url, status=status, error=error, reset_session_id=reset_session_id)
+
+
 @app.get("/healthz")
 async def healthz() -> dict:
-    return {"ok": True, "version": __version__, "store": "supabase" if settings.use_supabase else "local"}
+    return {
+        "ok": True,
+        "version": __version__,
+        "store": "supabase" if settings.use_supabase else "local",
+        "login_store": (
+            f"supabase:{settings.freelancers_table}" if settings.use_supabase else "local"
+        ),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -430,8 +543,28 @@ async def ui_reset_status_page(reset_session_id: str) -> HTMLResponse:
     return HTMLResponse((STATIC_DIR / "status.html").read_text(encoding="utf-8"))
 
 
+async def _require_freelancer_gate(
+    store: Store, email: str | None = None, credential: str | None = None
+) -> str:
+    """Login gate is off for now so reset can be tested. Re-enable later."""
+    return (email or "").strip().lower()
+
+
+def _bearer_ok(authorization: str | None) -> bool:
+    if not settings.api_key:
+        return False
+    expected = f"Bearer {settings.api_key}"
+    return bool(authorization) and hmac.compare_digest(authorization, expected)
+
+
 @app.get("/ui/reset/{reset_session_id}")
-async def ui_reset_status(reset_session_id: str, store: Store = Depends(get_store)) -> dict:
+async def ui_reset_status(
+    reset_session_id: str,
+    store: Store = Depends(get_store),
+    email: str | None = None,
+    credential: str | None = None,
+) -> dict:
+    await _require_freelancer_gate(store, email, credential)
     record = await store.get(reset_session_id)
     if not record:
         raise HTTPException(status_code=404, detail="unknown reset_session_id")
@@ -637,16 +770,15 @@ async def create_reset(
         reset_session_id, op_mode = await _launch_reset(
             store, background, req.email, req.persona, req.task_allocation_id, req.mode, req.services
         )
+    except HTTPException:
+        raise
     except ActiveResetConflict:
         raise HTTPException(status_code=409, detail="an active reset already exists for this account")
     except Exception as exc:
         log.exception("failed to create session row")
         raise HTTPException(status_code=502, detail="could not create the reset session; please retry") from exc
 
-    # url = the status endpoint for this reset. Open it in a browser for the live
-    # page, or GET it from code for JSON ({url, status, error}).
-    url = f"{settings.public_base_url.rstrip('/')}/api/environment/reset/{reset_session_id}"
-    return ResetApiResponse(url=url, status="in_progress", error=None)
+    return _reset_accepted(reset_session_id)
 
 
 @app.post("/api/reset-link", response_model=ResetLinkResponse, dependencies=[Depends(require_api_key)])
@@ -716,7 +848,148 @@ async def delete_freelancer(email: str, store: Store = Depends(get_store)) -> di
 async def ui_auth_config() -> dict:
     """Public: tells the reset page whether Google sign-in is enabled and, if so,
     which client id to use. Empty client id -> the page uses the email fallback."""
-    return {"google_client_id": settings.google_client_id or ""}
+    return {
+        "google_client_id": resolve_google_client_id(),
+        "google_login_url": "/ui/google/start",
+    }
+
+
+@app.get("/ui/google/start")
+async def ui_google_start(
+    next_path: str = Query("/reset", alias="next"),
+    hint: str = "",
+) -> RedirectResponse:
+    """Send the browser to Google's email + password page (prompt=login)."""
+    try:
+        url = google_login.build_login_url(next_path, hint)
+    except Exception as exc:
+        log.warning("google login start failed: %s", exc)
+        dest = google_login.callback_redirect(next_path, login_error="not_configured")
+        return RedirectResponse(dest, status_code=303)
+    return RedirectResponse(url, status_code=302)
+
+
+@app.get("/ui/google/callback")
+async def ui_google_callback(
+    store: Store = Depends(get_store),
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+) -> RedirectResponse:
+    """Google returns here after password sign-in. Identity only — no token save."""
+    next_path = "/reset"
+    try:
+        email, credential, next_path = google_login.finish_login(code, state, error)
+    except google_login.GoogleLoginError as exc:
+        log.warning("google login callback failed: %s", exc)
+        dest = google_login.callback_redirect(exc.next_path, login_error="google")
+        return RedirectResponse(dest, status_code=303)
+    row = await store.get_freelancer(email)
+    if not row or not row.get("active", True):
+        dest = google_login.callback_redirect(next_path, login_error="not_allowed")
+        return RedirectResponse(dest, status_code=303)
+    dest = google_login.callback_redirect(next_path, credential=credential)
+    return RedirectResponse(dest, status_code=303)
+
+
+@app.post("/api/logins", dependencies=[Depends(require_api_key)])
+async def upsert_logins(req: LoginUpsertRequest, store: Store = Depends(get_store)) -> dict:
+    """Who may Google-sign-in on /reset. Same freelancers table as Cosmo."""
+    rows = req.items()
+    if not rows:
+        raise HTTPException(status_code=422, detail="provide email, or logins[]")
+    saved: list[str] = []
+    for item in rows:
+        await store.upsert_login(item.email, item.name)
+        saved.append(item.email)
+    return {"upserted": len(saved), "emails": saved, "csv_format": LOGIN_CSV_FORMAT}
+
+
+@app.post("/api/logins/csv", dependencies=[Depends(require_api_key)])
+async def upsert_logins_csv(
+    file: UploadFile = File(...), store: Store = Depends(get_store)
+) -> dict:
+    raw = await file.read()
+    rows, errors = parse_login_csv(raw)
+    saved: list[str] = []
+    for item in rows:
+        await store.upsert_login(item["email"], item.get("name") or None)
+        saved.append(item["email"])
+    return {
+        "upserted": len(saved),
+        "emails": saved,
+        "errors": errors,
+        "csv_format": LOGIN_CSV_FORMAT,
+    }
+
+
+@app.get("/api/logins", dependencies=[Depends(require_api_key)])
+async def list_logins(store: Store = Depends(get_store)) -> dict:
+    rows = await store.list_logins()
+    return {
+        "count": len(rows),
+        "logins": rows,
+        "store": f"supabase:{settings.freelancers_table}" if settings.use_supabase else "local",
+    }
+
+
+@app.delete("/api/logins/{email}", dependencies=[Depends(require_api_key)])
+async def delete_login(email: str, store: Store = Depends(get_store)) -> dict:
+    await store.delete_login(email)
+    return {"deleted": email.strip().lower()}
+
+
+@app.get("/api/accounts/csv-format", dependencies=[Depends(require_api_key)])
+async def accounts_csv_format() -> dict:
+    return CSV_FORMAT
+
+
+@app.post("/api/accounts", dependencies=[Depends(require_api_key)])
+async def upsert_accounts(
+    req: AccountUpsertRequest, store: Store = Depends(get_store)
+) -> dict:
+    """Register demo Google accounts (single or list). Does not seed Drive/Gmail."""
+    rows = req.items()
+    if not rows:
+        raise HTTPException(status_code=422, detail="provide email+persona, or accounts[]")
+    saved: list[dict[str, Any]] = []
+    for item in rows:
+        rec = await store.upsert_account(item.email, item.persona, item.password)
+        saved.append(public_account(rec))
+    return {"upserted": len(saved), "accounts": saved, "csv_format": CSV_FORMAT}
+
+
+@app.post("/api/accounts/csv", dependencies=[Depends(require_api_key)])
+async def upsert_accounts_csv(
+    file: UploadFile = File(...), store: Store = Depends(get_store)
+) -> dict:
+    """Register accounts from a CSV (email, persona, optional password)."""
+    raw = await file.read()
+    rows, errors = parse_account_csv(raw)
+    saved: list[dict[str, Any]] = []
+    for item in rows:
+        rec = await store.upsert_account(item["email"], item["persona"], item.get("password") or None)
+        saved.append(public_account(rec))
+    return {
+        "upserted": len(saved),
+        "accounts": saved,
+        "errors": errors,
+        "csv_format": CSV_FORMAT,
+    }
+
+
+@app.get("/api/accounts", dependencies=[Depends(require_api_key)])
+async def list_accounts(store: Store = Depends(get_store)) -> dict:
+    rows = [public_account(r) for r in await store.list_accounts()]
+    return {"count": len(rows), "accounts": rows}
+
+
+@app.get("/api/accounts/{email}", dependencies=[Depends(require_api_key)])
+async def get_account(email: str, store: Store = Depends(get_store)) -> dict:
+    rec = await _resolve_reset_account(store, email)
+    if not rec:
+        raise HTTPException(status_code=404, detail="account not registered")
+    return public_account(rec)
 
 
 def _verify_google_credential(credential: str) -> str | None:
@@ -724,14 +997,15 @@ def _verify_google_credential(credential: str) -> str | None:
 
     Checks the signature against Google's public keys, the audience (our client id),
     and that Google marked the email verified. Any failure returns None (no trust)."""
-    if not settings.google_client_id:
+    client_id = resolve_google_client_id()
+    if not client_id:
         return None
     try:
         from google.oauth2 import id_token as google_id_token
         from google.auth.transport import requests as google_requests
 
         info = google_id_token.verify_oauth2_token(
-            credential, google_requests.Request(), settings.google_client_id
+            credential, google_requests.Request(), client_id
         )
     except Exception:  # noqa: BLE001 - a bad/expired/forged token is simply untrusted
         log.warning("google credential verification failed")
@@ -751,7 +1025,7 @@ async def verify_freelancer(
     taken from a verified Google ID token (can't be spoofed); otherwise it falls back
     to a plain email (dev only). The resolved email is then checked against the
     freelancers allow-list. Returns {verified, name, email}."""
-    if settings.google_client_id:
+    if resolve_google_client_id():
         # Google enabled -> ONLY trust an email proven by a Google ID token.
         email = _verify_google_credential(req.credential or "")
         if not email:
@@ -773,6 +1047,74 @@ async def verify_freelancer(
     return FreelancerVerifyResponse(verified=False, email=email)
 
 
+def _login_email_from_request(req: AccountLoginRequest) -> str | None:
+    if resolve_google_client_id():
+        return _verify_google_credential(req.credential or "")
+    email = (req.email or "").strip().lower()
+    if not email or "@" not in email:
+        return None
+    return email
+
+
+@app.post("/ui/account/login", response_model=AccountLoginResponse)
+async def ui_account_login(
+    req: AccountLoginRequest, store: Store = Depends(get_store)
+) -> AccountLoginResponse:
+    """Google login gate. Allowed only if the signed-in email is in freelancers."""
+    email = _login_email_from_request(req)
+    if not email:
+        return AccountLoginResponse(
+            verified=False,
+            detail="Google sign-in failed" if resolve_google_client_id() else "enter a valid email",
+        )
+    row = await store.get_freelancer(email)
+    if not row or not row.get("active", True):
+        return AccountLoginResponse(
+            verified=False,
+            email=email,
+            detail="this Google account is not allowed to sign in",
+        )
+    return AccountLoginResponse(verified=True, email=email)
+
+
+@app.post("/ui/account/reset", response_model=ResetApiResponse, status_code=status.HTTP_202_ACCEPTED)
+async def ui_account_reset(
+    req: AccountLoginRequest,
+    background: BackgroundTasks,
+    store: Store = Depends(get_store),
+) -> ResetApiResponse:
+    """Same POST /api/environment/reset session. Login gate is off for now.
+
+    The account that gets reset must be in gab_accounts. Response is the Cosmo
+    contract: url, status, error, reset_session_id.
+    """
+    reset_email = (req.reset_email or req.email or "").strip().lower()
+    if not reset_email or "@" not in reset_email:
+        raise HTTPException(status_code=400, detail="provide the gab_accounts email to reset")
+    rec = await _resolve_reset_account(store, reset_email)
+    if not rec:
+        raise HTTPException(
+            status_code=404,
+            detail="that email has not been uploaded yet — it is not a seeded environment",
+        )
+    persona = rec.get("last_reset_persona") or rec.get("persona")
+    if not persona:
+        raise HTTPException(status_code=400, detail="account has no persona on file")
+    try:
+        reset_session_id, _op = await _launch_reset(
+            store,
+            background,
+            reset_email,
+            persona,
+            f"account-reset-{uuid.uuid4()}",
+            None,
+            None,
+        )
+    except ActiveResetConflict:
+        raise HTTPException(status_code=409, detail="a reset is already running for this account")
+    return _reset_accepted(reset_session_id)
+
+
 # --------------------------------------------------------------------------- #
 # UPLOAD (first upload): OAuth consent -> engine `seed` which WRITES the        #
 # manifest, so a later same-persona reset can route to delta. Same server, same #
@@ -790,12 +1132,14 @@ async def _start_upload(
     same-origin onboarding UI. Returns (upload_session_id, task_allocation_id,
     auth_url|None). auth_url is None in SIMULATE (seeds immediately).
 
-    Upload = clean-slate: the background op is `reseed` (full wipe of ALL existing
-    data, no manifest needed) then a fresh engine seed which WRITES the manifest
-    (so a later reset can delta). The seed runs through the bounded pool, so many
-    concurrent uploads (e.g. a 200-account batch) stay quota-safe.
+    First-time only: engine ``seed`` (full upload, no wipe). If this account
+    already has ``gab_accounts.last_reset_persona``, callers must use
+    POST /api/environment/reset (same persona -> delta, switch -> reseed).
     """
     email = email.lower()
+    last = await _last_reset_persona(store, email)
+    if last:
+        raise AlreadySeeded(email, last)
     upload_session_id = str(uuid.uuid4())
     task_allocation_id = f"upload-{uuid.uuid4()}"  # placeholder; unused downstream
     await store.create({
@@ -813,7 +1157,7 @@ async def _start_upload(
     if settings.simulate:
         background.add_task(
             _bounded_run, store, upload_session_id, task_allocation_id,
-            email, persona, "reseed", services, "upload",
+            email, persona, "seed", services, "upload",
         )
         return upload_session_id, task_allocation_id, None
     try:
@@ -842,6 +1186,14 @@ async def create_upload(
 ) -> UploadResponse:
     try:
         usid, tid, auth_url = await _start_upload(store, background, req.email, req.persona, req.services)
+    except AlreadySeeded as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"account already seeded as {exc.last_persona}; "
+                "use POST /api/environment/reset"
+            ),
+        ) from exc
     except Exception as exc:
         log.exception("failed to start upload")
         raise HTTPException(status_code=502, detail="could not start the upload; please retry") from exc
@@ -893,7 +1245,7 @@ async def oauth_callback(
         row = await store.get(usid)
         tid = (row or {}).get("task_allocation_id") or f"upload-{usid}"
         background.add_task(
-            _bounded_run, store, usid, tid, email, persona, "reseed", services, "upload",
+            _bounded_run, store, usid, tid, email, persona, "seed", services, "upload",
         )
 
     # Return the operator to WHERE THEY STARTED (e.g. the authorize workspace) so the
@@ -927,6 +1279,50 @@ async def get_upload(upload_session_id: str, store: Store = Depends(get_store)) 
 # manifest) through the bounded pool -> safe for ~200-account batches. Separate #
 # from the deccan DWD seeder; no service-account/DWD path here.                 #
 # --------------------------------------------------------------------------- #
+@app.get("/logins", response_class=HTMLResponse)
+async def ui_logins_page() -> HTMLResponse:
+    return HTMLResponse((STATIC_DIR / "logins.html").read_text(encoding="utf-8"))
+
+
+@app.get("/ui/logins")
+async def ui_list_logins(store: Store = Depends(get_store)) -> dict:
+    rows = await store.list_logins()
+    return {
+        "count": len(rows),
+        "logins": [{"email": r.get("email"), "active": r.get("active", True)} for r in rows],
+        "store": f"supabase:{settings.freelancers_table}" if settings.use_supabase else "local",
+    }
+
+
+@app.post("/ui/logins")
+async def ui_upsert_logins(req: LoginUpsertRequest, store: Store = Depends(get_store)) -> dict:
+    rows = req.items()
+    if not rows:
+        raise HTTPException(status_code=422, detail="provide an email")
+    saved: list[str] = []
+    for item in rows:
+        await store.upsert_login(item.email)
+        saved.append(item.email)
+    return {"upserted": len(saved), "emails": saved}
+
+
+@app.post("/ui/logins/csv")
+async def ui_upsert_logins_csv(request: Request, store: Store = Depends(get_store)) -> dict:
+    raw = await request.body()
+    rows, errors = parse_login_csv(raw)
+    saved: list[str] = []
+    for item in rows:
+        await store.upsert_login(item["email"])
+        saved.append(item["email"])
+    return {"upserted": len(saved), "emails": saved, "errors": errors}
+
+
+@app.delete("/ui/logins/{email}")
+async def ui_delete_login(email: str, store: Store = Depends(get_store)) -> dict:
+    await store.delete_login(email)
+    return {"deleted": email.strip().lower()}
+
+
 @app.get("/onboard", response_class=HTMLResponse)
 async def ui_onboard_page() -> HTMLResponse:
     return HTMLResponse((STATIC_DIR / "onboard.html").read_text(encoding="utf-8"))
@@ -967,6 +1363,14 @@ async def ui_upload(
     """Same as /api/environment/upload but same-origin (no Bearer) for the UI."""
     try:
         usid, tid, auth_url = await _start_upload(store, background, req.email, req.persona, req.services)
+    except AlreadySeeded as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"account already seeded as {exc.last_persona}; "
+                "use POST /api/environment/reset"
+            ),
+        ) from exc
     except Exception as exc:
         log.exception("ui upload start failed")
         raise HTTPException(status_code=502, detail="could not start the upload; please retry") from exc
@@ -997,10 +1401,15 @@ async def _seed_upload(
     persona: str,
     services: list[str] | None,
 ) -> tuple[str, str]:
-    """Seed an ALREADY-authorized account: reseed (wipe + engine seed), which
-    writes the manifest. Recorded as mode='upload' in reset_sessions and run
-    through the bounded pool (safe for large batches). Returns (id, task_id)."""
+    """First-time seed of an already-authorized account (engine ``seed``, no wipe).
+
+    Recorded as mode='upload'. If last_reset_persona is already set, callers must
+    use the reset API instead. Returns (id, task_id).
+    """
     email = email.lower()
+    last = await _last_reset_persona(store, email)
+    if last:
+        raise AlreadySeeded(email, last)
     reset_session_id = str(uuid.uuid4())
     task_allocation_id = f"upload-{uuid.uuid4()}"
     await store.create({
@@ -1017,7 +1426,7 @@ async def _seed_upload(
     })
     background.add_task(
         _bounded_run, store, reset_session_id, task_allocation_id,
-        email, persona, "reseed", services, "upload",
+        email, persona, "seed", services, "upload",
     )
     return reset_session_id, task_allocation_id
 
@@ -1039,18 +1448,10 @@ async def ui_authorize(req: UploadRequest, store: Store = Depends(get_store)) ->
 @app.get("/ui/account")
 async def ui_account(email: str, store: Store = Depends(get_store)) -> dict:
     """Authorize status for one account (drives the operator UI's 'authorized ✓')."""
-    try:
-        rows = await store.query(
-            settings.accounts_table,
-            {"select": "email,persona,authorized,last_reset_persona", "email": f"eq.{email.lower()}", "limit": "1"},
-        )
-    except Exception:
-        log.warning("ui_account lookup failed for %s", email, exc_info=True)
-        rows = []
-    r = rows[0] if rows else {}
+    r = await _resolve_reset_account(store, email) or {}
     return {
         "email": email.lower(),
-        "authorized": bool(r.get("authorized")),
+        "authorized": bool(r.get("authorized")) or _seeder_token_exists(email),
         "persona": r.get("persona"),
         "last_reset_persona": r.get("last_reset_persona"),
     }
@@ -1078,6 +1479,14 @@ async def ui_seed(
         raise HTTPException(status_code=400, detail="account not authorized yet")
     try:
         rsid, tid = await _seed_upload(store, background, email, req.persona, req.services)
+    except AlreadySeeded as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"account already seeded as {exc.last_persona}; "
+                "use POST /api/environment/reset"
+            ),
+        ) from exc
     except Exception as exc:
         if "409" in str(exc) or "duplicate" in str(exc).lower() or "conflict" in str(exc).lower():
             raise HTTPException(status_code=409, detail="an operation is already running for this account") from exc
@@ -1186,11 +1595,12 @@ async def ui_qc_read(task_allocation_id: str, store: Store = Depends(get_store))
 async def get_reset(
     reset_session_id: str,
     accept: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
     store: Store = Depends(get_store),
+    email: str | None = None,
+    credential: str | None = None,
 ):
-    # Opened in a browser (Accept: text/html) -> send them to the status UI page.
-    # Programmatic callers (curl/Postman/Cosmo, Accept: */* or application/json)
-    # still get the JSON body, so nothing that polls this endpoint breaks.
+    # Browser link (Accept: text/html) -> status page. JSON is open while login is off.
     if accept and "text/html" in accept.lower():
         return RedirectResponse(url=f"/reset/status/{reset_session_id}", status_code=303)
     record = await store.get(reset_session_id)
@@ -1199,5 +1609,4 @@ async def get_reset(
     st = (record.get("status") or "").lower()
     # Contract states: in_progress | completed | failed (queued/running collapse to in_progress).
     norm = "completed" if st == "completed" else "failed" if st == "failed" else "in_progress"
-    url = f"{settings.public_base_url.rstrip('/')}/api/environment/reset/{reset_session_id}"
-    return ResetApiResponse(url=url, status=norm, error=record.get("error"))
+    return _reset_accepted(reset_session_id, status=norm, error=record.get("error"))

@@ -89,25 +89,27 @@ class GoogleSignInTest(unittest.TestCase):
         return mock.patch.object(appmod, "settings", replaced)
 
     def test_auth_config_reports_client_id(self) -> None:
-        with self._google_on():
+        from unittest import mock
+        from reset_service import app as appmod
+        with mock.patch.object(appmod, "resolve_google_client_id", return_value="cid.apps.googleusercontent.com"):
             cfg = self.client.get("/ui/auth-config").json()
             self.assertEqual(cfg["google_client_id"], "cid.apps.googleusercontent.com")
 
     def test_email_only_rejected_when_google_enabled(self) -> None:
-        with self._google_on():
-            # A plain email must NOT be trusted once Google is enabled (no spoofing).
+        from unittest import mock
+        from reset_service import app as appmod
+        with mock.patch.object(appmod, "resolve_google_client_id", return_value="cid.apps.googleusercontent.com"):
             r = self.client.post("/ui/freelancer/verify", json={"email": "gverified@deccan.ai"})
             self.assertFalse(r.json()["verified"])
 
     def test_valid_credential_verifies_against_allow_list(self) -> None:
         from unittest import mock
         from reset_service import app as appmod
-        with self._google_on(), \
+        with mock.patch.object(appmod, "resolve_google_client_id", return_value="cid.apps.googleusercontent.com"), \
              mock.patch.object(appmod, "_verify_google_credential", return_value="gverified@deccan.ai"):
             r = self.client.post("/ui/freelancer/verify", json={"credential": "fake.jwt.token"})
             self.assertTrue(r.json()["verified"])
-        # An unknown Google account (verified by Google, but not on the list) -> denied.
-        with self._google_on(), \
+        with mock.patch.object(appmod, "resolve_google_client_id", return_value="cid.apps.googleusercontent.com"), \
              mock.patch.object(appmod, "_verify_google_credential", return_value="stranger@gmail.com"):
             r = self.client.post("/ui/freelancer/verify", json={"credential": "fake.jwt.token"})
             self.assertFalse(r.json()["verified"])

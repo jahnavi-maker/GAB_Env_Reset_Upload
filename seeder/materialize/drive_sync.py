@@ -287,6 +287,55 @@ def download_file_bytes(drive, file_id: str, log: Callable[[str], None]) -> byte
     return _retry(pull, log)
 
 
+def upload_bytes(
+    drive,
+    parent_id: str,
+    name: str,
+    raw: bytes,
+    mime: str,
+    log: Callable[[str], None],
+) -> str:
+    """Create one Drive file and return its id. Media uploads are not batched."""
+    safe_name = str(name)[:200]
+    if not raw:
+        created = _retry(
+            lambda: drive.files()
+            .create(
+                body={"name": safe_name, "parents": [parent_id]},
+                fields="id",
+            )
+            .execute(),
+            log,
+        )
+        return str(created["id"])
+    media = MediaIoBaseUpload(
+        io.BytesIO(raw),
+        mimetype=mime or "application/octet-stream",
+        resumable=len(raw) > 5 * 1024 * 1024,
+    )
+    created = _retry(
+        lambda: drive.files()
+        .create(
+            body={"name": safe_name, "parents": [parent_id]},
+            media_body=media,
+            fields="id",
+        )
+        .execute(),
+        log,
+    )
+    return str(created["id"])
+
+
+def ensure_child_folder(
+    drive,
+    name: str,
+    parent_id: str,
+    log: Callable[[str], None],
+    cache: dict[str, str] | None = None,
+) -> str:
+    return _ensure_folder(drive, name, parent_id, cache if cache is not None else {}, log)
+
+
 def trash_file(drive, file_id: str, log: Callable[[str], None]) -> None:
     if not file_id:
         return

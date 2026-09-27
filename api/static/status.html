@@ -51,10 +51,45 @@
   @keyframes spin { to { transform:rotate(360deg); } }
   .foot { font-size:13px; color:var(--muted); }
   .err-detail { color:var(--err); font-size:12px; margin-top:8px; }
+  input[type=email], input[type=password] { width:100%; padding:13px 14px; font-size:16px; border:1px solid var(--line);
+    border-radius:12px; background:var(--bg); color:var(--ink); margin-top:4px; }
+  input[type=email]:focus, input[type=password]:focus { outline:2px solid var(--brand); outline-offset:1px; }
+  .or { text-align:center; color:var(--muted); font-size:12px; margin:14px 0 8px; }
+  button { appearance:none; border:0; cursor:pointer; width:100%; margin-top:6px;
+    background:var(--brand); color:#fff; font-size:16px; font-weight:600; padding:15px; border-radius:12px; }
+  button:hover { opacity:.92; }
+  .hidden { display:none; }
 </style>
 </head>
 <body>
   <div class="card">
+    <div id="loginView" class="hidden">
+      <div class="pad">
+        <h1>Sign in with Google</h1>
+        <p class="subtle" id="loginSub">Enter your Google email and password. Google will confirm the password. Only freelancers can open this reset link.</p>
+      </div>
+      <div class="divider"></div>
+      <div class="pad">
+        <form id="googleLoginForm">
+          <div class="field">
+            <div class="label">Google email</div>
+            <input id="loginEmail" type="email" autocomplete="username" placeholder="you@gmail.com" required />
+          </div>
+          <div class="field">
+            <div class="label">Google password</div>
+            <input id="loginPassword" type="password" autocomplete="current-password" placeholder="••••••••" required />
+          </div>
+          <button id="loginBtn" type="submit">Sign in with Google</button>
+        </form>
+        <div id="googleBox" class="hidden">
+          <div class="or">or</div>
+          <div id="gsiButton"></div>
+        </div>
+        <div class="err-detail" id="loginErr"></div>
+      </div>
+    </div>
+
+    <div id="progressView">
     <div class="pad">
       <h1>Restore progress</h1>
       <p class="subtle">Updates automatically while the worker runs.</p>
@@ -98,15 +133,16 @@
       <div class="foot" id="pFoot">Waiting for the central reset worker.</div>
       <div class="err-detail" id="pErr"></div>
     </div>
+    </div>
   </div>
 
 <script>
   // session id = last path segment: /reset/status/<id>
   const ID = location.pathname.split("/").filter(Boolean).pop();
+  const hash = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+  const query = new URLSearchParams(location.search);
   const STEPS = ["Authenticate","Inspect changes","Restore Drive","Restore Gmail","Restore Calendar","Verify baseline","Complete"];
   const $ = id => document.getElementById(id);
-
-  $("sid").textContent = ID || "—"; if(ID) $("sid").classList.remove("empty");
 
   function setVal(el, text){ if(text){ el.textContent=text; el.classList.remove("empty"); } else { el.textContent="—"; el.classList.add("empty"); } }
 
@@ -165,9 +201,21 @@
     else { $("pFoot").textContent = "Waiting for the central reset worker."; }
   }
 
+  let loginEmail = null;
+  let loginCredential = null;
+
   async function poll(){
     try {
-      const r = await fetch("/ui/reset/" + encodeURIComponent(ID), {cache:"no-store"});
+      const qs = new URLSearchParams();
+      if (loginEmail) qs.set("email", loginEmail);
+      if (loginCredential) qs.set("credential", loginCredential);
+      const r = await fetch("/ui/reset/" + encodeURIComponent(ID) + "?" + qs.toString(), {cache:"no-store"});
+      if (r.status === 401 || r.status === 403){
+        $("progressView").classList.add("hidden");
+        $("loginView").classList.remove("hidden");
+        $("loginErr").textContent = "This account is not on the freelancers list.";
+        return;
+      }
       if (r.status === 404){ $("pFoot").textContent = "Unknown reset session id."; $("pPill").className="pill failed"; $("pPill").textContent="Not found"; return; }
       const d = await r.json();
       setVal($("email"), d.email);
@@ -179,7 +227,65 @@
     } catch(e){ /* transient; keep polling */ }
     setTimeout(poll, 2000);
   }
-  poll();
+
+  function showProgress(){
+    $("loginView").classList.add("hidden");
+    $("progressView").classList.remove("hidden");
+    $("sid").textContent = ID || "—"; if(ID) $("sid").classList.remove("empty");
+    poll();
+  }
+  async function postLogin(body){
+    $("loginErr").textContent = "";
+    try {
+      const r = await fetch("/ui/account/login", {
+        method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (r.ok && d.verified){
+        loginEmail = d.email;
+        loginCredential = body.credential || null;
+        showProgress();
+        return true;
+      }
+      $("loginErr").textContent = d.detail || "This Google account is not on the freelancers list.";
+    } catch(e){ $("loginErr").textContent = "Couldn't verify right now — please try again."; }
+    return false;
+  }
+  function startGooglePasswordLogin(){
+    const email = ($("loginEmail").value || "").trim().toLowerCase();
+    const password = $("loginPassword").value || "";
+    if (!email || email.indexOf("@") < 0){ $("loginErr").textContent = "Enter your Google email."; return; }
+    if (!password){ $("loginErr").textContent = "Enter your Google password."; return; }
+    $("loginPassword").value = "";
+    const next = location.pathname + location.search;
+    location.href = "/ui/google/start?next=" + encodeURIComponent(next) + "&hint=" + encodeURIComponent(email);
+  }
+  if ($("googleLoginForm")){
+    $("googleLoginForm").addEventListener("submit", (e)=>{ e.preventDefault(); startGooglePasswordLogin(); });
+  }
+  window.__onGoogleCredential = function(resp){ postLogin({ credential: resp.credential }); };
+  function setupGoogle(clientId){
+    $("googleBox").classList.remove("hidden");
+    const s = document.createElement("script");
+    s.src = "https://accounts.google.com/gsi/client"; s.async = true; s.defer = true;
+    s.onload = function(){
+      try {
+        google.accounts.id.initialize({ client_id: clientId, callback: window.__onGoogleCredential, auto_select: false });
+        google.accounts.id.renderButton($("gsiButton"), { theme:"outline", size:"large", width:320, text:"signin_with" });
+      } catch(e){ /* password form still works */ }
+    };
+    document.head.appendChild(s);
+  }
+  function loginErrorMessage(code){
+    if (code === "not_allowed") return "This Google account is not on the freelancers list.";
+    if (code === "not_configured") return "Google sign-in is not configured on this server.";
+    if (code === "google") return "Google sign-in did not complete. Try again.";
+    return "";
+  }
+  (function initGate(){
+    // Sign-in is off for now — show reset progress immediately.
+    showProgress();
+  })();
 </script>
 </body>
 </html>

@@ -265,6 +265,76 @@ def _run_reseed(cfg_path: Path, persona: str, svc: str | None, email: str):
     return proc, None
 
 
+def _persona_dir(persona: str) -> str:
+    """Match a request persona to a folder under GAB_PERSONA_ROOT."""
+    import sys
+
+    seeder = str(Path(settings.seeder_dir).expanduser().resolve())
+    if seeder not in sys.path:
+        sys.path.insert(0, seeder)
+    from materialize.csv_ingest import normalize_persona_key  # type: ignore
+    from materialize.runstate import persona_folders  # type: ignore
+
+    want = normalize_persona_key(persona)
+    for folder in persona_folders():
+        if normalize_persona_key(folder) == want:
+            return folder
+    return persona
+
+
+def _run_seeder_reset(email: str, persona: str, mode: str, services: str | None) -> ResetResult:
+    """Run the seeder provision pipeline (same as the :8765 Push button)."""
+    import sys
+
+    seeder = str(Path(settings.seeder_dir).expanduser().resolve())
+    if seeder not in sys.path:
+        sys.path.insert(0, seeder)
+    try:
+        from materialize.authbackend import get_backend  # type: ignore
+        from materialize.provision.route import apply_mode  # type: ignore
+        from materialize.runstate import ENV_ROOT, persona_file  # type: ignore
+        from materialize.runner import run_populate  # type: ignore
+    except Exception as exc:
+        return ResetResult(False, f"seeder pipeline unavailable: {exc}", mode)
+
+    folder = _persona_dir(persona)
+    picked = {s.strip() for s in (services or "drive,gmail,calendar").split(",") if s.strip()}
+    flags = apply_mode(mode if mode in ("seed", "delta", "reseed") else "delta")
+    try:
+        creds = get_backend().credentials_for(email)
+    except Exception as exc:
+        return ResetResult(False, f"no saved Google token for {email}: {exc}", mode)
+
+    github = ENV_ROOT / folder / "services" / "github"
+    github_dir = github if github.is_dir() else None
+    log.info("seeder reset start email=%s persona=%s mode=%s github=%s", email, folder, mode, github_dir)
+    try:
+        result = run_populate(
+            creds,
+            calendar_json=Path(p) if (p := persona_file(folder, "calendar")) else None,
+            gmail_json=Path(p) if (p := persona_file(folder, "gmail")) else None,
+            drive_json=Path(p) if (p := persona_file(folder, "filesystem")) else None,
+            github_dir=github_dir,
+            persona=folder,
+            do_calendar="calendar" in picked,
+            do_gmail="gmail" in picked,
+            do_drive="drive" in picked,
+            do_github=False,
+            do_github_zip=bool(github_dir),
+            wipe=bool(flags.get("wipe")),
+            log=lambda m: log.info("%s", m),
+            target_email=email,
+            mode=str(flags.get("mode") or mode),
+        )
+    except Exception as exc:
+        log.exception("seeder reset failed for %s", email)
+        return ResetResult(False, f"{type(exc).__name__}: {exc}", mode)
+    status = (result.get("accounts") or {}).get(email, {}).get("status")
+    if status in (None, "ok", "partial"):
+        return ResetResult(True, f"reset completed via seeder ({mode})", mode, returncode=0, raw=result)
+    return ResetResult(False, f"seeder reset {status}: {result}", mode, returncode=1, raw=result)
+
+
 def run_reset(
     email: str,
     persona: str,
@@ -283,7 +353,9 @@ def run_reset(
         return ResetResult(True, "simulated reset", mode, returncode=0)
 
     if not settings.gab_config:
-        return ResetResult(False, "GAB_CONFIG is not set; cannot run reset", mode)
+        # Local seeder path: reuse the same pipeline as the :8765 UI when the
+        # engine zip/config has not been set up yet.
+        return _run_seeder_reset(email, persona, mode, svc)
 
     # Build the per-request config up front. A missing/malformed engine config (or a
     # persona absent from it) must return a clean message, not leak a raw traceback.

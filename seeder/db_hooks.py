@@ -159,6 +159,32 @@ def on_authorize(email: str, persona: str, *, verified_email: str | None = None,
         log.info("gab_accounts recorded %s (persona=%s, authorized=%s)", email, persona, bool(token_json))
 
 
+def last_reset_persona(email: str) -> str | None:
+    """Read gab_accounts.last_reset_persona from Supabase. None if unknown/unset."""
+    _load_env()
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+    table = os.environ.get("SUPABASE_ACCOUNTS_TABLE", "gab_accounts")
+    code, text = _supabase(
+        "GET",
+        table,
+        params=f"select=last_reset_persona&email=eq.{email}&limit=1",
+    )
+    if not code or code >= 300:
+        if code:
+            log.warning("last_reset_persona lookup failed for %s: %s %s", email, code, (text or "")[:200])
+        return None
+    try:
+        rows = json.loads(text or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not rows or not isinstance(rows, list):
+        return None
+    value = str((rows[0] or {}).get("last_reset_persona") or "").strip()
+    return value or None
+
+
 def on_push_success(email: str, persona: str) -> None:
     """After a push/seed completes: log an 'upload' row in reset_sessions."""
     _load_env()

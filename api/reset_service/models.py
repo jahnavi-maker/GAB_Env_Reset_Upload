@@ -112,11 +112,13 @@ class ResetApiResponse(BaseModel):
 
     ``url`` is the status endpoint for this reset: open it in a browser for the
     live status page, or GET it from code for this same JSON. ``error`` is null
-    unless the reset ended in failure.
+    unless the reset ended in failure. ``reset_session_id`` is the same id in
+    the URL path so callers do not have to parse it.
     """
     url: str
     status: str  # in_progress | completed | failed
     error: Optional[str] = None
+    reset_session_id: str
 
 
 class ResetResponse(BaseModel):
@@ -179,3 +181,75 @@ class FreelancerVerifyResponse(BaseModel):
     verified: bool
     name: Optional[str] = None
     email: Optional[str] = None
+
+
+class AccountItem(BaseModel):
+    email: str
+    persona: str = Field(..., min_length=1)
+    password: Optional[str] = Field(default=None, repr=False)
+
+    @field_validator("email")
+    @classmethod
+    def _norm_email(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if "@" not in v or "." not in v.split("@")[-1]:
+            raise ValueError("email must be a valid address")
+        return v
+
+
+class AccountUpsertRequest(BaseModel):
+    """Register one account or a list. Does not seed Google — only gab_accounts."""
+    email: Optional[str] = None
+    persona: Optional[str] = None
+    password: Optional[str] = Field(default=None, repr=False)
+    accounts: Optional[list[AccountItem]] = None
+
+    def items(self) -> list[AccountItem]:
+        rows: list[AccountItem] = list(self.accounts or [])
+        if self.email and self.persona:
+            rows.append(AccountItem(email=self.email, persona=self.persona, password=self.password))
+        return rows
+
+
+class AccountLoginRequest(BaseModel):
+    """Reset-page login: Google ID token, or email when Google sign-in is off."""
+    credential: Optional[str] = None
+    email: Optional[str] = None
+    reset_email: Optional[str] = Field(
+        default=None,
+        description="gab_accounts email to reset (the environment). Login email is only the gate.",
+    )
+
+
+class AccountLoginResponse(BaseModel):
+    verified: bool
+    email: Optional[str] = None
+    persona: Optional[str] = None
+    last_reset_persona: Optional[str] = None
+    detail: Optional[str] = None
+
+
+class LoginItem(BaseModel):
+    email: str
+    name: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def _norm_email(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if "@" not in v:
+            raise ValueError("email must contain @")
+        return v
+
+
+class LoginUpsertRequest(BaseModel):
+    """Who may sign in on /reset. gab_logins on Supabase when configured."""
+    email: Optional[str] = None
+    name: Optional[str] = None
+    logins: Optional[list[LoginItem]] = None
+
+    def items(self) -> list[LoginItem]:
+        rows: list[LoginItem] = list(self.logins or [])
+        if self.email:
+            rows.append(LoginItem(email=self.email, name=self.name))
+        return rows

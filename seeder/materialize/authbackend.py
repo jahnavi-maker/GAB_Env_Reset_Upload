@@ -187,13 +187,11 @@ class ConsumerOAuthBackend:
             raise AuthError(
                 'JSON must contain a top-level "web" object (Google Web OAuth client).'
             )
-        needed = [f"{BASE_URL}/oauth/callback", "http://localhost:8765/oauth/callback"]
-        uris = data["web"].get("redirect_uris") or []
-        missing = [u for u in needed if u not in uris]
-        secure_write(CREDENTIALS_PATH, text)
-        status = credentials_status()
-        status["missing_redirects"] = missing
-        return status
+        from materialize.auth import ensure_local_redirects
+
+        data = ensure_local_redirects(data)
+        secure_write(CREDENTIALS_PATH, json.dumps(data, indent=2) + "\n")
+        return credentials_status()
 
     def status(self, email: str) -> AuthState:
         creds, err = load_creds_result(email)
@@ -273,14 +271,15 @@ class ConsumerOAuthBackend:
             "backend": self.name,
         }
 
-    def begin(self, run_id: str, email: str) -> dict | None:
+    def begin(self, run_id: str, email: str, redirect_uri: str | None = None) -> dict | None:
         status = credentials_status()
         if not status.get("present") or status.get("kind") != "web":
             raise AuthError(
                 "Upload a Web OAuth client JSON first. Redirect URI must be "
                 f"{BASE_URL}/oauth/callback"
             )
-        flow = make_flow(f"{BASE_URL}/oauth/callback")
+        callback = redirect_uri or f"{BASE_URL}/oauth/callback"
+        flow = make_flow(callback)
         state = secrets.token_urlsafe(24)
         url, _ = flow.authorization_url(
             access_type="offline",
@@ -294,6 +293,7 @@ class ConsumerOAuthBackend:
             "email": email,
             "expires": time.time() + 10 * 60,
             "code_verifier": flow.code_verifier,
+            "redirect_uri": callback,
         }
         self._pending[state] = pending
         self._write_pending(state, pending)
@@ -342,7 +342,7 @@ class ConsumerOAuthBackend:
         qs = urlencode({"run": run_id, "account": expected})
         if error or not code:
             return {"path": f"/?{qs}&auth=error"}
-        flow = make_flow(f"{BASE_URL}/oauth/callback")
+        flow = make_flow(pending.get("redirect_uri") or f"{BASE_URL}/oauth/callback")
         flow.code_verifier = pending.get("code_verifier")
         try:
             flow.fetch_token(code=code)

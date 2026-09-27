@@ -128,15 +128,60 @@ def cached_verified_email(account_email: str) -> str | None:
     return got
 
 
+LOCAL_CALLBACKS = (
+    "http://127.0.0.1:8765/oauth/callback",
+    "http://localhost:8765/oauth/callback",
+)
+LOCAL_ORIGINS = ("http://127.0.0.1:8765", "http://localhost:8765")
+
+
+def required_redirects() -> list[str]:
+    """Local loopback callbacks. 127.0.0.1 and localhost both count."""
+    return [f"{BASE_URL}/oauth/callback"]
+
+
+def _norm_uri(value: str) -> str:
+    return (value or "").strip().rstrip("/")
+
+
+def has_local_callback(uris: list[str] | None) -> bool:
+    have = {_norm_uri(u) for u in (uris or [])}
+    want = {_norm_uri(u) for u in LOCAL_CALLBACKS}
+    want.add(_norm_uri(f"{BASE_URL}/oauth/callback"))
+    return bool(have & want)
+
+
+def ensure_local_redirects(data: dict[str, Any]) -> dict[str, Any]:
+    """Google's download often lists only one of 127.0.0.1 / localhost. Keep both."""
+    web = data.setdefault("web", {})
+    if not isinstance(web, dict):
+        return data
+    uris = [str(u) for u in (web.get("redirect_uris") or []) if u]
+    origins = [str(o) for o in (web.get("javascript_origins") or []) if o]
+    for uri in LOCAL_CALLBACKS:
+        if uri not in uris:
+            uris.append(uri)
+    for origin in LOCAL_ORIGINS:
+        if origin not in origins:
+            origins.append(origin)
+    web["redirect_uris"] = uris
+    web["javascript_origins"] = origins
+    return data
+
+
 def credentials_status() -> dict[str, Any]:
-    needed = [f"{BASE_URL}/oauth/callback", "http://localhost:8765/oauth/callback"]
+    needed = required_redirects()
     if not CREDENTIALS_PATH.exists():
         return {"present": False, "kind": None, "missing_redirects": needed}
     data = json.loads(CREDENTIALS_PATH.read_text())
     info = data.get("web") or data.get("installed") or {}
     kind = "web" if "web" in data else ("installed" if "installed" in data else "unknown")
     uris = info.get("redirect_uris") or []
-    missing = [u for u in needed if u not in uris] if kind == "web" else needed
+    missing: list[str] = []
+    if kind != "web":
+        missing = needed
+    elif not has_local_callback(uris):
+        missing = needed
     return {
         "present": True,
         "kind": kind,

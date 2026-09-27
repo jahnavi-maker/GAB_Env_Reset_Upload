@@ -126,7 +126,7 @@ def build_auth_url(email: str, persona: str, *, kind: str = "authorize",
 
     ``kind`` tells the callback what to do after consent:
       - "authorize": just persist the account to gab_accounts (operator UI step 1).
-      - "seed": authorize AND kick off the wipe+seed (the one-shot API /upload).
+      - "seed": authorize AND kick off first-time engine seed (POST /api/environment/upload).
     """
     auth = _auth()
     flow = auth.make_flow(settings.upload_redirect_uri)
