@@ -96,10 +96,10 @@
     </div>
 
     <!-- lookup view -->
-    <div id="lookupView">
+    <div id="lookupView" class="hidden">
       <div class="pad">
         <h1>Environment Reset</h1>
-        <p class="subtle">You are signed in. Enter the gab_accounts email to reset.</p>
+        <p class="subtle" id="lookupSub">You are signed in. Enter the gab_accounts email to reset.</p>
       </div>
       <div class="divider"></div>
       <div class="pad">
@@ -107,7 +107,18 @@
           <div class="label">Signed in as</div>
           <div class="value empty" id="loginAs">—</div>
         </div>
-        <div class="field">
+        <!-- token mode (Cosmo reset link): task + account are resolved from the signed
+             link and shown read-only; the freelancer never types the account -->
+        <div class="field hidden" id="taskRow">
+          <div class="label">Task</div>
+          <div class="value empty" id="taskId">—</div>
+        </div>
+        <div class="field hidden" id="acctRow">
+          <div class="label">Account</div>
+          <div class="value empty" id="acctVal">—</div>
+        </div>
+        <!-- operator mode (no token): type which gab_accounts email to reset -->
+        <div class="field" id="resetEmailRow">
           <div class="label">Account to reset</div>
           <input id="resetEmail" type="email" autocomplete="email" placeholder="seeded-account@gmail.com" />
         </div>
@@ -282,6 +293,26 @@
   }
 
   async function startReset(){
+    // Option-2 token flow: the account is resolved server-side from the signed token,
+    // and the reset runs under the pre-generated id bound into it.
+    if (ctx.token){
+      $("resetBtn").disabled = true;
+      showProgress();
+      renderProgress("queued", null);
+      try {
+        const r = await fetch("/ui/task/reset", {
+          method:"POST", headers:{ "Content-Type":"application/json" },
+          body: JSON.stringify({ token: ctx.token, task_allocation_id: ctx.task_allocation_id, email: ctx.email }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
+        RESET_ID = d.reset_session_id;
+        renderProgress(d.status || "in_progress", d.error);
+        poll(RESET_ID);
+      } catch(e){ renderProgress("failed", "Could not start reset: " + e.message); }
+      return;
+    }
+    // Operator flow: freelancer typed which gab_accounts email to reset.
     const target = (($("resetEmail") && $("resetEmail").value) || ctx.resetEmail || "").trim().toLowerCase();
     if (!target || target.indexOf("@") < 0){
       $("lookupErr").textContent = "Enter the gab_accounts email to reset.";
@@ -328,10 +359,45 @@
     setTimeout(()=>{ b.textContent = t; }, 1500);
   });
 
+  // Token mode (Cosmo reset link): resolve the bound account + persona server-side
+  // from the signed token. The freelancer never sees or types another account.
+  async function loadTask(){
+    try {
+      const r = await fetch("/ui/task", {
+        method:"POST", headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ token: ctx.token, task_allocation_id: ctx.task_allocation_id, email: ctx.email }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
+      ctx.task_allocation_id = d.task_allocation_id || ctx.task_allocation_id;
+      ctx.email = d.email || ctx.email;
+      ctx.resetEmail = ctx.email;
+      ctx.persona = d.persona || null;
+      setVal($("taskId"), ctx.task_allocation_id);
+      setVal($("acctVal"), ctx.email);
+      setVal($("persona"), ctx.persona);
+      $("resetBtn").disabled = !ctx.email;
+      if (!ctx.email) $("lookupErr").textContent = "Could not find your account for this task.";
+    } catch(e){ $("lookupErr").textContent = e.message; }
+  }
+
   function showTask(){
     $("loginView").classList.add("hidden");
     $("lookupView").classList.remove("hidden");
-    showRegisteredAccount();
+    if (ctx.token){
+      // Option-2: account bound in the signed link — read-only, no typing.
+      $("resetEmailRow").classList.add("hidden");
+      $("taskRow").classList.remove("hidden");
+      $("acctRow").classList.remove("hidden");
+      $("lookupSub").textContent = "You are signed in. Reset the account assigned to this task.";
+      loadTask();
+    } else {
+      // Operator flow: pick any gab_accounts email.
+      $("resetEmailRow").classList.remove("hidden");
+      $("taskRow").classList.add("hidden");
+      $("acctRow").classList.add("hidden");
+      showRegisteredAccount();
+    }
   }
   async function postLogin(body){
     $("loginErr").textContent = "";
@@ -383,8 +449,25 @@
     return "";
   }
   (function initGate(){
-    // Sign-in is off for now — open the reset form directly.
-    showTask();
+    // Gate ON: the freelancer must authenticate with Google (and be on the allow-list)
+    // before the reset form is shown.
+    const loginErr = query.get("login_error");
+    if (loginErr){ $("loginErr").textContent = loginErrorMessage(loginErr) || "Sign-in failed."; }
+    // Returning from the server-side Google redirect with a verified credential.
+    const cred = hash.get("credential");
+    if (cred){ postLogin({ credential: cred }); return; }
+    $("loginView").classList.remove("hidden");
+    // In token mode (a Cosmo reset link) the redirect form would drop the #t= token,
+    // so require the popup Google button (no navigation) and hide the redirect form.
+    if (ctx.token){
+      if ($("googleLoginForm")) $("googleLoginForm").classList.add("hidden");
+      const orEl = document.querySelector("#googleBox .or"); if (orEl) orEl.style.display = "none";
+      $("loginSub").textContent = "Sign in with your Google account to continue.";
+    }
+    fetch("/ui/auth-config").then(r=>r.json()).then(cfg=>{
+      if (cfg && cfg.google_client_id){ setupGoogle(cfg.google_client_id); }
+      else if (ctx.token){ $("loginErr").textContent = "Google sign-in is not configured on this server."; }
+    }).catch(()=>{ if (ctx.token) $("loginErr").textContent = "Could not load Google sign-in."; });
   })();
 </script>
 </body>
