@@ -242,8 +242,11 @@
     try {
       const r=await fetch("/ui/authorize",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:row.email,persona:row.persona,return_to:"/onboard"})});
       const d=await r.json(); if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
-      row.authUrl=d.auth_url; window.open(d.auth_url,"_blank"); renderRows();
-      pollAuth(i, 0);
+      row.authUrl=d.auth_url; renderRows();  // persist the table (sessionStorage) before we navigate
+      // Authorize in the SAME tab so Google returns to /onboard?authorized=ok with the
+      // loaded accounts intact (restored from sessionStorage) and this account marked
+      // authorized — instead of opening a new tab that lands on an empty onboard page.
+      window.location.href = d.auth_url;
     } catch(err){ row.status="failed"; row.error=err.message; renderRows(); }
   }
   async function pollAuth(i, n){
