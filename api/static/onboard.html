@@ -158,6 +158,9 @@
       const arr = JSON.parse(raw);
       if (!Array.isArray(arr) || !arr.length) return false;
       rows.length = 0; arr.forEach(r => rows.push(r));
+      // A persisted "authorizing" is stale after a reload — drop the spinner; refreshAuth
+      // below promotes it back to "authorized" if the server still confirms it.
+      rows.forEach(r => { if (r.status === "authorizing") r.status = r.authorized ? "authorized" : "idle"; });
       $("tableCard").style.display = "block";
       renderRows();
       rows.forEach((row,i)=> {
@@ -355,7 +358,15 @@
   async function refreshAuth(i){
     const row=rows[i]; if(!row.valid) return;
     try { const r=await fetch("/ui/account?email="+encodeURIComponent(row.email)); const d=await r.json();
-      if (d.authorized && !row.authorized){ row.authorized=true; if(row.status==="idle"||row.status==="authorizing") row.status="authorized"; renderRows(); } }
+      if (d.authorized){
+        let changed=false;
+        if(!row.authorized){ row.authorized=true; changed=true; }
+        // Reconcile a stale "awaiting consent" even when we already knew the account was
+        // authorized (e.g. Re-authorize on an already-authorized account) so the row
+        // never sticks on the spinner.
+        if(row.status==="idle"||row.status==="authorizing"){ row.status="authorized"; changed=true; }
+        if(changed) renderRows();
+      } }
     catch(e){}
   }
   // Per-account authorize: open Google consent in a NEW tab, then poll until the server
