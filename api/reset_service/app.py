@@ -30,7 +30,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPExcepti
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from . import __version__, engine, google_login, upload
+from . import __version__, activity_log, engine, google_login, upload
 from .accounts import (
     CSV_FORMAT,
     LOGIN_CSV_FORMAT,
@@ -66,6 +66,12 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("reset_service")
+
+# Cut the noise: every Supabase call was logging a full httpx line, and uvicorn logged
+# every status poll. Keep those at WARNING so the log shows real activity (uploads,
+# resets, logins, errors) — the readable stuff lives in reset_service.* + activity_log.
+for _noisy in ("httpx", "httpcore", "uvicorn.access"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 def _now() -> str:
@@ -116,9 +122,12 @@ async def lifespan(app: FastAPI):
     # Reap sessions left non-terminal by a crash/restart/DB-blip so no account stays
     # blocked (runs immediately on startup, then on an interval).
     reaper_task = asyncio.create_task(_reaper_loop(store))
+    # Rolling activity summary (uploads/resets/errors + users) every few minutes.
+    summary_task = asyncio.create_task(_activity_summary_loop())
     yield
     retention_task.cancel()
     reaper_task.cancel()
+    summary_task.cancel()
     store = getattr(app.state, "store", None)
     if store is not None:
         await store.aclose()
@@ -354,6 +363,58 @@ async def _reaper_loop(store: Store) -> None:
         await asyncio.sleep(settings.reaper_interval_s)
 
 
+async def _activity_summary_loop() -> None:
+    """Write a rolling activity summary (uploads/resets/errors + logged-in users)
+    every ACTIVITY_SUMMARY_S seconds (default 300 = 5 min). Cancelled at shutdown."""
+    try:
+        interval = max(30, int(os.environ.get("ACTIVITY_SUMMARY_S", "300")))
+    except ValueError:
+        interval = 300
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            activity_log.write_summary()
+        except Exception:  # noqa: BLE001 - a logging hiccup must not kill the loop
+            log.warning("activity summary write failed", exc_info=True)
+
+
+def _clarify_error(raw: str | None) -> str:
+    """Turn a raw engine/exception string into one clear sentence for the reset status
+    and the logs. Falls back to a trimmed version of the original."""
+    if not raw:
+        return "reset failed"
+    s = str(raw)
+    low = s.lower()
+    if "quota" in low:
+        return "Google API quota reached for this account — retry after it resets (usually within 24 hours)."
+    if "invalid_grant" in low or "re-authorize" in low or "refresherror" in low or "no valid oauth token" in low:
+        return "This account's Google sign-in expired or is missing — re-authorize it on /onboard, then reset again."
+    if "not been uploaded" in low or "not provisioned" in low or "no persona on file" in low:
+        return "This account has not been uploaded/authorized yet — do the first upload on /onboard first."
+    if "not present in the environment archive" in low or "unknown persona" in low:
+        return s if "valid personas" in low else "That persona doesn't exist in the environment archive — check the persona name."
+    if "timed out" in low or "timeout" in low:
+        return "The reset took too long or the network stalled — please try again."
+    if "signed reset link" in low or "invalid or expired reset link" in low:
+        return "This reset link is invalid or expired — generate a new one."
+    return s.strip()[:300]
+
+
+def _service_status(services: list[str] | str | None, ok: bool) -> dict:
+    """Best-effort per-service outcome for the log row. Marks each requested service
+    ok/failed by the overall result; services not requested show '—'."""
+    if isinstance(services, str):
+        req = {p.strip().lower() for p in services.split(",") if p.strip()}
+    elif services:
+        req = {str(p).strip().lower() for p in services}
+    else:
+        req = {"drive", "gmail", "calendar"}  # platform default forces all three
+    state = "ok" if ok else "failed"
+    out = {svc: (state if svc in req else "—") for svc in ("gmail", "calendar", "drive")}
+    out["github"] = state if "github" in req else "—"
+    return out
+
+
 async def _run_and_record(
     store: Store,
     reset_session_id: str,
@@ -363,6 +424,7 @@ async def _run_and_record(
     mode: str,
     services: list[str] | None = None,
     row_mode: str | None = None,
+    triggered_by: str | None = None,
 ) -> None:
     """Run the reset (serially, in a thread) and persist status + write a QC log.
 
@@ -387,7 +449,7 @@ async def _run_and_record(
                 "status": "completed" if ok else "failed",
                 "completed_at": _now(),
                 "mode": row_mode or result.mode,
-                "error": None if ok else result.detail,
+                "error": None if ok else _clarify_error(result.detail),
             },
         )
         if ok:
@@ -405,7 +467,7 @@ async def _run_and_record(
         detail = f"{type(exc).__name__}: {exc}"
         log.exception("reset %s crashed", reset_session_id)
         await _safe_update(
-            store, reset_session_id, {"status": "failed", "completed_at": _now(), "error": detail}
+            store, reset_session_id, {"status": "failed", "completed_at": _now(), "error": _clarify_error(detail)}
         )
     finally:
         # Surface skips/omits so QC can treat them as tickets. The engine reports
@@ -427,11 +489,24 @@ async def _run_and_record(
             "skips": len(warnings) if isinstance(warnings, list) else 0,
             "error": None if ok else detail,
         })
+        # Short, tagged, per-account activity log (the readable "logs table").
+        try:
+            activity_log.record(
+                email,
+                "upload" if (row_mode == "upload") else "reset",
+                "completed" if ok else "failed",
+                mode=row_mode or mode,
+                triggered_by=triggered_by,
+                services=_service_status(services, ok),
+                error=None if ok else _clarify_error(detail),
+            )
+        except Exception:  # noqa: BLE001 - logging must never break the task
+            log.warning("activity log write failed for %s", email, exc_info=True)
 
 
-async def _bounded_run(store, reset_session_id, task_allocation_id, email, persona, mode, services, row_mode=None):
+async def _bounded_run(store, reset_session_id, task_allocation_id, email, persona, mode, services, row_mode=None, triggered_by=None):
     async with _sem_for(mode):
-        await _run_and_record(store, reset_session_id, task_allocation_id, email, persona, mode, services, row_mode)
+        await _run_and_record(store, reset_session_id, task_allocation_id, email, persona, mode, services, row_mode, triggered_by)
 
 
 class ActiveResetConflict(Exception):
@@ -447,6 +522,7 @@ async def _launch_reset(
     mode: str | None = None,
     services: list[str] | None = None,
     reset_session_id: str | None = None,
+    triggered_by: str | None = None,
 ) -> tuple[str, str]:
     """Create a queued session, dispatch to the bounded pool. Returns (id, op_mode).
 
@@ -498,7 +574,8 @@ async def _launch_reset(
             raise ActiveResetConflict(email) from exc
         raise
     background.add_task(
-        _bounded_run, store, reset_session_id, task_allocation_id, email, persona, op_mode, services
+        _bounded_run, store, reset_session_id, task_allocation_id, email, persona, op_mode, services,
+        None, triggered_by,
     )
     return reset_session_id, op_mode
 
@@ -748,7 +825,7 @@ async def ui_task_reset(
     try:
         reset_session_id, op_mode = await _launch_reset(
             store, background, email, persona, task_allocation_id, None, None,
-            reset_session_id=tok_sid,
+            reset_session_id=tok_sid, triggered_by="freelancer",
         )
     except ActiveResetConflict:
         raise HTTPException(status_code=409, detail="a reset is already running for this account")
@@ -768,7 +845,8 @@ async def create_reset(
 ) -> ResetApiResponse:
     try:
         reset_session_id, op_mode = await _launch_reset(
-            store, background, req.email, req.persona, req.task_allocation_id, req.mode, req.services
+            store, background, req.email, req.persona, req.task_allocation_id, req.mode, req.services,
+            triggered_by="cosmo",
         )
     except HTTPException:
         raise
@@ -1043,6 +1121,7 @@ async def verify_freelancer(
         raise HTTPException(status_code=503, detail="verification temporarily unavailable")
     # active defaults to True when the column/field is absent.
     if row and row.get("active", True):
+        activity_log.login(email, "freelancer")
         return FreelancerVerifyResponse(verified=True, name=row.get("name"), email=email)
     return FreelancerVerifyResponse(verified=False, email=email)
 
@@ -1074,6 +1153,7 @@ async def ui_account_login(
             email=email,
             detail="this Google account is not allowed to sign in",
         )
+    activity_log.login(email, "operator")
     return AccountLoginResponse(verified=True, email=email)
 
 
@@ -1109,6 +1189,7 @@ async def ui_account_reset(
             f"account-reset-{uuid.uuid4()}",
             None,
             None,
+            triggered_by=(req.email or "operator"),
         )
     except ActiveResetConflict:
         raise HTTPException(status_code=409, detail="a reset is already running for this account")
@@ -1157,7 +1238,7 @@ async def _start_upload(
     if settings.simulate:
         background.add_task(
             _bounded_run, store, upload_session_id, task_allocation_id,
-            email, persona, "seed", services, "upload",
+            email, persona, "seed", services, "upload", "operator",
         )
         return upload_session_id, task_allocation_id, None
     try:
@@ -1245,7 +1326,7 @@ async def oauth_callback(
         row = await store.get(usid)
         tid = (row or {}).get("task_allocation_id") or f"upload-{usid}"
         background.add_task(
-            _bounded_run, store, usid, tid, email, persona, "seed", services, "upload",
+            _bounded_run, store, usid, tid, email, persona, "seed", services, "upload", "operator",
         )
 
     # Return the operator to WHERE THEY STARTED (e.g. the authorize workspace) so the
@@ -1426,7 +1507,7 @@ async def _seed_upload(
     })
     background.add_task(
         _bounded_run, store, reset_session_id, task_allocation_id,
-        email, persona, "seed", services, "upload",
+        email, persona, "seed", services, "upload", "operator",
     )
     return reset_session_id, task_allocation_id
 
@@ -1512,7 +1593,8 @@ async def ui_recover(
     email = req.email.lower()
     try:
         reset_session_id, op_mode = await _launch_reset(
-            store, background, email, req.persona, f"recover-{uuid.uuid4()}", "delta", req.services
+            store, background, email, req.persona, f"recover-{uuid.uuid4()}", "delta", req.services,
+            triggered_by="operator",
         )
     except ActiveResetConflict:
         raise HTTPException(status_code=409, detail="an operation is already running for this account")

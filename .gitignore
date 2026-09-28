@@ -39,3 +39,6 @@ PKJA_UltraEvals_Environments_/
 **/drive-cache/
 GAB_Env_Reset_Upload/
 _old_clone_backup_*/
+
+# runtime activity logs (activity.csv, by-email/, errors.log, summary.log)
+logs/
