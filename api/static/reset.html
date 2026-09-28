@@ -390,6 +390,7 @@
       $("taskRow").classList.remove("hidden");
       $("acctRow").classList.remove("hidden");
       $("lookupSub").textContent = "You are signed in. Reset the account assigned to this task.";
+      setVal($("loginAs"), ctx.loginEmail);   // show WHO signed in (token flow too)
       loadTask();
     } else {
       // Operator flow: pick any gab_accounts email.

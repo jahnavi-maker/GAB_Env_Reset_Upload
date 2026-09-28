@@ -215,9 +215,12 @@ class SupabaseStore(Store):
         }
         if password is not None:
             rec["password"] = password
-        # Same-persona reset is delta only when last_reset_persona is set.
-        if not (existing or {}).get("last_reset_persona"):
-            rec["last_reset_persona"] = (existing or {}).get("last_reset_persona") or persona
+        # NB: do NOT set last_reset_persona here. It means "the persona this account was
+        # last SUCCESSFULLY seeded/reset to" and is set only after a real seed/reset
+        # (on_seed_complete / _run_and_record). Setting it at registration made a
+        # never-seeded account look "already seeded" (blocking first upload) and wrongly
+        # routed its first reset to delta. Omitting it from the upsert also preserves any
+        # existing value (merge-duplicates only updates provided columns).
         r = await self._client.post(
             self._acct_url(),
             json=rec,
@@ -462,8 +465,8 @@ class LocalJsonStore(Store):
             rec["persona"] = persona
             if password is not None:
                 rec["password"] = password
-            if not rec.get("last_reset_persona"):
-                rec["last_reset_persona"] = persona
+            # last_reset_persona is set only after a real seed/reset (not at
+            # registration) — otherwise a never-seeded account looks "already seeded".
             rec["updated_at"] = _now_iso()
             data[key] = rec
             self._write_acct(data)
