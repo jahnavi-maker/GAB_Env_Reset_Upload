@@ -103,6 +103,11 @@
       </div>
       <div class="divider"></div>
       <div class="pad">
+        <!-- the verified freelancer (the Google account we checked against the login list) -->
+        <div class="field hidden" id="signedInRow">
+          <div class="label">Signed in as</div>
+          <div class="value" id="signedInAs">—</div>
+        </div>
         <!-- token mode (Cosmo reset link): task + account are resolved from the signed
              link and shown read-only; the freelancer never types the account -->
         <div class="field hidden" id="taskRow">
@@ -379,6 +384,13 @@
   function showTask(){
     $("loginView").classList.add("hidden");
     $("lookupView").classList.remove("hidden");
+    // Show the verified freelancer email we authenticated.
+    if (ctx.loginEmail){
+      $("signedInAs").textContent = ctx.loginEmail;
+      $("signedInRow").classList.remove("hidden");
+    } else {
+      $("signedInRow").classList.add("hidden");
+    }
     if (ctx.token){
       // Option-2: account bound in the signed link — read-only, no typing.
       $("resetEmailRow").classList.add("hidden");
