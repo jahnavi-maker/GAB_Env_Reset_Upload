@@ -253,9 +253,10 @@ class UploadProgressTest(unittest.TestCase):
         from reset_service import engine
 
         sid = "44444444-4444-4444-4444-444444444444"
-        self._make_session(sid, "prog-counts@gmail.com")
-        base = engine._run_dir(sid)
-        self.assertIsNotNone(base)
+        email = "prog-counts@gmail.com"
+        self._make_session(sid, email)
+        # The job store is persistent per account+persona, not per session id.
+        base = engine._acct_dir(email, engine._persona_dir("Student"))
         base.mkdir(parents=True, exist_ok=True)
         con = sqlite3.connect(base / "provision.sqlite")
         con.execute("CREATE TABLE jobs (service TEXT, status TEXT)")

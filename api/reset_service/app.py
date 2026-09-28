@@ -1497,7 +1497,11 @@ async def ui_upload_progress(upload_session_id: str, store: Store = Depends(get_
     record = await store.get(upload_session_id)
     if not record:
         raise HTTPException(status_code=404, detail="unknown upload_session_id")
-    progress = await asyncio.to_thread(engine.read_progress, upload_session_id)
+    email = record.get("email") or ""
+    persona = record.get("persona") or record.get("last_reset_persona") or ""
+    progress = None
+    if email and persona:
+        progress = await asyncio.to_thread(engine.read_progress, email, persona)
     return {
         "upload_session_id": upload_session_id,
         "status": record.get("status") or "unknown",
@@ -1514,8 +1518,10 @@ async def ui_upload_verify(upload_session_id: str, store: Store = Depends(get_st
     record = await store.get(upload_session_id)
     if not record:
         raise HTTPException(status_code=404, detail="unknown upload_session_id")
+    email = record.get("email") or ""
+    persona = record.get("persona") or record.get("last_reset_persona") or ""
     try:
-        verify = await asyncio.to_thread(engine.reverify, upload_session_id)
+        verify = await asyncio.to_thread(engine.reverify, email, persona)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"verification failed: {exc}") from exc
     if verify is None:

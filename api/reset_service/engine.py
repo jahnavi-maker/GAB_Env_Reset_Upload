@@ -16,6 +16,8 @@ import copy
 import os
 import json
 import logging
+import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -40,6 +42,26 @@ def _ensure_seeder_path() -> None:
     seeder = str(Path(settings.seeder_dir).expanduser().resolve())
     if seeder not in sys.path:
         sys.path.insert(0, seeder)
+
+
+def _acct_run_id(email: str, folder: str) -> str:
+    """Stable run id (and SQLite job-store name) for one account+persona.
+
+    The provision pipeline is built for surgical delta: ``store.upsert`` keeps rows
+    that are already SUCCESS and the workers only run non-SUCCESS jobs. That only
+    works if the job store PERSISTS across runs — so we key it by account+persona
+    instead of by reset_session_id. A delta ("Retry skipped") then re-runs only the
+    items that previously failed/were-missing; seed/reseed start it fresh.
+    """
+    safe = re.sub(r"[^a-z0-9]+", "_", f"{email}__{folder}".lower()).strip("_")
+    return f"acct-{safe}"
+
+
+def _acct_dir(email: str, folder: str) -> Path:
+    """RUNS/<acct-id> — the persistent job store + verify sidecar for this account."""
+    from materialize.runstate import RUNS  # type: ignore
+
+    return RUNS / _acct_run_id(email, folder)
 
 
 @dataclass
@@ -352,7 +374,17 @@ def _run_seeder_reset(
 
     github = ENV_ROOT / folder / "services" / "github"
     github_dir = github if github.is_dir() else None
-    log.info("seeder reset start email=%s persona=%s mode=%s github=%s", email, folder, mode, github_dir)
+
+    # Persistent per-account job store => surgical delta. A delta ("Retry skipped")
+    # reuses it, so the workers re-run ONLY the items that previously failed or were
+    # missing (SUCCESS rows are kept and skipped). seed/reseed wipe the store first so
+    # every item is (re)planned and re-pushed.
+    acct_id = _acct_run_id(email, folder)
+    if mode != "delta":
+        shutil.rmtree(_acct_dir(email, folder), ignore_errors=True)
+
+    log.info("seeder reset start email=%s persona=%s mode=%s github=%s store=%s",
+             email, folder, mode, github_dir, acct_id)
     try:
         result = run_populate(
             creds,
@@ -370,18 +402,18 @@ def _run_seeder_reset(
             log=lambda m: log.info("%s", m),
             target_email=email,
             mode=str(flags.get("mode") or mode),
-            run_id=progress_id or None,   # isolates + names this run's SQLite job store
-            job_id=progress_id or None,   # publishes live progress under this id
+            run_id=acct_id,            # persistent per-account SQLite job store
+            job_id=progress_id or None,   # (progress is read straight from the store)
         )
     except Exception as exc:
         log.exception("seeder reset failed for %s", email)
         return ResetResult(False, f"{type(exc).__name__}: {exc}", mode)
     status = (result.get("accounts") or {}).get(email, {}).get("status")
     # Best-effort post-seed verification: count what actually landed per service and
-    # persist it durably (RUNS/<id>/verify.json) so the Upload page can show real
+    # persist it durably (in the account's store dir) so the Upload page can show real
     # verified counts that survive a refresh. Never let verification fail the reset.
     try:
-        verify = _verify_seed(email, folder, picked, result, creds, progress_id)
+        verify = _verify_seed(email, folder, picked, result, creds)
         if verify:
             result["verify"] = verify
     except Exception as exc:  # noqa: BLE001
@@ -391,19 +423,11 @@ def _run_seeder_reset(
     return ResetResult(False, f"seeder reset {status}: {result}", mode, returncode=1, raw=result)
 
 
-def _run_dir(progress_id: str | None) -> Path | None:
-    """RUNS/<id> — where this run's SQLite store + verify sidecar live."""
-    if not progress_id:
-        return None
-    from materialize.runstate import RUNS  # type: ignore
-
-    return RUNS / str(progress_id)
-
-
 def _verify_seed(
-    email: str, folder: str, picked: set[str], result: dict, creds, progress_id: str | None,
+    email: str, folder: str, picked: set[str], result: dict, creds,
 ) -> dict | None:
-    """Run the seeder's verifier (real per-service got/expect counts) and persist it."""
+    """Run the seeder's verifier (real per-service got/expect counts) and persist it to
+    the account's store dir so it survives across runs + a page refresh."""
     from materialize.verify import verify_seed  # type: ignore
 
     expect = result.get("expect") or {}
@@ -425,13 +449,12 @@ def _verify_seed(
         "overall": v.get("overall"),
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    d = _run_dir(progress_id)
-    if d is not None:
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "verify.json").write_text(json.dumps(record), encoding="utf-8")
-        except OSError as exc:
-            log.warning("could not persist verify.json for %s: %s", progress_id, exc)
+    d = _acct_dir(email, folder)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "verify.json").write_text(json.dumps(record), encoding="utf-8")
+    except OSError as exc:
+        log.warning("could not persist verify.json for %s: %s", email, exc)
     return record
 
 
@@ -462,13 +485,13 @@ def _svc_progress(sc: dict) -> dict:
     }
 
 
-def read_progress(progress_id: str) -> dict | None:
-    """Live per-service progress for a run: real counts from its SQLite job store plus
-    the last persisted verification. Returns None when nothing is known yet."""
+def read_progress(email: str, persona: str) -> dict | None:
+    """Live per-service progress for an account: real counts from its persistent SQLite
+    job store plus the last persisted verification. Returns None when nothing is known
+    yet. Keyed by account+persona so it reflects cumulative state across runs."""
     _ensure_seeder_path()
-    base = _run_dir(progress_id)
-    if base is None:
-        return None
+    folder = _persona_dir(persona)
+    base = _acct_dir(email, folder)
     services: dict = {}
     sqlite_path = base / "provision.sqlite"
     if sqlite_path.exists():
@@ -505,30 +528,24 @@ def read_progress(progress_id: str) -> dict | None:
     return {"services": services, "github": None, "verify": verify}
 
 
-def reverify(progress_id: str) -> dict | None:
-    """Re-run verification for a finished run from its persisted sidecar, refresh the
-    stored counts, and return them. Returns None if the run isn't verifiable yet."""
+def reverify(email: str, persona: str) -> dict | None:
+    """Re-run verification for an account from its persisted sidecar, refresh the stored
+    counts, and return them. Returns None if the account hasn't been seeded yet."""
     _ensure_seeder_path()
-    base = _run_dir(progress_id)
-    if base is None:
-        return None
-    vpath = base / "verify.json"
+    folder = _persona_dir(persona)
+    vpath = _acct_dir(email, folder) / "verify.json"
     if not vpath.exists():
         return None
     try:
         prev = json.loads(vpath.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    email = prev.get("email")
-    folder = prev.get("persona")
-    if not email or not folder:
-        return None
     from materialize.authbackend import get_backend  # type: ignore
 
     creds = get_backend().credentials_for(email)
     picked = {k for k, val in (prev.get("expect") or {}).items() if val is not None}
     synthetic = {"expect": prev.get("expect") or {}, "folder_id": prev.get("folder_id")}
-    return _verify_seed(email, folder, picked, synthetic, creds, progress_id)
+    return _verify_seed(email, folder, picked, synthetic, creds)
 
 
 def run_reset(
