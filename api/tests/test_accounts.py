@@ -232,10 +232,25 @@ class DecideModeTest(unittest.IsolatedAsyncioTestCase):
 
         class _Store:
             async def get_account(self, email):
-                return {"email": email, "persona": "Backend_software_engineer", "last_reset_persona": None}
+                # delta requires the account to have been SEEDED with that persona
+                return {"email": email, "persona": "Backend_software_engineer",
+                        "last_reset_persona": "Backend_software_engineer"}
 
         mode = await _decide_mode(_Store(), "test02gemini@gmail.com", "backend_software_engineer", None)
         self.assertEqual(mode, "delta")
+
+    async def test_registered_but_never_seeded_is_reseed(self) -> None:
+        # Regression: an account registered/authorized (persona set) but never seeded
+        # (last_reset_persona is null) must reseed, NOT delta — persona is the assigned
+        # target, not proof it was seeded.
+        from reset_service.app import _decide_mode
+
+        class _Store:
+            async def get_account(self, email):
+                return {"email": email, "persona": "Backend_software_engineer", "last_reset_persona": None}
+
+        mode = await _decide_mode(_Store(), "fresh@gmail.com", "backend_software_engineer", None)
+        self.assertEqual(mode, "reseed")
 
     async def test_different_supabase_persona_is_reseed(self) -> None:
         from reset_service.app import _decide_mode
