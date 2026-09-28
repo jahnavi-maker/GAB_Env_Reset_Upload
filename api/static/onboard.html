@@ -365,6 +365,12 @@
         // authorized (e.g. Re-authorize on an already-authorized account) so the row
         // never sticks on the spinner.
         if(row.status==="idle"||row.status==="authorizing"){ row.status="authorized"; changed=true; }
+        // A prior reset/delta that failed ONLY because the token was expired is now stale
+        // once the account is authorized again — clear it back to authorized so the
+        // operator can retry. Other failures (quota, unknown persona…) are left intact.
+        else if(row.status==="failed" && /re-authorize|expired|sign-in|invalid_grant/i.test(row.error||"")){
+          row.status="authorized"; row.error=null; changed=true;
+        }
         if(changed) renderRows();
       } }
     catch(e){}
