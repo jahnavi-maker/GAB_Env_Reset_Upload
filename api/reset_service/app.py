@@ -299,7 +299,10 @@ def _persona_key(value: str) -> str:
 
 
 async def _last_reset_persona(store: Store, email: str) -> str:
-    """Last known persona from Supabase gab_accounts (last_reset_persona, else persona)."""
+    """The persona this account was last SUCCESSFULLY seeded/reset to (gab_accounts
+    .last_reset_persona). NOT `persona` — that is the assigned target, which is set at
+    registration and would make a never-seeded account look already-seeded (blocking
+    first upload) and mis-route its first reset to delta. Empty when never seeded."""
     try:
         rec = await store.get_account(email)
     except Exception:
@@ -307,7 +310,7 @@ async def _last_reset_persona(store: Store, email: str) -> str:
         return ""
     if not rec:
         return ""
-    return str(rec.get("last_reset_persona") or rec.get("persona") or "").strip()
+    return str(rec.get("last_reset_persona") or "").strip()
 
 
 async def _decide_mode(store: Store, email: str, persona: str, explicit: str | None) -> str:
