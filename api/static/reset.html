@@ -72,7 +72,7 @@
     <div id="loginView" class="hidden">
       <div class="pad">
         <h1>Sign in with Google</h1>
-        <p class="subtle" id="loginSub">Enter your Google email and password. Google will confirm the password.</p>
+        <p class="subtle" id="loginSub">Sign in with your Google account to continue.</p>
       </div>
       <div class="divider"></div>
       <div class="pad">
@@ -457,17 +457,16 @@
     const cred = hash.get("credential");
     if (cred){ postLogin({ credential: cred }); return; }
     $("loginView").classList.remove("hidden");
-    // In token mode (a Cosmo reset link) the redirect form would drop the #t= token,
-    // so require the popup Google button (no navigation) and hide the redirect form.
-    if (ctx.token){
-      if ($("googleLoginForm")) $("googleLoginForm").classList.add("hidden");
-      const orEl = document.querySelector("#googleBox .or"); if (orEl) orEl.style.display = "none";
-      $("loginSub").textContent = "Sign in with your Google account to continue.";
-    }
+    // Direct Google sign-in ONLY. We never take a Google password on our own page
+    // (that looks like credential harvesting) — the real Google button opens Google's
+    // account chooser/consent in a popup, which also preserves the #t= reset-link token.
+    if ($("googleLoginForm")) $("googleLoginForm").classList.add("hidden");
+    const orEl = document.querySelector("#googleBox .or"); if (orEl) orEl.style.display = "none";
+    $("loginSub").textContent = "Sign in with your Google account to continue.";
     fetch("/ui/auth-config").then(r=>r.json()).then(cfg=>{
       if (cfg && cfg.google_client_id){ setupGoogle(cfg.google_client_id); }
-      else if (ctx.token){ $("loginErr").textContent = "Google sign-in is not configured on this server."; }
-    }).catch(()=>{ if (ctx.token) $("loginErr").textContent = "Could not load Google sign-in."; });
+      else { $("loginErr").textContent = "Google sign-in is not configured on this server."; }
+    }).catch(()=>{ $("loginErr").textContent = "Could not load Google sign-in — refresh and try again."; });
   })();
 </script>
 </body>
