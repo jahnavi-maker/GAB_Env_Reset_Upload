@@ -209,6 +209,73 @@ class AccountApiTest(unittest.TestCase):
         self.assertEqual(r.status_code, 202)
 
 
+class UploadProgressTest(unittest.TestCase):
+    """Per-service upload progress + verified counts (features #2/#3)."""
+
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+
+    def _make_session(self, sid: str, email: str, status: str = "completed") -> None:
+        import asyncio
+
+        from reset_service.app import get_store
+
+        asyncio.run(get_store().create({
+            "reset_session_id": sid, "task_allocation_id": "prog", "email": email,
+            "persona": "Student", "status": status, "created_at": "2026-01-01T00:00:00+00:00",
+            "started_at": None, "completed_at": None, "mode": "upload", "error": None,
+        }))
+
+    def test_progress_unknown_session_404(self) -> None:
+        r = self.client.get("/ui/upload/nope/progress")
+        self.assertEqual(r.status_code, 404)
+
+    def test_progress_empty_before_any_work(self) -> None:
+        sid = "22222222-2222-2222-2222-222222222222"
+        self._make_session(sid, "prog-empty@gmail.com")
+        r = self.client.get(f"/ui/upload/{sid}/progress")
+        self.assertEqual(r.status_code, 200)
+        d = r.json()
+        self.assertEqual(d["services"], {})
+        self.assertIsNone(d["verify"])
+        # github is never a separately-tracked service (bundled into Drive)
+        self.assertIsNone(d["github"])
+
+    def test_verify_409_before_any_upload(self) -> None:
+        sid = "33333333-3333-3333-3333-333333333333"
+        self._make_session(sid, "prog-noverify@gmail.com")
+        r = self.client.post(f"/ui/upload/{sid}/verify")
+        self.assertEqual(r.status_code, 409)
+
+    def test_progress_reads_real_service_counts_from_job_store(self) -> None:
+        import sqlite3
+
+        from reset_service import engine
+
+        sid = "44444444-4444-4444-4444-444444444444"
+        self._make_session(sid, "prog-counts@gmail.com")
+        base = engine._run_dir(sid)
+        self.assertIsNotNone(base)
+        base.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(base / "provision.sqlite")
+        con.execute("CREATE TABLE jobs (service TEXT, status TEXT)")
+        # drive: 180 done + 20 in-flight = 200 ; gmail: 200 all done
+        con.executemany("INSERT INTO jobs VALUES (?,?)",
+                        [("drive", "SUCCESS")] * 180 + [("drive", "PROCESSING")] * 20
+                        + [("gmail", "SUCCESS")] * 200)
+        con.commit(); con.close()
+        try:
+            d = self.client.get(f"/ui/upload/{sid}/progress").json()
+            self.assertEqual(d["services"]["drive"]["done"], 180)
+            self.assertEqual(d["services"]["drive"]["total"], 200)
+            self.assertEqual(d["services"]["drive"]["state"], "in_progress")
+            self.assertEqual(d["services"]["gmail"]["done"], 200)
+            self.assertEqual(d["services"]["gmail"]["state"], "completed")
+        finally:
+            import shutil
+            shutil.rmtree(base, ignore_errors=True)
+
+
 class SplitLoginStoreTest(unittest.IsolatedAsyncioTestCase):
     async def test_logins_do_not_write_accounts_file(self) -> None:
         from reset_service.db import LocalJsonStore, SplitLoginStore

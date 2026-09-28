@@ -444,7 +444,9 @@ async def _run_and_record(
     detail = None
     raw = None
     try:
-        result = await asyncio.to_thread(engine.run_reset, email, persona, mode, services)
+        result = await asyncio.to_thread(
+            engine.run_reset, email, persona, mode, services, reset_session_id
+        )
         ok, detail, raw = result.success, result.detail, result.raw
         await _safe_update(
             store,
@@ -1420,13 +1422,11 @@ async def ui_onboard_page() -> HTMLResponse:
     return HTMLResponse((STATIC_DIR / "onboard.html").read_text(encoding="utf-8"))
 
 
-@app.get("/onboard/authorize", response_class=HTMLResponse)
-async def ui_authorize_workspace() -> HTMLResponse:
-    """Dedicated manual-authorization workspace. Shows the account table with each
-    account's password (parsed from the operator's CSV, held only in the browser and
-    never sent to the server) so the operator can copy-paste it into Google's login
-    while authorizing accounts one by one."""
-    return HTMLResponse((STATIC_DIR / "authorize_all.html").read_text(encoding="utf-8"))
+@app.get("/onboard/authorize")
+async def ui_authorize_workspace() -> RedirectResponse:
+    """Legacy path: authorization is now part of the single onboarding page. Keep the
+    URL working (old links / OAuth return_to) by redirecting to /onboard."""
+    return RedirectResponse(url="/onboard", status_code=307)
 
 
 @app.post("/ui/client")
@@ -1484,6 +1484,46 @@ async def ui_upload_status(upload_session_id: str, store: Store = Depends(get_st
         "status": record.get("status") or "unknown",
         "error": record.get("error"),
     }
+
+
+@app.get("/ui/upload/{upload_session_id}/progress")
+async def ui_upload_progress(upload_session_id: str, store: Store = Depends(get_store)) -> dict:
+    """Real per-service upload progress (Gmail/Calendar/Drive counts) + verified counts.
+
+    Counts come straight from this run's SQLite job store and the persisted verifier —
+    never estimated on the client. Survives a page refresh: the job store + verify
+    sidecar live on disk under RUNS/<id>/.
+    """
+    record = await store.get(upload_session_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="unknown upload_session_id")
+    progress = await asyncio.to_thread(engine.read_progress, upload_session_id)
+    return {
+        "upload_session_id": upload_session_id,
+        "status": record.get("status") or "unknown",
+        "error": record.get("error"),
+        "services": (progress or {}).get("services") or {},
+        "github": (progress or {}).get("github"),
+        "verify": (progress or {}).get("verify"),
+    }
+
+
+@app.post("/ui/upload/{upload_session_id}/verify")
+async def ui_upload_verify(upload_session_id: str, store: Store = Depends(get_store)) -> dict:
+    """Re-run verification for a finished upload and persist the refreshed counts."""
+    record = await store.get(upload_session_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="unknown upload_session_id")
+    try:
+        verify = await asyncio.to_thread(engine.reverify, upload_session_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"verification failed: {exc}") from exc
+    if verify is None:
+        raise HTTPException(
+            status_code=409,
+            detail="nothing to verify yet — this account has not completed an upload",
+        )
+    return {"upload_session_id": upload_session_id, "verify": verify}
 
 
 async def _seed_upload(

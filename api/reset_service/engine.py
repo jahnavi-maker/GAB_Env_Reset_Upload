@@ -20,11 +20,26 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import settings
 
 log = logging.getLogger("reset_service.engine")
+
+# The provision pipeline's job statuses (mirrors seeder/materialize/provision/store.py).
+_ST_PENDING, _ST_PROCESSING, _ST_SUCCESS, _ST_RETRY, _ST_FAILED = (
+    "PENDING", "PROCESSING", "SUCCESS", "RETRY", "PERMANENT_FAILURE",
+)
+
+
+def _ensure_seeder_path() -> None:
+    """Put the seeder package on sys.path so ``materialize.*`` imports resolve."""
+    import sys
+
+    seeder = str(Path(settings.seeder_dir).expanduser().resolve())
+    if seeder not in sys.path:
+        sys.path.insert(0, seeder)
 
 
 @dataclass
@@ -309,13 +324,16 @@ def _persona_dir(persona: str) -> str:
     return _match_persona(persona) or persona
 
 
-def _run_seeder_reset(email: str, persona: str, mode: str, services: str | None) -> ResetResult:
-    """Run the seeder provision pipeline (same as the :8765 Push button)."""
-    import sys
+def _run_seeder_reset(
+    email: str, persona: str, mode: str, services: str | None, progress_id: str | None = None,
+) -> ResetResult:
+    """Run the seeder provision pipeline (same as the :8765 Push button).
 
-    seeder = str(Path(settings.seeder_dir).expanduser().resolve())
-    if seeder not in sys.path:
-        sys.path.insert(0, seeder)
+    ``progress_id`` (the reset_session_id) isolates this run's SQLite job store at a
+    known path (RUNS/<id>/provision.sqlite) so per-service progress is queryable while
+    it runs and survives a page refresh, and drives a durable verification sidecar.
+    """
+    _ensure_seeder_path()
     try:
         from materialize.authbackend import get_backend  # type: ignore
         from materialize.provision.route import apply_mode  # type: ignore
@@ -352,14 +370,165 @@ def _run_seeder_reset(email: str, persona: str, mode: str, services: str | None)
             log=lambda m: log.info("%s", m),
             target_email=email,
             mode=str(flags.get("mode") or mode),
+            run_id=progress_id or None,   # isolates + names this run's SQLite job store
+            job_id=progress_id or None,   # publishes live progress under this id
         )
     except Exception as exc:
         log.exception("seeder reset failed for %s", email)
         return ResetResult(False, f"{type(exc).__name__}: {exc}", mode)
     status = (result.get("accounts") or {}).get(email, {}).get("status")
+    # Best-effort post-seed verification: count what actually landed per service and
+    # persist it durably (RUNS/<id>/verify.json) so the Upload page can show real
+    # verified counts that survive a refresh. Never let verification fail the reset.
+    try:
+        verify = _verify_seed(email, folder, picked, result, creds, progress_id)
+        if verify:
+            result["verify"] = verify
+    except Exception as exc:  # noqa: BLE001
+        log.warning("post-seed verify failed for %s: %s", email, exc)
     if status in (None, "ok", "partial"):
         return ResetResult(True, f"reset completed via seeder ({mode})", mode, returncode=0, raw=result)
     return ResetResult(False, f"seeder reset {status}: {result}", mode, returncode=1, raw=result)
+
+
+def _run_dir(progress_id: str | None) -> Path | None:
+    """RUNS/<id> — where this run's SQLite store + verify sidecar live."""
+    if not progress_id:
+        return None
+    from materialize.runstate import RUNS  # type: ignore
+
+    return RUNS / str(progress_id)
+
+
+def _verify_seed(
+    email: str, folder: str, picked: set[str], result: dict, creds, progress_id: str | None,
+) -> dict | None:
+    """Run the seeder's verifier (real per-service got/expect counts) and persist it."""
+    from materialize.verify import verify_seed  # type: ignore
+
+    expect = result.get("expect") or {}
+    v = verify_seed(
+        creds,
+        persona=folder,
+        expect_calendar=expect.get("calendar") if "calendar" in picked else None,
+        expect_gmail=expect.get("gmail") if "gmail" in picked else None,
+        expect_drive=expect.get("drive") if "drive" in picked else None,
+        folder_id=result.get("folder_id"),
+        log=lambda m: log.info("%s", m),
+    )
+    record = {
+        "email": email,
+        "persona": folder,
+        "folder_id": v.get("folder_id") or result.get("folder_id"),
+        "expect": {k: expect.get(k) for k in ("calendar", "gmail", "drive")},
+        "modules": v.get("modules"),
+        "overall": v.get("overall"),
+        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    d = _run_dir(progress_id)
+    if d is not None:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "verify.json").write_text(json.dumps(record), encoding="utf-8")
+        except OSError as exc:
+            log.warning("could not persist verify.json for %s: %s", progress_id, exc)
+    return record
+
+
+def _svc_progress(sc: dict) -> dict:
+    """Turn raw per-service status counts into a display payload + a coarse state."""
+    total = sum(sc.values())
+    done = sc.get(_ST_SUCCESS, 0) + sc.get(_ST_FAILED, 0)
+    failed = sc.get(_ST_FAILED, 0)
+    inflight = sc.get(_ST_PROCESSING, 0) + sc.get(_ST_RETRY, 0)
+    pending = sc.get(_ST_PENDING, 0)
+    if total == 0:
+        state = "pending"
+    elif failed and done >= total:
+        state = "failed"
+    elif done >= total:
+        state = "completed"
+    elif inflight or (done and pending):
+        state = "in_progress"
+    else:
+        state = "pending"
+    return {
+        "total": total,
+        "done": sc.get(_ST_SUCCESS, 0),
+        "failed": failed,
+        "retrying": sc.get(_ST_RETRY, 0),
+        "left": max(0, total - done),
+        "state": state,
+    }
+
+
+def read_progress(progress_id: str) -> dict | None:
+    """Live per-service progress for a run: real counts from its SQLite job store plus
+    the last persisted verification. Returns None when nothing is known yet."""
+    _ensure_seeder_path()
+    base = _run_dir(progress_id)
+    if base is None:
+        return None
+    services: dict = {}
+    sqlite_path = base / "provision.sqlite"
+    if sqlite_path.exists():
+        import sqlite3
+
+        try:
+            con = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+            con.row_factory = sqlite3.Row
+            try:
+                rows = con.execute(
+                    "SELECT service, status, COUNT(*) AS n FROM jobs GROUP BY service, status"
+                ).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            rows = []
+        agg: dict = {}
+        for r in rows:
+            agg.setdefault(r["service"], {})[r["status"]] = int(r["n"])
+        for name in ("gmail", "calendar", "drive"):
+            if name in agg:
+                services[name] = _svc_progress(agg[name])
+    verify = None
+    vpath = base / "verify.json"
+    if vpath.exists():
+        try:
+            verify = json.loads(vpath.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            verify = None
+    if not services and verify is None:
+        return None
+    # Github is bundled into the Drive upload (no separate job service), so we report it
+    # as not-separately-tracked rather than inventing a count.
+    return {"services": services, "github": None, "verify": verify}
+
+
+def reverify(progress_id: str) -> dict | None:
+    """Re-run verification for a finished run from its persisted sidecar, refresh the
+    stored counts, and return them. Returns None if the run isn't verifiable yet."""
+    _ensure_seeder_path()
+    base = _run_dir(progress_id)
+    if base is None:
+        return None
+    vpath = base / "verify.json"
+    if not vpath.exists():
+        return None
+    try:
+        prev = json.loads(vpath.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    email = prev.get("email")
+    folder = prev.get("persona")
+    if not email or not folder:
+        return None
+    from materialize.authbackend import get_backend  # type: ignore
+
+    creds = get_backend().credentials_for(email)
+    picked = {k for k, val in (prev.get("expect") or {}).items() if val is not None}
+    synthetic = {"expect": prev.get("expect") or {}, "folder_id": prev.get("folder_id")}
+    return _verify_seed(email, folder, picked, synthetic, creds, progress_id)
 
 
 def run_reset(
@@ -367,6 +536,7 @@ def run_reset(
     persona: str,
     mode: str | None = None,
     services: list[str] | None = None,
+    progress_id: str | None = None,
 ) -> ResetResult:
     mode = (mode or settings.reset_mode).strip()
     try:
@@ -402,7 +572,7 @@ def run_reset(
     if not settings.gab_config:
         # Local seeder path: reuse the same pipeline as the :8765 UI when the
         # engine zip/config has not been set up yet.
-        return _run_seeder_reset(email, persona, mode, svc)
+        return _run_seeder_reset(email, persona, mode, svc, progress_id)
 
     # Build the per-request config up front. A missing/malformed engine config (or a
     # persona absent from it) must return a clean message, not leak a raw traceback.
