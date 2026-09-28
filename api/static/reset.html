@@ -103,10 +103,6 @@
       </div>
       <div class="divider"></div>
       <div class="pad">
-        <div class="field">
-          <div class="label">Signed in as</div>
-          <div class="value empty" id="loginAs">—</div>
-        </div>
         <!-- token mode (Cosmo reset link): task + account are resolved from the signed
              link and shown read-only; the freelancer never types the account -->
         <div class="field hidden" id="taskRow">
@@ -264,7 +260,6 @@
   }
 
   function showRegisteredAccount(){
-    setVal($("loginAs"), ctx.loginEmail || ctx.email);
     if (ctx.resetEmail && $("resetEmail")) $("resetEmail").value = ctx.resetEmail;
     $("resetBtn").disabled = false;
   }
@@ -390,7 +385,6 @@
       $("taskRow").classList.remove("hidden");
       $("acctRow").classList.remove("hidden");
       $("lookupSub").textContent = "You are signed in. Reset the account assigned to this task.";
-      setVal($("loginAs"), ctx.loginEmail);   // show WHO signed in (token flow too)
       loadTask();
     } else {
       // Operator flow: pick any gab_accounts email.
