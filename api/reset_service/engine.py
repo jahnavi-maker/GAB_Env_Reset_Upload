@@ -265,21 +265,48 @@ def _run_reseed(cfg_path: Path, persona: str, svc: str | None, email: str):
     return proc, None
 
 
-def _persona_dir(persona: str) -> str:
-    """Match a request persona to a folder under GAB_PERSONA_ROOT."""
+def _persona_choices() -> list[str]:
+    """The persona folder names available under GAB_PERSONA_ROOT (empty if the seeder
+    package can't be imported, e.g. in a stripped test env)."""
     import sys
 
     seeder = str(Path(settings.seeder_dir).expanduser().resolve())
     if seeder not in sys.path:
         sys.path.insert(0, seeder)
-    from materialize.csv_ingest import normalize_persona_key  # type: ignore
-    from materialize.runstate import persona_folders  # type: ignore
+    try:
+        from materialize.runstate import persona_folders  # type: ignore
 
+        return list(persona_folders())
+    except Exception:  # noqa: BLE001 - missing seeder must not crash the reset
+        return []
+
+
+def _match_persona(persona: str) -> str | None:
+    """Map a loosely-typed persona name to its exact archive folder.
+
+    Matching is case/space/underscore-insensitive (``"Startup Founder"`` /
+    ``"startup founder"`` / ``"Startup_founder"`` all match the ``Startup_founder``
+    folder). Returns the canonical folder name, or None when nothing matches.
+    """
+    import sys
+
+    seeder = str(Path(settings.seeder_dir).expanduser().resolve())
+    if seeder not in sys.path:
+        sys.path.insert(0, seeder)
+    try:
+        from materialize.csv_ingest import normalize_persona_key  # type: ignore
+    except Exception:  # noqa: BLE001
+        return None
     want = normalize_persona_key(persona)
-    for folder in persona_folders():
+    for folder in _persona_choices():
         if normalize_persona_key(folder) == want:
             return folder
-    return persona
+    return None
+
+
+def _persona_dir(persona: str) -> str:
+    """Match a request persona to a folder under GAB_PERSONA_ROOT (raw name as fallback)."""
+    return _match_persona(persona) or persona
 
 
 def _run_seeder_reset(email: str, persona: str, mode: str, services: str | None) -> ResetResult:
@@ -351,6 +378,26 @@ def run_reset(
         time.sleep(1.0)
         log.info("SIMULATE reset ok email=%s persona=%s mode=%s services=%s", email, persona, mode, svc or "all")
         return ResetResult(True, "simulated reset", mode, returncode=0)
+
+    # Accept loosely-typed persona names (spaces / casing / underscores) by mapping to
+    # the exact archive folder BEFORE either engine runs — so "Startup Founder" seeds
+    # the same as "Startup_founder" instead of failing with "persona not present in the
+    # environment archive". If it truly isn't a known persona, fail with a clear list
+    # rather than a cryptic engine error.
+    canonical = _match_persona(persona)
+    if canonical:
+        if canonical != persona:
+            log.info("persona %r normalized to canonical folder %r", persona, canonical)
+        persona = canonical
+    else:
+        choices = _persona_choices()
+        if choices:
+            return ResetResult(
+                False,
+                f"unknown persona {persona!r}; valid personas: {', '.join(sorted(choices))}",
+                mode,
+            )
+        # Seeder package unavailable to list choices — fall through and let the engine try as-is.
 
     if not settings.gab_config:
         # Local seeder path: reuse the same pipeline as the :8765 UI when the
