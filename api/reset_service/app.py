@@ -387,7 +387,8 @@ def _clarify_error(raw: str | None) -> str:
     low = s.lower()
     if "quota" in low:
         return "Google API quota reached for this account — retry after it resets (usually within 24 hours)."
-    if "invalid_grant" in low or "re-authorize" in low or "refresherror" in low or "no valid oauth token" in low:
+    if ("invalid_grant" in low or "re-authorize" in low or "refresherror" in low
+            or "no valid oauth token" in low or "no saved google token" in low or "google token" in low):
         return "This account's Google sign-in expired or is missing — re-authorize it on /onboard, then reset again."
     if "not been uploaded" in low or "not provisioned" in low or "no persona on file" in low:
         return "This account has not been uploaded/authorized yet — do the first upload on /onboard first."
@@ -495,6 +496,7 @@ async def _run_and_record(
                 email,
                 "upload" if (row_mode == "upload") else "reset",
                 "completed" if ok else "failed",
+                persona=persona,
                 mode=row_mode or mode,
                 triggered_by=triggered_by,
                 services=_service_status(services, ok),
@@ -1034,6 +1036,7 @@ async def upsert_accounts(
     for item in rows:
         rec = await store.upsert_account(item.email, item.persona, item.password)
         saved.append(public_account(rec))
+        activity_log.account_registered(item.email, item.persona, source="api")
     return {"upserted": len(saved), "accounts": saved, "csv_format": CSV_FORMAT}
 
 
@@ -1044,10 +1047,12 @@ async def upsert_accounts_csv(
     """Register accounts from a CSV (email, persona, optional password)."""
     raw = await file.read()
     rows, errors = parse_account_csv(raw)
+    activity_log.csv_load(len(rows), kind="accounts", source="onboard-csv")
     saved: list[dict[str, Any]] = []
     for item in rows:
         rec = await store.upsert_account(item["email"], item["persona"], item.get("password") or None)
         saved.append(public_account(rec))
+        activity_log.account_registered(item["email"], item["persona"], source="csv")
     return {
         "upserted": len(saved),
         "accounts": saved,
@@ -1305,6 +1310,7 @@ async def oauth_callback(
         ctx = upload.complete_callback(code, state, error)
     except upload.UploadError as exc:
         log.warning("oauth callback failed: %s", exc)
+        activity_log.authorize(None, status="failed", error=_clarify_error(str(exc)))
         return RedirectResponse(f"{dest}?authorized=error", status_code=303)
 
     email = ctx["email"]
@@ -1317,8 +1323,10 @@ async def oauth_callback(
     # This is the "authorize" step: the account lands in gab_accounts.
     try:
         upload._db_hooks().on_authorize(email, persona, verified_email=ctx.get("verified_email"))
-    except Exception:
+        activity_log.authorize(email, persona, status="completed")
+    except Exception as exc:
         log.warning("on_authorize failed for %s", email, exc_info=True)
+        activity_log.authorize(email, persona, status="failed", error=_clarify_error(str(exc)))
 
     # Only the one-shot API /upload (kind="seed") also seeds here. The operator UI
     # authorizes first (kind="authorize") and seeds later via the Bulk upload button.
