@@ -314,7 +314,14 @@ async def _last_reset_persona(store: Store, email: str) -> str:
 
 
 async def _decide_mode(store: Store, email: str, persona: str, explicit: str | None) -> str:
-    """Same persona as Supabase gab_accounts -> delta; different or unknown -> reseed."""
+    """Route a reset by comparing the requested persona to what's seeded:
+
+    - same persona    -> ``reconcile`` (delete agent-created content, restore baseline).
+      A benchmark reset MUST clean what the models added, so same-persona is a full
+      baseline reconcile, not a restore-only delta.
+    - different/unknown persona -> ``reseed`` (wipe + seed the new persona).
+    An explicit mode (e.g. Cosmo passing ``delta``) is always honored as-is.
+    """
     if explicit:
         return explicit
     if not settings.reset_auto_route:
@@ -322,7 +329,7 @@ async def _decide_mode(store: Store, email: str, persona: str, explicit: str | N
     last = await _last_reset_persona(store, email)
     if not last:
         return "reseed"
-    return "delta" if _persona_key(last) == _persona_key(persona) else "reseed"
+    return "reconcile" if _persona_key(last) == _persona_key(persona) else "reseed"
 
 
 async def _safe_update(store: Store, reset_session_id: str, fields: dict) -> None:
@@ -1554,7 +1561,9 @@ async def _seed_upload(
     if not last:
         engine_mode, row_mode = "seed", "upload"
     elif _persona_key(last) == _persona_key(persona):
-        engine_mode, row_mode = "delta", "delta"
+        # already seeded with this persona -> full baseline reconcile (remove agent
+        # content + restore missing), not a restore-only delta.
+        engine_mode, row_mode = "reconcile", "reconcile"
     else:
         engine_mode, row_mode = "reseed", "reseed"
     reset_session_id = str(uuid.uuid4())

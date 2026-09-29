@@ -308,12 +308,12 @@ class UploadAutoRouteTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["mode"], "upload")
 
-    def test_same_persona_routes_to_delta(self) -> None:
+    def test_same_persona_routes_to_reconcile(self) -> None:
         email = "route-same@gmail.com"
         self._prep(email, last="Student")
         r = self.client.post("/ui/seed", json={"email": email, "persona": "Student"})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(r.json()["mode"], "delta")
+        self.assertEqual(r.json()["mode"], "reconcile")
 
     def test_different_persona_routes_to_reseed(self) -> None:
         email = "route-diff@gmail.com"
@@ -375,17 +375,17 @@ class SplitLoginStoreTest(unittest.IsolatedAsyncioTestCase):
 
 
 class DecideModeTest(unittest.IsolatedAsyncioTestCase):
-    async def test_same_supabase_persona_is_delta(self) -> None:
+    async def test_same_supabase_persona_is_reconcile(self) -> None:
         from reset_service.app import _decide_mode
 
         class _Store:
             async def get_account(self, email):
-                # delta requires the account to have been SEEDED with that persona
+                # already seeded with this persona -> full baseline reconcile
                 return {"email": email, "persona": "Backend_software_engineer",
                         "last_reset_persona": "Backend_software_engineer"}
 
         mode = await _decide_mode(_Store(), "test02gemini@gmail.com", "backend_software_engineer", None)
-        self.assertEqual(mode, "delta")
+        self.assertEqual(mode, "reconcile")
 
     async def test_registered_but_never_seeded_is_reseed(self) -> None:
         # Regression: an account registered/authorized (persona set) but never seeded
