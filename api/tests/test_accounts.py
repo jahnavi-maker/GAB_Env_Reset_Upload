@@ -82,6 +82,25 @@ class LoginTableTest(unittest.TestCase):
         self.assertTrue(data["reset_session_id"])
         self.assertTrue(data["url"].endswith("/api/environment/reset/" + data["reset_session_id"]))
 
+    def test_account_reset_requires_signin(self) -> None:
+        # No verifiable identity -> 401 (closes the anonymous hole).
+        r = self.client.post("/ui/account/reset", json={"reset_email": "seeded-x@gmail.com"})
+        self.assertEqual(r.status_code, 401)
+
+    def test_account_reset_rejects_non_allowlisted(self) -> None:
+        # A signed-in email that is not an allowed operator/freelancer -> 403,
+        # even for a real seeded account.
+        self.client.post(
+            "/api/accounts",
+            json={"email": "seeded-guard@gmail.com", "persona": "Student"},
+            headers=AUTH,
+        )
+        r = self.client.post(
+            "/ui/account/reset",
+            json={"email": "stranger@x.com", "reset_email": "seeded-guard@gmail.com"},
+        )
+        self.assertEqual(r.status_code, 403)
+
     def test_reset_page_skips_login(self) -> None:
         r = self.client.get("/reset")
         self.assertEqual(r.status_code, 200)

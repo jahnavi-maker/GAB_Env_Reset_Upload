@@ -1180,11 +1180,41 @@ async def ui_account_reset(
     background: BackgroundTasks,
     store: Store = Depends(get_store),
 ) -> ResetApiResponse:
-    """Same POST /api/environment/reset session. Login gate is off for now.
+    """The no-token operator "reset any account" form.
 
-    The account that gets reset must be in gab_accounts. Response is the Cosmo
-    contract: url, status, error, reset_session_id.
+    Option C authorization: this manual form is OPERATOR-ONLY — freelancers must use
+    their task's bound reset link (POST /ui/task/reset), which pins the account in a
+    signed token. Here the requester's identity is RE-VERIFIED from the Google credential
+    (never trusted from req.email), and must be an operator: in OPERATOR_EMAILS when set,
+    otherwise (unconfigured) at least a verified, allowed freelancer sign-in. This closes
+    the hole where anyone could reset any account by posting an email.
+
+    The account that gets reset must be in gab_accounts. Response is the Cosmo contract.
     """
+    requester = _login_email_from_request(req)
+    if not requester:
+        raise HTTPException(status_code=401, detail="sign in with Google to reset")
+    ops = settings.operator_emails
+    if ops:
+        if requester not in ops:
+            raise HTTPException(
+                status_code=403,
+                detail="manual reset is operator-only — use the reset link from your task instead",
+            )
+    else:
+        # No operator list configured: fall back to requiring a verified, allowed sign-in
+        # (closes the anonymous hole; set OPERATOR_EMAILS to restrict to operators only).
+        row = await store.get_freelancer(requester)
+        if not row or not row.get("active", True):
+            raise HTTPException(
+                status_code=403,
+                detail="this account is not allowed to run a manual reset",
+            )
+        log.warning(
+            "OPERATOR_EMAILS not set; /ui/account/reset allowed verified freelancer %s "
+            "(set OPERATOR_EMAILS to restrict the manual form to operators)", requester,
+        )
+
     reset_email = (req.reset_email or req.email or "").strip().lower()
     if not reset_email or "@" not in reset_email:
         raise HTTPException(status_code=400, detail="provide the gab_accounts email to reset")
@@ -1206,7 +1236,7 @@ async def ui_account_reset(
             f"account-reset-{uuid.uuid4()}",
             None,
             None,
-            triggered_by=(req.email or "operator"),
+            triggered_by=requester,
         )
     except ActiveResetConflict:
         raise HTTPException(status_code=409, detail="a reset is already running for this account")
