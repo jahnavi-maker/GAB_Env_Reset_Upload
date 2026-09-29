@@ -645,28 +645,30 @@ def _live_drive_ids(drive) -> set:
     return {fid for fid, _ in _owned_drive_files(drive)}
 
 
-def _drive_orphans_by_folder(drive, seed_root_id: str | None) -> set:
-    """Owned Drive ids NOT under the seed root folder = agent-created.
+def _drive_orphans(drive, baseline_ids: set) -> set:
+    """Owned Drive ids that are agent-created = not recorded in the manifest AND not a
+    descendant of any manifest-recorded folder.
 
-    Folder-based identity (robust vs per-file manifest gaps for big github repos with
-    duplicate filenames): the seed puts everything under GAB_UltraEvals__<persona>, so
-    we keep that whole subtree and delete only what the account owns outside it. With no
-    seed folder yet (never seeded), everything owned is treated as an orphan."""
+    The manifest records ~all seeded files+folders (incl. the github repo folders, which
+    live OUTSIDE GAB_UltraEvals). A few big-repo files can miss their own id (duplicate
+    names → synthetic_id collisions), so we ALSO keep anything whose parent chain reaches
+    a recorded folder. That closes those gaps without the fragility of a single seed-root.
+    Never seeded (empty baseline) → everything owned is an orphan (→ full nuke + reseed)."""
     files = _owned_drive_files(drive)
-    if not seed_root_id:
+    if not baseline_ids:
         return {fid for fid, _ in files}
     parent = {fid: p for fid, p in files}
 
-    def under_root(fid: str) -> bool:
+    def kept(fid: str) -> bool:
         cur, seen = fid, set()
         while cur and cur not in seen:
-            if cur == seed_root_id:
+            if cur in baseline_ids:
                 return True
             seen.add(cur)
             cur = parent.get(cur)
         return False
 
-    return {fid for fid, _ in files if fid != seed_root_id and not under_root(fid)}
+    return {fid for fid, _ in files if not kept(fid)}
 
 
 def reconcile_preview(email: str, persona: str) -> dict:
@@ -679,7 +681,6 @@ def reconcile_preview(email: str, persona: str) -> dict:
     _ensure_seeder_path()
     from materialize.auth import build_service  # type: ignore
     from materialize.authbackend import get_backend  # type: ignore
-    from materialize.drive_sync import find_seed_folder  # type: ignore
     from materialize.gmail_sync import GAB_LABEL  # type: ignore
 
     folder = _persona_dir(persona)
@@ -699,12 +700,10 @@ def reconcile_preview(email: str, persona: str) -> dict:
             "orphan_ids": sorted(g_orphans)[:50],
         }
     }
-    # Drive: identity by the seed root FOLDER (robust vs per-file manifest gaps on big
-    # github repos). Keep the seed subtree; orphans = owned files outside it.
+    # Drive: manifest ids + anything under a manifest-recorded folder (ancestry).
     drive = build_service("drive", "v3", creds)
-    seed_root_id = find_seed_folder(drive, folder, lambda m: log.info("%s", m))
     d_all = _live_drive_ids(drive)
-    d_orphans = _drive_orphans_by_folder(drive, seed_root_id)
+    d_orphans = _drive_orphans(drive, base["drive"])
     services["drive"] = {
         "baseline": len(d_all) - len(d_orphans),
         "live": len(d_all),
@@ -720,8 +719,8 @@ def reconcile_preview(email: str, persona: str) -> dict:
         "orphans": len(c_orphans),
         "orphan_ids": c_orphans[:50],
     }
-    # "never seeded" = no seed drive folder (a seeded account always has one).
-    manifest_empty = seed_root_id is None
+    # "never seeded" = no manifest for the manifest-backed surfaces (calendar/drive).
+    manifest_empty = not (base["calendar"] or base["drive"])
     log.info("reconcile dry-run %s persona=%s manifest_empty=%s :: %s", email, folder,
              manifest_empty, {s: services[s]["orphans"] for s in services})
     return {"email": email, "persona": folder, "manifest_empty": manifest_empty,
@@ -790,7 +789,6 @@ def _run_reconcile(
     _ensure_seeder_path()
     from materialize.auth import build_service  # type: ignore
     from materialize.authbackend import get_backend  # type: ignore
-    from materialize.drive_sync import find_seed_folder  # type: ignore
     from materialize.gmail_sync import GAB_LABEL  # type: ignore
 
     folder = _persona_dir(persona)
@@ -803,22 +801,20 @@ def _run_reconcile(
     cal = build_service("calendar", "v3", creds)
     drive = build_service("drive", "v3", creds)
 
-    # "Never seeded" = no seed drive folder (a seeded account always has GAB_UltraEvals__X).
-    # In that case the diff below treats ALL current content as orphans → full nuke, then a
-    # forced reseed rebuilds the baseline + manifest + Gmail labels + seed folder, so future
-    # reconciles are surgical. We never fall back to a marker-only reseed (it would leave
-    # unlabeled agent content behind).
-    seed_root_id = find_seed_folder(drive, folder, lambda m: log.info("%s", m))
-    manifest_empty = seed_root_id is None
+    # "Never seeded" = no manifest for the manifest-backed surfaces (calendar/drive). Then
+    # the diff treats ALL current content as orphans → full nuke, and a forced reseed
+    # rebuilds baseline + manifest + Gmail labels. We never fall back to a marker-only
+    # reseed (it would leave unlabeled agent content behind).
+    manifest_empty = not (base["calendar"] or base["drive"])
     if manifest_empty:
-        log.info("reconcile: no seed folder for %s -> full nuke + seed", email)
+        log.info("reconcile: no manifest for %s -> full nuke + seed", email)
 
-    # Gmail: delete unlabeled (baseline is GAB-SEED-labeled). Calendar: delete events not in
-    # the manifest. Drive: delete owned files outside the seed folder (folder identity is
-    # robust vs per-file manifest gaps on big github repos).
+    # Gmail: delete unlabeled (baseline = GAB-SEED-labeled). Calendar: delete events not in
+    # the manifest. Drive: delete owned files not recorded in the manifest AND not under a
+    # manifest-recorded folder (robust vs per-file gaps on big github repos).
     g_orphans = _gmail_ids_by_query(gmail, f"-label:{GAB_LABEL}")
     c_orphans = _live_calendar_ids(cal) - base["calendar"]
-    d_orphans = _drive_orphans_by_folder(drive, seed_root_id)
+    d_orphans = _drive_orphans(drive, base["drive"])
     deleted = {
         "gmail": _delete_gmail(gmail, g_orphans),
         "calendar": _delete_calendar_events(cal, c_orphans),
