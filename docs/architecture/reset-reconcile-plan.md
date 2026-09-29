@@ -93,5 +93,8 @@ orphans=0 on all three surfaces (gmail 170/170, calendar 170/170, drive 231/231)
 - [x] First-run empty-manifest → reseed rule
 - [x] Gmail baseline by GAB-SEED label (message ids unstable)
 - [x] Live validation on user410 — orphans=0 on gmail/calendar/drive
-- [ ] Wire `reconcile` into the reset path (POST /api/environment/reset / rater reset link)
-- [ ] Decide: Upload "same persona" → reconcile vs plain delta
+- [x] Wire `reconcile` into the reset path — `_decide_mode` same-persona → reconcile, so
+      POST /api/environment/reset, the rater reset link, and account-reset all reconcile.
+      Validated: an API reset ran `mode=reconcile by=cosmo`. "Retry skipped" (explicit
+      delta) stays restore-only.
+- [x] Upload "same persona" → reconcile (onboard Upload / Bulk upload)
