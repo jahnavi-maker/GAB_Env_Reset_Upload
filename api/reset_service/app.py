@@ -1174,73 +1174,15 @@ async def ui_account_login(
     return AccountLoginResponse(verified=True, email=email)
 
 
-@app.post("/ui/account/reset", response_model=ResetApiResponse, status_code=status.HTTP_202_ACCEPTED)
-async def ui_account_reset(
-    req: AccountLoginRequest,
-    background: BackgroundTasks,
-    store: Store = Depends(get_store),
-) -> ResetApiResponse:
-    """The no-token operator "reset any account" form.
-
-    Option C authorization: this manual form is OPERATOR-ONLY — freelancers must use
-    their task's bound reset link (POST /ui/task/reset), which pins the account in a
-    signed token. Here the requester's identity is RE-VERIFIED from the Google credential
-    (never trusted from req.email), and must be an operator: in OPERATOR_EMAILS when set,
-    otherwise (unconfigured) at least a verified, allowed freelancer sign-in. This closes
-    the hole where anyone could reset any account by posting an email.
-
-    The account that gets reset must be in gab_accounts. Response is the Cosmo contract.
-    """
-    requester = _login_email_from_request(req)
-    if not requester:
-        raise HTTPException(status_code=401, detail="sign in with Google to reset")
-    ops = settings.operator_emails
-    if ops:
-        if requester not in ops:
-            raise HTTPException(
-                status_code=403,
-                detail="manual reset is operator-only — use the reset link from your task instead",
-            )
-    else:
-        # No operator list configured: fall back to requiring a verified, allowed sign-in
-        # (closes the anonymous hole; set OPERATOR_EMAILS to restrict to operators only).
-        row = await store.get_freelancer(requester)
-        if not row or not row.get("active", True):
-            raise HTTPException(
-                status_code=403,
-                detail="this account is not allowed to run a manual reset",
-            )
-        log.warning(
-            "OPERATOR_EMAILS not set; /ui/account/reset allowed verified freelancer %s "
-            "(set OPERATOR_EMAILS to restrict the manual form to operators)", requester,
-        )
-
-    reset_email = (req.reset_email or req.email or "").strip().lower()
-    if not reset_email or "@" not in reset_email:
-        raise HTTPException(status_code=400, detail="provide the gab_accounts email to reset")
-    rec = await _resolve_reset_account(store, reset_email)
-    if not rec:
-        raise HTTPException(
-            status_code=404,
-            detail="that email has not been uploaded yet — it is not a seeded environment",
-        )
-    persona = rec.get("last_reset_persona") or rec.get("persona")
-    if not persona:
-        raise HTTPException(status_code=400, detail="account has no persona on file")
-    try:
-        reset_session_id, _op = await _launch_reset(
-            store,
-            background,
-            reset_email,
-            persona,
-            f"account-reset-{uuid.uuid4()}",
-            None,
-            None,
-            triggered_by=requester,
-        )
-    except ActiveResetConflict:
-        raise HTTPException(status_code=409, detail="a reset is already running for this account")
-    return _reset_accepted(reset_session_id)
+@app.post("/ui/account/reset")
+async def ui_account_reset(req: AccountLoginRequest) -> dict:
+    """DISABLED. The no-token "reset any account" form has been removed — a reset can
+    only run from a task's reset link (POST /ui/task/reset), which binds the account in a
+    signed token issued by Cosmo. Always refuses; performs no reset."""
+    raise HTTPException(
+        status_code=403,
+        detail="Manual reset is disabled. Open the reset link from your task to reset it.",
+    )
 
 
 # --------------------------------------------------------------------------- #

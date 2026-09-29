@@ -58,46 +58,18 @@ class LoginTableTest(unittest.TestCase):
         self.assertTrue(hit.json()["verified"])
         self.assertIsNone(hit.json().get("persona"))
 
-    def test_reset_needs_login_and_gab_account(self) -> None:
-        self.client.post("/api/logins", json={"email": "op-reset@x.com"}, headers=AUTH)
-        denied = self.client.post(
-            "/ui/account/reset",
-            json={"email": "op-reset@x.com", "reset_email": "seeded-reset@gmail.com"},
-        )
-        self.assertEqual(denied.status_code, 404)
-
+    def test_manual_account_reset_is_disabled(self) -> None:
+        # The no-token "reset any account" form is removed: only a task reset link
+        # (POST /ui/task/reset, bound token from Cosmo) can run a reset. Always 403,
+        # even for a real seeded account and no reset is started.
         self.client.post(
             "/api/accounts",
             json={"email": "seeded-reset@gmail.com", "persona": "Student"},
             headers=AUTH,
         )
-        ok = self.client.post(
-            "/ui/account/reset",
-            json={"email": "op-reset@x.com", "reset_email": "seeded-reset@gmail.com"},
-        )
-        self.assertEqual(ok.status_code, 202)
-        data = ok.json()
-        self.assertEqual(data["status"], "in_progress")
-        self.assertIsNone(data["error"])
-        self.assertTrue(data["reset_session_id"])
-        self.assertTrue(data["url"].endswith("/api/environment/reset/" + data["reset_session_id"]))
-
-    def test_account_reset_requires_signin(self) -> None:
-        # No verifiable identity -> 401 (closes the anonymous hole).
-        r = self.client.post("/ui/account/reset", json={"reset_email": "seeded-x@gmail.com"})
-        self.assertEqual(r.status_code, 401)
-
-    def test_account_reset_rejects_non_allowlisted(self) -> None:
-        # A signed-in email that is not an allowed operator/freelancer -> 403,
-        # even for a real seeded account.
-        self.client.post(
-            "/api/accounts",
-            json={"email": "seeded-guard@gmail.com", "persona": "Student"},
-            headers=AUTH,
-        )
         r = self.client.post(
             "/ui/account/reset",
-            json={"email": "stranger@x.com", "reset_email": "seeded-guard@gmail.com"},
+            json={"email": "anyone@x.com", "reset_email": "seeded-reset@gmail.com"},
         )
         self.assertEqual(r.status_code, 403)
 

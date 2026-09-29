@@ -399,11 +399,17 @@
       $("lookupSub").textContent = "You are signed in. Reset the account assigned to this task.";
       loadTask();
     } else {
-      // Operator flow: pick any gab_accounts email.
-      $("resetEmailRow").classList.remove("hidden");
+      // No token: the manual "reset any account" form is removed. Only a task reset
+      // link (from Cosmo) can run a reset — it binds the account in a signed token.
+      $("resetEmailRow").classList.add("hidden");
       $("taskRow").classList.add("hidden");
       $("acctRow").classList.add("hidden");
-      showRegisteredAccount();
+      $("resetBtn").classList.add("hidden");
+      const pf = $("persona") && $("persona").closest(".field");
+      if (pf) pf.classList.add("hidden");
+      $("lookupSub").textContent =
+        "Open the reset link from your task to reset its environment. "
+        + "This page resets only the account assigned to your task.";
     }
   }
   async function postLogin(body){

@@ -123,13 +123,6 @@ class Settings:
     logins_use_supabase: bool = _flag("LOGINS_USE_SUPABASE", True)
     # Allow-list of freelancers permitted to open the reset page (email-only check).
     freelancers_table: str = os.environ.get("SUPABASE_FREELANCERS_TABLE", "freelancers")
-    # Operators allowed to use the no-token "reset any account" form on /reset
-    # (POST /ui/account/reset). Comma-separated emails. Freelancers must instead use
-    # their task's bound reset link (POST /ui/task/reset). When empty, that manual form
-    # falls back to requiring any verified, allowed freelancer sign-in (still no anon).
-    operator_emails: frozenset = frozenset(
-        e.strip().lower() for e in os.environ.get("OPERATOR_EMAILS", "").split(",") if e.strip()
-    )
     # OAuth web client id for "Sign in with Google" on the reset page (public value).
     # When set, the reset page requires a Google sign-in (email proven by Google) and
     # then checks that email against the freelancers table. When empty (dev), the page
