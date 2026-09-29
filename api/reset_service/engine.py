@@ -689,19 +689,27 @@ def reconcile_preview(email: str, persona: str) -> dict:
             "dry_run": True, "services": services}
 
 
-def _trash_gmail(gmail, ids: set) -> int:
-    """Move agent messages to Trash (batchModify, 1000/chunk — needs only modify scope)."""
+def _delete_gmail(gmail, ids: set) -> int:
+    """Permanently delete agent messages (batchDelete, 1000/chunk) so nothing lingers in
+    Trash. Needs the full https://mail.google.com/ scope (the onboard flow grants it); if
+    a token only has gmail.modify, fall back to Trash."""
     lst = list(ids)
     done = 0
     for i in range(0, len(lst), 1000):
         chunk = lst[i:i + 1000]
         try:
-            gmail.users().messages().batchModify(
-                userId="me", body={"ids": chunk, "addLabelIds": ["TRASH"]}
-            ).execute()
+            gmail.users().messages().batchDelete(userId="me", body={"ids": chunk}).execute()
             done += len(chunk)
         except Exception as exc:  # noqa: BLE001
-            log.warning("gmail trash chunk failed (%d ids): %s", len(chunk), exc)
+            log.warning("gmail batchDelete failed (%d ids), falling back to Trash: %s",
+                        len(chunk), exc)
+            try:
+                gmail.users().messages().batchModify(
+                    userId="me", body={"ids": chunk, "addLabelIds": ["TRASH"]}
+                ).execute()
+                done += len(chunk)
+            except Exception as exc2:  # noqa: BLE001
+                log.warning("gmail trash fallback failed (%d ids): %s", len(chunk), exc2)
     return done
 
 
@@ -716,15 +724,21 @@ def _delete_calendar_events(cal, ids: set) -> int:
     return done
 
 
-def _trash_drive(drive, ids: set) -> int:
-    """Trash agent files/folders. A child of an already-trashed folder may 404 — ignore."""
+def _delete_drive(drive, ids: set) -> int:
+    """Permanently delete agent files/folders so nothing lingers in Drive Trash. Falls
+    back to trashing if a permanent delete is refused. A child of an already-removed
+    folder may 404 — ignored."""
     done = 0
     for fid in ids:
         try:
-            drive.files().update(fileId=fid, body={"trashed": True}).execute()
+            drive.files().delete(fileId=fid).execute()
             done += 1
         except Exception as exc:  # noqa: BLE001
-            log.warning("drive trash %s failed: %s", fid, exc)
+            try:
+                drive.files().update(fileId=fid, body={"trashed": True}).execute()
+                done += 1
+            except Exception as exc2:  # noqa: BLE001
+                log.warning("drive delete/trash %s failed: %s (%s)", fid, exc2, exc)
     return done
 
 
@@ -760,10 +774,23 @@ def _run_reconcile(
     c_orphans = _live_calendar_ids(cal) - base["calendar"]
     d_orphans = _live_drive_ids(drive) - base["drive"]
     deleted = {
-        "gmail": _trash_gmail(gmail, g_orphans),
+        "gmail": _delete_gmail(gmail, g_orphans),
         "calendar": _delete_calendar_events(cal, c_orphans),
-        "drive": _trash_drive(drive, d_orphans),
+        "drive": _delete_drive(drive, d_orphans),
     }
+    # Empty any pre-existing Trash too (from earlier runs, or items a model trashed) so the
+    # account is truly pristine. The baseline is never in Trash, so this is safe.
+    try:
+        trashed_mail = _gmail_ids_by_query(gmail, "in:trash")
+        if trashed_mail:
+            _delete_gmail(gmail, trashed_mail)
+            deleted["gmail"] += len(trashed_mail)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("gmail empty-trash failed: %s", exc)
+    try:
+        drive.files().emptyTrash().execute()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("drive emptyTrash failed: %s", exc)
     log.info("reconcile %s removed orphans=%s", email, deleted)
 
     # Restore anything the baseline is now missing (usually a no-op — baseline was kept).
