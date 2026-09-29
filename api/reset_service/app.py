@@ -1538,16 +1538,25 @@ async def _seed_upload(
     email: str,
     persona: str,
     services: list[str] | None,
-) -> tuple[str, str]:
-    """First-time seed of an already-authorized account (engine ``seed``, no wipe).
+) -> tuple[str, str, str]:
+    """Upload = reconcile an authorized account to its persona baseline.
 
-    Recorded as mode='upload'. If last_reset_persona is already set, callers must
-    use the reset API instead. Returns (id, task_id).
+    Auto-routes by comparing the CSV persona against what the DB has seeded:
+      - never seeded            -> ``seed``   (first full seed, no wipe)
+      - same persona            -> ``delta``  (surgical: only missing/changed items)
+      - a different persona     -> ``reseed`` (wipe the old persona, seed the new one)
+
+    So a second Upload of an already-seeded account no longer errors — it delta-
+    reconciles it to baseline. Returns (id, task_id, op_mode).
     """
     email = email.lower()
     last = await _last_reset_persona(store, email)
-    if last:
-        raise AlreadySeeded(email, last)
+    if not last:
+        engine_mode, row_mode = "seed", "upload"
+    elif _persona_key(last) == _persona_key(persona):
+        engine_mode, row_mode = "delta", "delta"
+    else:
+        engine_mode, row_mode = "reseed", "reseed"
     reset_session_id = str(uuid.uuid4())
     task_allocation_id = f"upload-{uuid.uuid4()}"
     await store.create({
@@ -1559,14 +1568,14 @@ async def _seed_upload(
         "created_at": _now(),
         "started_at": None,
         "completed_at": None,
-        "mode": "upload",
+        "mode": row_mode,
         "error": None,
     })
     background.add_task(
         _bounded_run, store, reset_session_id, task_allocation_id,
-        email, persona, "seed", services, "upload", "operator",
+        email, persona, engine_mode, services, row_mode, "operator",
     )
-    return reset_session_id, task_allocation_id
+    return reset_session_id, task_allocation_id, row_mode
 
 
 @app.post("/ui/authorize")
@@ -1616,21 +1625,13 @@ async def ui_seed(
     if not acct or not acct[0].get("authorized"):
         raise HTTPException(status_code=400, detail="account not authorized yet")
     try:
-        rsid, tid = await _seed_upload(store, background, email, req.persona, req.services)
-    except AlreadySeeded as exc:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"account already seeded as {exc.last_persona}; "
-                "use POST /api/environment/reset"
-            ),
-        ) from exc
+        rsid, tid, op_mode = await _seed_upload(store, background, email, req.persona, req.services)
     except Exception as exc:
         if "409" in str(exc) or "duplicate" in str(exc).lower() or "conflict" in str(exc).lower():
             raise HTTPException(status_code=409, detail="an operation is already running for this account") from exc
         log.exception("ui seed failed")
         raise HTTPException(status_code=502, detail="seeding could not start; please retry") from exc
-    return {"reset_session_id": rsid, "task_allocation_id": tid, "status": "in_progress"}
+    return {"reset_session_id": rsid, "task_allocation_id": tid, "status": "in_progress", "mode": op_mode}
 
 
 @app.post("/ui/recover")

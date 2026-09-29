@@ -1,4 +1,4 @@
-"""gab_logins (who may sign in) vs gab_accounts (who gets reset)."""
+"""freelancers (who may sign in) vs gab_accounts (who gets reset)."""
 import json
 import os
 import tempfile
@@ -44,7 +44,7 @@ class LoginTableTest(unittest.TestCase):
         self.assertIn("op@x.com", emails)
         self.assertIn("rater@deccan.ai", emails)
 
-    def test_login_gate_uses_gab_logins_not_gab_accounts(self) -> None:
+    def test_login_gate_uses_freelancers_not_gab_accounts(self) -> None:
         self.client.post(
             "/api/accounts",
             json={"email": "seeded-gate@gmail.com", "persona": "Student"},
@@ -275,6 +275,54 @@ class UploadProgressTest(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(base, ignore_errors=True)
+
+
+class UploadAutoRouteTest(unittest.TestCase):
+    """The onboard Upload button auto-routes by comparing CSV persona vs the DB:
+    never seeded -> seed, same persona -> delta, different persona -> reseed."""
+
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+
+    def _prep(self, email: str, *, last, persona: str = "Student") -> None:
+        import asyncio
+
+        from reset_service.app import get_store
+        from reset_service.config import settings
+
+        store = get_store()
+
+        async def go() -> None:
+            await store.upsert_account(email, persona)
+            fields = {"authorized": True}
+            if last is not None:
+                fields["last_reset_persona"] = last
+            await store.patch_table(settings.accounts_table, {"email": f"eq.{email}"}, fields)
+
+        asyncio.run(go())
+
+    def test_never_seeded_routes_to_seed(self) -> None:
+        email = "route-new@gmail.com"
+        self._prep(email, last=None)
+        r = self.client.post("/ui/seed", json={"email": email, "persona": "Student"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["mode"], "upload")
+
+    def test_same_persona_routes_to_delta(self) -> None:
+        email = "route-same@gmail.com"
+        self._prep(email, last="Student")
+        r = self.client.post("/ui/seed", json={"email": email, "persona": "Student"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["mode"], "delta")
+
+    def test_different_persona_routes_to_reseed(self) -> None:
+        email = "route-diff@gmail.com"
+        self._prep(email, last="Student")
+        r = self.client.post(
+            "/ui/seed", json={"email": email, "persona": "Backend_software_engineer"}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["mode"], "reseed")
 
 
 class SplitLoginStoreTest(unittest.IsolatedAsyncioTestCase):

@@ -243,7 +243,7 @@ class LoginItem(BaseModel):
 
 
 class LoginUpsertRequest(BaseModel):
-    """Who may sign in on /reset. gab_logins on Supabase when configured."""
+    """Who may sign in on /reset. Stored in the freelancers table on Supabase."""
     email: Optional[str] = None
     name: Optional[str] = None
     logins: Optional[list[LoginItem]] = None

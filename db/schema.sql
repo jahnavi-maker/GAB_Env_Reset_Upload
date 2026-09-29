@@ -77,19 +77,8 @@ create trigger trg_freelancers_updated before update on freelancers
     for each row execute function set_updated_at();
 
 -- ---------------------------------------------------------------------------
--- gab_logins : who may open the reset page (Google sign-in allow-list).
--- Separate from gab_accounts. gab_accounts = emails that get reset.
--- gab_logins = people allowed to sign in and trigger a reset.
+-- gab_logins : REMOVED. The sign-in allow-list is the `freelancers` table above.
+-- The app reads/writes it via SUPABASE_LOGINS_TABLE (default "freelancers"), so
+-- gab_logins was an unused duplicate. Drop it if a legacy deployment still has it.
 -- ---------------------------------------------------------------------------
-create table if not exists gab_logins (
-    email       text primary key,
-    name        text,
-    active      boolean     not null default true,
-    created_at  timestamptz not null default now(),
-    updated_at  timestamptz not null default now()
-);
-create index if not exists idx_gab_logins_active on gab_logins (active);
-
-drop trigger if exists trg_gab_logins_updated on gab_logins;
-create trigger trg_gab_logins_updated before update on gab_logins
-    for each row execute function set_updated_at();
+drop table if exists gab_logins cascade;

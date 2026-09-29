@@ -37,7 +37,7 @@ LOGIN_CSV_FORMAT = {
     "example": "operator@company.com\nrater@deccan.ai\n",
     "notes": [
         "One email per line, or a CSV whose first column is email.",
-        "These emails may sign in on /reset. Stored in gab_logins when Supabase is set.",
+        "These emails may sign in on /reset. Stored in the freelancers table when Supabase is set.",
     ],
 }
 

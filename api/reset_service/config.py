@@ -117,7 +117,8 @@ class Settings:
     qc_log_retention_days: int = _int_env("QC_LOG_RETENTION_DAYS", 15)
     accounts_table: str = os.environ.get("SUPABASE_ACCOUNTS_TABLE", "gab_accounts")
     # Google sign-in allow-list for /reset. Not the accounts that get reset.
-    # Same table as /ui/freelancer/verify. gab_logins is not used for sign-in.
+    # The sign-in allow-list. Same `freelancers` table as /ui/freelancer/verify
+    # (the legacy gab_logins table has been removed).
     logins_table: str = os.environ.get("SUPABASE_LOGINS_TABLE", "freelancers")
     logins_use_supabase: bool = _flag("LOGINS_USE_SUPABASE", True)
     # Allow-list of freelancers permitted to open the reset page (email-only check).
