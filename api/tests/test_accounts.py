@@ -325,6 +325,20 @@ class UploadAutoRouteTest(unittest.TestCase):
         self.assertEqual(r.json()["mode"], "reseed")
 
 
+class ReconcilePreviewTest(unittest.TestCase):
+    """The reconcile dry-run is guarded to registered demo accounts."""
+
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+
+    def test_reconcile_preview_rejects_unregistered_account(self) -> None:
+        r = self.client.post(
+            "/ui/reconcile-preview",
+            json={"email": "not-a-demo-account@gmail.com", "persona": "Student"},
+        )
+        self.assertEqual(r.status_code, 404)
+
+
 class SplitLoginStoreTest(unittest.IsolatedAsyncioTestCase):
     async def test_logins_do_not_write_accounts_file(self) -> None:
         from reset_service.db import LocalJsonStore, SplitLoginStore

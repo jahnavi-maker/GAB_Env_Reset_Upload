@@ -1659,6 +1659,30 @@ async def ui_recover(
     return {"reset_session_id": reset_session_id, "status": "in_progress", "mode": op_mode}
 
 
+@app.post("/ui/reconcile-preview")
+async def ui_reconcile_preview(req: UploadRequest, store: Store = Depends(get_store)) -> dict:
+    """DRY-RUN for the baseline reconcile. Lists what a reset WOULD delete (agent-created
+    items = live items not in the seeded manifest), per service. Deletes nothing.
+
+    Guarded to registered demo accounts only (never an arbitrary email)."""
+    email = req.email.lower()
+    acct = await _resolve_reset_account(store, email)
+    if not acct:
+        raise HTTPException(
+            status_code=404,
+            detail="this account is not a registered demo account (not in gab_accounts)",
+        )
+    persona = req.persona or acct.get("last_reset_persona") or acct.get("persona")
+    if not persona:
+        raise HTTPException(status_code=400, detail="account has no persona on file")
+    try:
+        report = await asyncio.to_thread(engine.reconcile_preview, email, persona)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("reconcile dry-run failed for %s", email)
+        raise HTTPException(status_code=502, detail=f"reconcile preview failed: {exc}") from exc
+    return report
+
+
 # --------------------------------------------------------------------------- #
 # QC: inspect a task's reset logs, then purge them on confirm (keeps storage   #
 # tiny). Logs are compact local JSONL; the DB rows stay for audit.             #

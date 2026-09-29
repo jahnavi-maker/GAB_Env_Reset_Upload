@@ -548,6 +548,131 @@ def reverify(email: str, persona: str) -> dict | None:
     return _verify_seed(email, folder, picked, synthetic, creds)
 
 
+# --------------------------------------------------------------------------- #
+# Baseline reconcile (diff-based reset). The persistent per-account job store   #
+# is the manifest: SUCCESS rows carry each seeded item's live Google ID. An     #
+# item on the account whose id is NOT in the manifest is agent-created (an       #
+# "orphan"). reconcile_preview is a DRY-RUN: it lists orphans, deletes nothing.  #
+# --------------------------------------------------------------------------- #
+def _baseline_ids(email: str, folder: str) -> dict[str, set]:
+    """Live Google IDs of the seeded baseline, per service, from the job store."""
+    ids: dict[str, set] = {"gmail": set(), "calendar": set(), "drive": set()}
+    p = _acct_dir(email, folder) / "provision.sqlite"
+    if not p.exists():
+        return ids
+    import sqlite3
+
+    try:
+        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                "SELECT service, action, google_object_id AS gid FROM jobs "
+                "WHERE status='SUCCESS' AND google_object_id IS NOT NULL "
+                "AND google_object_id NOT IN ('wiped','')"
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return ids
+    for r in rows:
+        svc, action, gid = r["service"], r["action"], r["gid"]
+        if svc == "gmail" and action == "insert_message":
+            ids["gmail"].add(gid)
+        elif svc == "calendar" and action == "insert_event":
+            ids["calendar"].add(gid)
+        elif svc == "drive" and action in ("create_folder", "upload"):
+            ids["drive"].add(gid)
+    return ids
+
+
+def _live_gmail_ids(gmail) -> set:
+    out: set = set()
+    tok = None
+    while True:
+        resp = gmail.users().messages().list(
+            userId="me", maxResults=500, pageToken=tok, includeSpamTrash=False
+        ).execute()
+        for m in resp.get("messages", []) or []:
+            if m.get("id"):
+                out.add(m["id"])
+        tok = resp.get("nextPageToken")
+        if not tok:
+            break
+    return out
+
+
+def _live_calendar_ids(cal) -> set:
+    out: set = set()
+    tok = None
+    while True:
+        resp = cal.events().list(
+            calendarId="primary", maxResults=2500, pageToken=tok,
+            singleEvents=False, showDeleted=False,
+        ).execute()
+        for e in resp.get("items", []) or []:
+            if e.get("id"):
+                out.add(e["id"])
+        tok = resp.get("nextPageToken")
+        if not tok:
+            break
+    return out
+
+
+def _live_drive_ids(drive) -> set:
+    """Files + folders the account OWNS (skips 'shared with me' and trashed)."""
+    out: set = set()
+    tok = None
+    while True:
+        resp = drive.files().list(
+            q="'me' in owners and trashed=false",
+            fields="nextPageToken, files(id,name,mimeType)",
+            pageSize=1000, pageToken=tok, spaces="drive",
+        ).execute()
+        for f in resp.get("files", []) or []:
+            if f.get("id"):
+                out.add(f["id"])
+        tok = resp.get("nextPageToken")
+        if not tok:
+            break
+    return out
+
+
+def reconcile_preview(email: str, persona: str) -> dict:
+    """DRY-RUN. Report what a reconcile WOULD delete (orphans = live - baseline) per
+    service. Read-only: lists live items and diffs against the manifest; deletes nothing.
+
+    ``manifest_empty`` True means no seeded IDs are recorded yet (old-code account) — a
+    reconcile would treat everything as an orphan, so the correct first step is a reseed.
+    """
+    _ensure_seeder_path()
+    from materialize.auth import build_service  # type: ignore
+    from materialize.authbackend import get_backend  # type: ignore
+
+    folder = _persona_dir(persona)
+    base = _baseline_ids(email, folder)
+    manifest_empty = not (base["gmail"] or base["calendar"] or base["drive"])
+    creds = get_backend().credentials_for(email)
+    live = {
+        "gmail": _live_gmail_ids(build_service("gmail", "v1", creds)),
+        "calendar": _live_calendar_ids(build_service("calendar", "v3", creds)),
+        "drive": _live_drive_ids(build_service("drive", "v3", creds)),
+    }
+    services: dict = {}
+    for svc in ("gmail", "calendar", "drive"):
+        orphans = sorted(live[svc] - base[svc])
+        services[svc] = {
+            "baseline": len(base[svc]),
+            "live": len(live[svc]),
+            "orphans": len(orphans),
+            "orphan_ids": orphans[:50],   # sample; full count in "orphans"
+        }
+    log.info("reconcile dry-run %s persona=%s manifest_empty=%s :: %s", email, folder,
+             manifest_empty, {s: services[s]["orphans"] for s in services})
+    return {"email": email, "persona": folder, "manifest_empty": manifest_empty,
+            "dry_run": True, "services": services}
+
+
 def run_reset(
     email: str,
     persona: str,
