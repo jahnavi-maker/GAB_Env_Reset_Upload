@@ -79,10 +79,19 @@ after that is a true, cheap diff.
 Deterministic given the manifest holds live IDs (confirmed). ~90%; remaining risk =
 API scopes (trash/delete) and Drive ownership edges — both de-risked by the dry-run.
 
+## Gmail identity note (validated)
+Gmail message ids proved unstable (threading / re-insert) → the manifest-id diff left a
+residual ~46 orphans on user410. Fixed by identifying Gmail baseline via the **GAB-SEED
+label** (`label:GAB-SEED` = keep, `-label:GAB-SEED` = orphan → delete). Calendar/Drive
+keep the manifest-id diff (validated clean). After the fix, user410 converged to
+orphans=0 on all three surfaces (gmail 170/170, calendar 170/170, drive 231/231).
+
 ## Status
 - [x] Persistent per-account manifest store (shipped)
-- [ ] Dry-run `reconcile_preview` + endpoint (in progress)
-- [ ] Live validation on user410
-- [ ] Real sweep + `reconcile` mode wired into reset
-- [ ] First-run empty-manifest → reseed rule
+- [x] Dry-run `reconcile_preview` + endpoint (shipped)
+- [x] Real sweep + `reconcile` mode + `POST /ui/reconcile` (shipped)
+- [x] First-run empty-manifest → reseed rule
+- [x] Gmail baseline by GAB-SEED label (message ids unstable)
+- [x] Live validation on user410 — orphans=0 on gmail/calendar/drive
+- [ ] Wire `reconcile` into the reset path (POST /api/environment/reset / rater reset link)
 - [ ] Decide: Upload "same persona" → reconcile vs plain delta
