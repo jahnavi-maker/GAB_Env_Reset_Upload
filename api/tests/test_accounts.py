@@ -338,6 +338,24 @@ class ReconcilePreviewTest(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 404)
 
+    def test_reconcile_rejects_unregistered_account(self) -> None:
+        r = self.client.post(
+            "/ui/reconcile",
+            json={"email": "nobody-demo@gmail.com", "persona": "Student"},
+        )
+        self.assertEqual(r.status_code, 404)
+
+    def test_reconcile_routes_as_reconcile_mode(self) -> None:
+        import asyncio
+
+        from reset_service.app import get_store
+
+        email = "reconcile-me@gmail.com"
+        asyncio.run(get_store().upsert_account(email, "Student"))
+        r = self.client.post("/ui/reconcile", json={"email": email, "persona": "Student"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["mode"], "reconcile")
+
 
 class SplitLoginStoreTest(unittest.IsolatedAsyncioTestCase):
     async def test_logins_do_not_write_accounts_file(self) -> None:

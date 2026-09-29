@@ -673,6 +673,88 @@ def reconcile_preview(email: str, persona: str) -> dict:
             "dry_run": True, "services": services}
 
 
+def _trash_gmail(gmail, ids: set) -> int:
+    """Move agent messages to Trash (batchModify, 1000/chunk — needs only modify scope)."""
+    lst = list(ids)
+    done = 0
+    for i in range(0, len(lst), 1000):
+        chunk = lst[i:i + 1000]
+        try:
+            gmail.users().messages().batchModify(
+                userId="me", body={"ids": chunk, "addLabelIds": ["TRASH"]}
+            ).execute()
+            done += len(chunk)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("gmail trash chunk failed (%d ids): %s", len(chunk), exc)
+    return done
+
+
+def _delete_calendar_events(cal, ids: set) -> int:
+    done = 0
+    for eid in ids:
+        try:
+            cal.events().delete(calendarId="primary", eventId=eid).execute()
+            done += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("calendar delete %s failed: %s", eid, exc)
+    return done
+
+
+def _trash_drive(drive, ids: set) -> int:
+    """Trash agent files/folders. A child of an already-trashed folder may 404 — ignore."""
+    done = 0
+    for fid in ids:
+        try:
+            drive.files().update(fileId=fid, body={"trashed": True}).execute()
+            done += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("drive trash %s failed: %s", fid, exc)
+    return done
+
+
+def _run_reconcile(
+    email: str, persona: str, services: str | None, progress_id: str | None = None,
+) -> ResetResult:
+    """Reconcile an account to its baseline: delete everything not in the manifest
+    (agent-created orphans), then restore anything missing (delta). If no manifest
+    exists yet, fall back to a full reseed to build it."""
+    _ensure_seeder_path()
+    from materialize.auth import build_service  # type: ignore
+    from materialize.authbackend import get_backend  # type: ignore
+
+    folder = _persona_dir(persona)
+    base = _baseline_ids(email, folder)
+    if not (base["gmail"] or base["calendar"] or base["drive"]):
+        log.info("reconcile: no manifest for %s -> reseed to build the baseline", email)
+        return _run_seeder_reset(email, persona, "reseed", services, progress_id)
+
+    try:
+        creds = get_backend().credentials_for(email)
+    except Exception as exc:  # noqa: BLE001
+        return ResetResult(False, f"no saved Google token for {email}: {exc}", "reconcile")
+    gmail = build_service("gmail", "v1", creds)
+    cal = build_service("calendar", "v3", creds)
+    drive = build_service("drive", "v3", creds)
+
+    g_orphans = _live_gmail_ids(gmail) - base["gmail"]
+    c_orphans = _live_calendar_ids(cal) - base["calendar"]
+    d_orphans = _live_drive_ids(drive) - base["drive"]
+    deleted = {
+        "gmail": _trash_gmail(gmail, g_orphans),
+        "calendar": _delete_calendar_events(cal, c_orphans),
+        "drive": _trash_drive(drive, d_orphans),
+    }
+    log.info("reconcile %s removed orphans=%s", email, deleted)
+
+    # Restore anything the baseline is now missing (usually a no-op — baseline was kept).
+    restore = _run_seeder_reset(email, persona, "delta", services, progress_id)
+    raw = restore.raw if isinstance(restore.raw, dict) else {}
+    raw["reconcile_deleted"] = deleted
+    detail = (f"reconcile: removed gmail={deleted['gmail']} calendar={deleted['calendar']} "
+              f"drive={deleted['drive']}; {restore.detail}")
+    return ResetResult(restore.success, detail, "reconcile", returncode=restore.returncode, raw=raw)
+
+
 def run_reset(
     email: str,
     persona: str,
@@ -710,6 +792,11 @@ def run_reset(
                 mode,
             )
         # Seeder package unavailable to list choices — fall through and let the engine try as-is.
+
+    if mode == "reconcile":
+        # Diff-based baseline reset: delete agent-created orphans, then restore missing.
+        # Only the in-process provision path supports it (the manifest lives in its store).
+        return _run_reconcile(email, persona, svc, progress_id)
 
     if not settings.gab_config:
         # Local seeder path: reuse the same pipeline as the :8765 UI when the

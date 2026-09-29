@@ -1683,6 +1683,33 @@ async def ui_reconcile_preview(req: UploadRequest, store: Store = Depends(get_st
     return report
 
 
+@app.post("/ui/reconcile")
+async def ui_reconcile(
+    req: UploadRequest, background: BackgroundTasks, store: Store = Depends(get_store)
+) -> dict:
+    """Run the REAL baseline reconcile: delete agent-created orphans (live items not in
+    the manifest), then restore anything missing. Destructive; guarded to registered demo
+    accounts. Poll status/counts via GET /ui/upload/{id}/progress."""
+    email = req.email.lower()
+    acct = await _resolve_reset_account(store, email)
+    if not acct:
+        raise HTTPException(
+            status_code=404,
+            detail="this account is not a registered demo account (not in gab_accounts)",
+        )
+    persona = req.persona or acct.get("last_reset_persona") or acct.get("persona")
+    if not persona:
+        raise HTTPException(status_code=400, detail="account has no persona on file")
+    try:
+        reset_session_id, op_mode = await _launch_reset(
+            store, background, email, persona, f"reconcile-{uuid.uuid4()}", "reconcile",
+            req.services, triggered_by="operator",
+        )
+    except ActiveResetConflict:
+        raise HTTPException(status_code=409, detail="an operation is already running for this account")
+    return {"reset_session_id": reset_session_id, "status": "in_progress", "mode": op_mode}
+
+
 # --------------------------------------------------------------------------- #
 # QC: inspect a task's reset logs, then purge them on confirm (keeps storage   #
 # tiny). Logs are compact local JSONL; the DB rows stay for audit.             #
