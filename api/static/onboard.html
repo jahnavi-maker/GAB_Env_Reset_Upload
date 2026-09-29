@@ -295,7 +295,7 @@
       upBtn.onclick=()=>startSeed(i); box.appendChild(upBtn);
 
       if (["completed","failed"].includes(row.status)){ const rb=document.createElement("button"); rb.className="ghost mini"; rb.textContent="Retry skipped"; rb.title="Delta: re-push missing/failed items"; rb.onclick=()=>startRecover(i); box.appendChild(rb); }
-      if (row.uid && row.status==="completed"){ const vb=document.createElement("button"); vb.className="ghost mini"; vb.textContent="Verify"; vb.title="Re-count what actually landed per service"; vb.onclick=()=>verifyNow(i); box.appendChild(vb); }
+      if (row.uid && row.status==="completed"){ const vb=document.createElement("button"); vb.className="ghost mini"; vb.textContent=row.verifying?"Verifying…":"Verify"; vb.disabled=!!row.verifying; vb.title="Re-count what actually landed per service"; vb.onclick=()=>verifyNow(i); box.appendChild(vb); }
 
       // Real per-service progress + verified counts (never estimated on the client).
       const detail = serviceBlock(row);
@@ -310,7 +310,7 @@
   function serviceBlock(row){
     const prog = row.progress || null;   // {gmail:{total,done,failed,left,state}, ...}
     const ver  = row.verify && row.verify.modules ? row.verify.modules : null; // {gmail:{got,expect}}
-    if (!prog && !ver) return null;
+    if (!prog && !ver && !row.verifying && !row.verifyErr) return null;
     const wrap = document.createElement("div"); wrap.className="svc";
     const SERVICES = [["gmail","Gmail"],["drive","Drive"],["calendar","Calendar"],["github","GitHub"]];
     SERVICES.forEach(([key,label])=>{
@@ -327,16 +327,20 @@
       line.textContent = text;
       wrap.appendChild(line);
     });
-    if (row.verify && row.verify.at){ const t=document.createElement("div"); t.className="svc-at"; t.textContent="verified "+row.verify.at.replace("T"," ").replace("Z"," UTC"); wrap.appendChild(t); }
+    if (row.verifying){ const b=document.createElement("div"); b.className="svc-at"; b.innerHTML='<span class="spin"></span> re-verifying…'; wrap.appendChild(b); }
+    else if (row.verifyErr){ const e=document.createElement("div"); e.className="svc-row verify-err"; e.textContent="verify failed: "+row.verifyErr; wrap.appendChild(e); }
+    else if (row.verify && row.verify.at){ const t=document.createElement("div"); t.className="svc-at"; t.textContent="verified "+row.verify.at.replace("T"," ").replace("Z"," UTC"); wrap.appendChild(t); }
     return wrap;
   }
   async function verifyNow(i){
-    const row=rows[i]; if(!row.uid) return;
+    const row=rows[i]; if(!row.uid || row.verifying) return;
+    row.verifying=true; row.verifyErr=null; renderRows();  // show "verifying…" immediately
     try {
       const r=await fetch("/ui/upload/"+row.uid+"/verify",{method:"POST"});
       const d=await r.json(); if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
-      row.verify=d.verify; renderRows();
-    } catch(e){ row.verifyErr=e.message; renderRows(); }
+      row.verify=d.verify; row.verifyErr=null;
+    } catch(e){ row.verifyErr=e.message; }
+    finally { row.verifying=false; renderRows(); }  // always re-render with fresh counts/timestamp
   }
   function statusLabel(row){
     if(!row.valid) return "unknown persona";
