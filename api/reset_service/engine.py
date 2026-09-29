@@ -752,28 +752,44 @@ def _delete_gmail(gmail, ids: set) -> int:
 
 
 def _delete_calendar_events(cal, ids: set) -> int:
+    """Delete agent events, routed through the seeder's Calendar _retry so it backs off
+    on 403/429 and waits out quota (Calendar's quota is the tightest API) instead of
+    hammering it. A 404/410 (already gone) is treated as done."""
+    from materialize.calendar_sync import _retry  # type: ignore
+
+    _log = lambda m: log.info("%s", m)  # noqa: E731
     done = 0
     for eid in ids:
         try:
-            cal.events().delete(calendarId="primary", eventId=eid).execute()
+            _retry(lambda e=eid: cal.events().delete(calendarId="primary", eventId=e).execute(), _log)
             done += 1
         except Exception as exc:  # noqa: BLE001
-            log.warning("calendar delete %s failed: %s", eid, exc)
+            if any(s in str(exc) for s in ("404", "410", "deleted", "Not Found")):
+                done += 1  # already gone
+            else:
+                log.warning("calendar delete %s failed: %s", eid, exc)
     return done
 
 
 def _delete_drive(drive, ids: set) -> int:
-    """Permanently delete agent files/folders so nothing lingers in Drive Trash. Falls
-    back to trashing if a permanent delete is refused. A child of an already-removed
-    folder may 404 — ignored."""
+    """Permanently delete agent files/folders so nothing lingers in Drive Trash. Routed
+    through the seeder's Drive _retry for backoff on rate/quota limits. Falls back to
+    trashing if a permanent delete is refused; a child of an already-removed folder may
+    404 — treated as done."""
+    from materialize.drive_sync import _retry  # type: ignore
+
+    _log = lambda m: log.info("%s", m)  # noqa: E731
     done = 0
     for fid in ids:
         try:
-            drive.files().delete(fileId=fid).execute()
+            _retry(lambda f=fid: drive.files().delete(fileId=f).execute(), _log)
             done += 1
         except Exception as exc:  # noqa: BLE001
+            if any(s in str(exc) for s in ("404", "410", "Not Found")):
+                done += 1  # already gone (e.g. parent folder removed)
+                continue
             try:
-                drive.files().update(fileId=fid, body={"trashed": True}).execute()
+                _retry(lambda f=fid: drive.files().update(fileId=f, body={"trashed": True}).execute(), _log)
                 done += 1
             except Exception as exc2:  # noqa: BLE001
                 log.warning("drive delete/trash %s failed: %s (%s)", fid, exc2, exc)
