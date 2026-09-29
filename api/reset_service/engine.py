@@ -755,11 +755,14 @@ def _run_reconcile(
 
     folder = _persona_dir(persona)
     base = _baseline_ids(email, folder)
-    # Calendar/Drive are manifest-backed; if that's empty the account was never seeded by
-    # this pipeline, so build the baseline with a reseed (which also labels Gmail).
-    if not (base["calendar"] or base["drive"]):
-        log.info("reconcile: no manifest for %s -> reseed to build the baseline", email)
-        return _run_seeder_reset(email, persona, "reseed", services, progress_id)
+    # If the manifest is empty (account not seeded by this pipeline yet) the diff below
+    # naturally treats ALL current content as orphans → it nukes everything, then the
+    # restore step seeds the baseline fresh and builds the manifest (+ Gmail labels), so
+    # future reconciles are surgical. We deliberately do NOT fall back to a marker-based
+    # reseed here — that would leave unlabeled agent content behind.
+    manifest_empty = not (base["calendar"] or base["drive"])
+    if manifest_empty:
+        log.info("reconcile: no manifest for %s -> full nuke + seed (builds the baseline)", email)
 
     try:
         creds = get_backend().credentials_for(email)
@@ -793,8 +796,12 @@ def _run_reconcile(
         log.warning("drive emptyTrash failed: %s", exc)
     log.info("reconcile %s removed orphans=%s", email, deleted)
 
-    # Restore anything the baseline is now missing (usually a no-op — baseline was kept).
-    restore = _run_seeder_reset(email, persona, "delta", services, progress_id)
+    # Restore the baseline. When the manifest was empty we just nuked everything, so force
+    # a fresh full seed ("reseed" wipes the store → seeds all → builds the manifest); with a
+    # manifest present a "delta" surgically restores only what's missing (usually nothing).
+    restore = _run_seeder_reset(
+        email, persona, "reseed" if manifest_empty else "delta", services, progress_id
+    )
     raw = restore.raw if isinstance(restore.raw, dict) else {}
     raw["reconcile_deleted"] = deleted
     detail = (f"reconcile: removed gmail={deleted['gmail']} calendar={deleted['calendar']} "
