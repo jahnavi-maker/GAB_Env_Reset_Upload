@@ -586,12 +586,13 @@ def _baseline_ids(email: str, folder: str) -> dict[str, set]:
     return ids
 
 
-def _live_gmail_ids(gmail) -> set:
+def _gmail_ids_by_query(gmail, q: str) -> set:
+    """Message ids matching a Gmail search query (excludes trash/spam by default)."""
     out: set = set()
     tok = None
     while True:
         resp = gmail.users().messages().list(
-            userId="me", maxResults=500, pageToken=tok, includeSpamTrash=False
+            userId="me", q=q, maxResults=500, pageToken=tok
         ).execute()
         for m in resp.get("messages", []) or []:
             if m.get("id"):
@@ -648,24 +649,39 @@ def reconcile_preview(email: str, persona: str) -> dict:
     _ensure_seeder_path()
     from materialize.auth import build_service  # type: ignore
     from materialize.authbackend import get_backend  # type: ignore
+    from materialize.gmail_sync import GAB_LABEL  # type: ignore
 
     folder = _persona_dir(persona)
     base = _baseline_ids(email, folder)
-    manifest_empty = not (base["gmail"] or base["calendar"] or base["drive"])
+    # manifest_empty tracks the manifest-backed surfaces (calendar/drive); gmail uses the
+    # GAB-SEED label so it doesn't depend on the manifest.
+    manifest_empty = not (base["calendar"] or base["drive"])
     creds = get_backend().credentials_for(email)
-    live = {
-        "gmail": _live_gmail_ids(build_service("gmail", "v1", creds)),
-        "calendar": _live_calendar_ids(build_service("calendar", "v3", creds)),
-        "drive": _live_drive_ids(build_service("drive", "v3", creds)),
+
+    # Gmail: identity by the GAB-SEED label (message ids are unstable across threading /
+    # re-insert). Baseline = labeled; orphans = unlabeled.
+    gmail = build_service("gmail", "v1", creds)
+    g_orphans = _gmail_ids_by_query(gmail, f"-label:{GAB_LABEL}")
+    g_baseline = _gmail_ids_by_query(gmail, f"label:{GAB_LABEL}")
+    services: dict = {
+        "gmail": {
+            "baseline": len(g_baseline),
+            "live": len(g_baseline) + len(g_orphans),
+            "orphans": len(g_orphans),
+            "orphan_ids": sorted(g_orphans)[:50],
+        }
     }
-    services: dict = {}
-    for svc in ("gmail", "calendar", "drive"):
-        orphans = sorted(live[svc] - base[svc])
+    # Calendar / Drive: identity by manifest google_object_id (provably clean).
+    for svc, live_ids in (
+        ("calendar", _live_calendar_ids(build_service("calendar", "v3", creds))),
+        ("drive", _live_drive_ids(build_service("drive", "v3", creds))),
+    ):
+        orphans = sorted(live_ids - base[svc])
         services[svc] = {
             "baseline": len(base[svc]),
-            "live": len(live[svc]),
+            "live": len(live_ids),
             "orphans": len(orphans),
-            "orphan_ids": orphans[:50],   # sample; full count in "orphans"
+            "orphan_ids": orphans[:50],
         }
     log.info("reconcile dry-run %s persona=%s manifest_empty=%s :: %s", email, folder,
              manifest_empty, {s: services[s]["orphans"] for s in services})
@@ -721,10 +737,13 @@ def _run_reconcile(
     _ensure_seeder_path()
     from materialize.auth import build_service  # type: ignore
     from materialize.authbackend import get_backend  # type: ignore
+    from materialize.gmail_sync import GAB_LABEL  # type: ignore
 
     folder = _persona_dir(persona)
     base = _baseline_ids(email, folder)
-    if not (base["gmail"] or base["calendar"] or base["drive"]):
+    # Calendar/Drive are manifest-backed; if that's empty the account was never seeded by
+    # this pipeline, so build the baseline with a reseed (which also labels Gmail).
+    if not (base["calendar"] or base["drive"]):
         log.info("reconcile: no manifest for %s -> reseed to build the baseline", email)
         return _run_seeder_reset(email, persona, "reseed", services, progress_id)
 
@@ -736,7 +755,8 @@ def _run_reconcile(
     cal = build_service("calendar", "v3", creds)
     drive = build_service("drive", "v3", creds)
 
-    g_orphans = _live_gmail_ids(gmail) - base["gmail"]
+    # Gmail: delete everything WITHOUT the GAB-SEED label (baseline is labeled → kept).
+    g_orphans = _gmail_ids_by_query(gmail, f"-label:{GAB_LABEL}")
     c_orphans = _live_calendar_ids(cal) - base["calendar"]
     d_orphans = _live_drive_ids(drive) - base["drive"]
     deleted = {
