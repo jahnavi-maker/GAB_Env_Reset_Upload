@@ -107,15 +107,27 @@ def list_seeded_mail(gmail, label_id: str, log: Callable[[str], None]) -> dict[s
     return found
 
 
-def wipe_seeded_mail(gmail, log: Callable[[str], None]) -> int:
-    """FULL wipe: permanently delete ALL mail (no marker match).
+def _is_scope_403(exc: HttpError) -> bool:
+    """A 403 caused by an insufficient OAuth scope (not a rate limit)."""
+    if getattr(exc.resp, "status", None) != 403:
+        return False
+    text = str(exc).lower()
+    return "insufficient" in text or "permission" in text or "accessnotconfigured" in text
 
-    The platform authorizes accounts with full https://mail.google.com/ scope
-    (see materialize/auth.py), so we hard-delete via batchDelete (1000/chunk)
-    rather than moving to Trash. Loop-until-empty: deleted messages drop out
-    of the listing, so we re-list until none remain.
+
+def wipe_seeded_mail(gmail, log: Callable[[str], None]) -> int:
+    """FULL wipe of ALL mail (no marker match). Loop-until-empty: wiped messages drop out
+    of a non-trash listing, so we re-list until none remain.
+
+    Consumer accounts hold full https://mail.google.com/ scope, so we hard-delete via
+    batchDelete (1000/chunk). Workspace **delegation** accounts only have gmail.modify —
+    batchDelete 403s there — so we FALL BACK to moving mail to Trash (batchModify +TRASH,
+    allowed by gmail.modify). _count_gmail counts only non-trash GAB-SEED mail, so a reseed
+    still verifies clean; trashed mail auto-purges. Grant mail.google.com in the DWD config
+    for true hard-delete on delegated accounts.
     """
     deleted = 0
+    hard_delete = True
     while True:
         resp = _retry(
             lambda: gmail.users()
@@ -129,16 +141,34 @@ def wipe_seeded_mail(gmail, log: Callable[[str], None]) -> int:
             break
         for start in range(0, len(ids), 1000):
             chunk = ids[start : start + 1000]
+            if hard_delete:
+                try:
+                    gmail.users().messages().batchDelete(userId="me", body={"ids": chunk}).execute()
+                    deleted += len(chunk)
+                    continue
+                except HttpError as exc:
+                    if _is_scope_403(exc):
+                        log("Gmail batchDelete not permitted (gmail.modify scope) — moving mail to Trash instead")
+                        hard_delete = False
+                    elif getattr(exc.resp, "status", None) in (429, 500, 503):
+                        _retry(
+                            lambda c=chunk: gmail.users().messages()
+                            .batchDelete(userId="me", body={"ids": c}).execute(),
+                            log,
+                        )
+                        deleted += len(chunk)
+                        continue
+                    else:
+                        raise
+            # Trash fallback (gmail.modify): add the TRASH label in batch.
             _retry(
-                lambda c=chunk: gmail.users()
-                .messages()
-                .batchDelete(userId="me", body={"ids": c})
-                .execute(),
+                lambda c=chunk: gmail.users().messages()
+                .batchModify(userId="me", body={"ids": c, "addLabelIds": ["TRASH"]}).execute(),
                 log,
             )
             deleted += len(chunk)
-        log(f"Deleted {deleted} messages so far (full wipe)")
-    log(f"Full Gmail wipe: permanently deleted {deleted} messages")
+        log(f"Removed {deleted} messages so far (full wipe)")
+    log(f"Full Gmail wipe: {deleted} messages ({'deleted' if hard_delete else 'trashed'})")
     return deleted
 
 
