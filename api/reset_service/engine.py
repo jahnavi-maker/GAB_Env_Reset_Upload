@@ -346,6 +346,39 @@ def _persona_dir(persona: str) -> str:
     return _match_persona(persona) or persona
 
 
+def _account_has_content(creds, *, log) -> bool:
+    """True if the account already has ANY owned Drive file, Gmail message, or Calendar
+    event. Cheap (one 1-item list per surface, short-circuits on the first hit); used to
+    decide whether a first upload should wipe before seeding for a clean baseline."""
+    from materialize.auth import build_service  # type: ignore
+    from materialize.drive_sync import _retry as _dretry  # type: ignore
+    from materialize.gmail_sync import _retry as _gretry  # type: ignore
+    from materialize.calendar_sync import _retry as _cretry  # type: ignore
+
+    drive = build_service("drive", "v3", creds)
+    r = _dretry(
+        lambda: drive.files()
+        .list(q="'me' in owners and trashed=false", spaces="drive", fields="files(id)", pageSize=1)
+        .execute(),
+        log,
+    )
+    if r.get("files"):
+        return True
+    gmail = build_service("gmail", "v1", creds)
+    r = _gretry(
+        lambda: gmail.users().messages().list(userId="me", maxResults=1, includeSpamTrash=False).execute(),
+        log,
+    )
+    if r.get("messages"):
+        return True
+    cal = build_service("calendar", "v3", creds)
+    r = _cretry(
+        lambda: cal.events().list(calendarId="primary", maxResults=1, showDeleted=False).execute(),
+        log,
+    )
+    return bool(r.get("items"))
+
+
 def _run_seeder_reset(
     email: str, persona: str, mode: str, services: str | None, progress_id: str | None = None,
 ) -> ResetResult:
@@ -371,6 +404,21 @@ def _run_seeder_reset(
         creds = backend_for(email).credentials_for(email)
     except Exception as exc:
         return ResetResult(False, f"no saved Google token for {email}: {exc}", mode)
+
+    # First-upload good practice (clean baseline): a plain "seed" does NOT wipe, so an
+    # account that already has content (leftover Gemini/agent artifacts, a prior manual
+    # upload) would get a polluted baseline. Check the live account first — if Drive,
+    # Gmail or Calendar already has anything, wipe before seeding; a truly empty account
+    # is just seeded. (delta/reseed already handle their own wipe policy, so only "seed".)
+    if mode == "seed" and not flags.get("wipe"):
+        try:
+            if _account_has_content(creds, log=lambda m: log.info("%s", m)):
+                log.info("upload: %s already has content -> wiping before seed (clean baseline)", email)
+                flags = {**flags, "wipe": True}
+            else:
+                log.info("upload: %s is empty -> seeding without wipe", email)
+        except Exception as exc:  # noqa: BLE001 - never block the seed on the pre-check
+            log.warning("upload content pre-check failed for %s: %s (seeding without wipe)", email, exc)
 
     github = ENV_ROOT / folder / "services" / "github"
     github_dir = github if github.is_dir() else None
