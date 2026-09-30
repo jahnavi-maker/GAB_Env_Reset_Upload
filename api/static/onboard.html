@@ -83,7 +83,8 @@
     <div class="step">2 · OAuth client (client.json)</div>
     <label class="dropzone" id="clientDrop">
       <input id="clientFile" type="file" accept=".json,application/json" hidden>
-      <div class="dz-title">Drop <b>client.json</b> here, or click to choose</div>
+      <div class="dz-title">Drop <b>client.json</b> or the <b>admin service-account key</b> here</div>
+      <div class="hint" style="margin-bottom:4px">Web client → authorize each account. Admin service-account key → Workspace accounts authorize automatically (no per-account step).</div>
       <div id="clientName" class="hint">Checking…</div>
     </label>
     <div id="clientNote" class="note"></div>
@@ -130,6 +131,7 @@
     return s.length>80 ? s.slice(0,80)+'…' : s; }
 
   let clientReady = false;
+  let delegation = false;   // true once an admin service-account key is loaded (DWD)
   const rows = [];  // {email, persona, rawP, valid, password, authorized, status, sid, uid, authUrl, error, progress, verify}
   // Persist the loaded table + raw CSV (incl. passwords) so a normal refresh — or the
   // authorize → Google → back round-trip (which opens in a NEW tab) — NEVER wipes the
@@ -197,9 +199,12 @@
   async function checkClient(){
     try {
       const r = await fetch("/ui/client"); const d = await r.json();
-      if (d && d.present) { clientReady = true; $("clientName").textContent = "A client is already configured ✓ (upload to replace)"; }
-      else { clientReady = false; $("clientName").textContent = "No client configured — upload client.json before authorizing."; }
-    } catch(e){ clientReady=false; $("clientName").textContent="No client configured — upload client.json before authorizing."; }
+      if (d && d.delegation) { clientReady = true; delegation = true;
+        $("clientName").innerHTML = "🔑 Domain delegation active ✓ <b>"+(d.domain||"workspace")+"</b> — domain accounts authorize automatically (drop the CSV and Upload)."; }
+      else if (d && d.present) { clientReady = true; delegation = false;
+        $("clientName").textContent = "OAuth web client configured ✓ (upload to replace)"; }
+      else { clientReady = false; delegation = false; $("clientName").textContent = "No client configured — drop client.json or the admin service-account key."; }
+    } catch(e){ clientReady=false; $("clientName").textContent="No client configured — drop client.json or the admin service-account key."; }
     renderRows();
   }
   async function handleClientFile(f){
@@ -211,8 +216,14 @@
       if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
       clientReady = true;
       const missing = d.missing_redirects || [];
-      if (missing.length) { $("clientNote").className="note warn"; $("clientNote").textContent="Saved. Also register these redirect URIs in Google: "+missing.join(", "); }
-      else { $("clientNote").className="note ok"; $("clientNote").textContent="Client saved ✓"; }
+      if (d.delegation) {
+        delegation = true;
+        $("clientNote").className="note ok";
+        $("clientNote").innerHTML = "🔑 Admin service-account key saved ✓ — <b>domain delegation active</b> ("+(d.domain||"workspace")+"). Domain accounts authorize automatically; just Upload.";
+        // re-check auth for loaded rows so they flip to authorized ✓ without a click
+        rows.forEach((row,i)=> refreshAuth(i));
+      } else if (missing.length) { delegation=false; $("clientNote").className="note warn"; $("clientNote").textContent="Saved. Also register these redirect URIs in Google: "+missing.join(", "); }
+      else { delegation=false; $("clientNote").className="note ok"; $("clientNote").textContent="Web client saved ✓"; }
       renderRows();
     } catch(err){ clientReady=false; $("clientNote").className="note err"; $("clientNote").textContent="Rejected: "+err.message; }
   }
@@ -284,11 +295,14 @@
 
       // actions
       const box = document.createElement("div"); box.className="actions"; tr.querySelector(".actcell").appendChild(box);
-      const authBtn=document.createElement("button"); authBtn.className="ghost mini";
-      authBtn.textContent = row.authorized ? "Re-authorize" : "Authorize";
-      authBtn.disabled = !clientReady || !row.valid;
-      authBtn.onclick=()=>startAuthorize(i); box.appendChild(authBtn);
-      if (row.authUrl && row.status==="authorizing"){ const a=document.createElement("a"); a.href=row.authUrl; a.target="_blank"; a.className="authlink"; a.textContent="open consent ↗"; box.appendChild(a); }
+      // In delegation mode accounts authorize automatically — no per-account button.
+      if (!delegation){
+        const authBtn=document.createElement("button"); authBtn.className="ghost mini";
+        authBtn.textContent = row.authorized ? "Re-authorize" : "Authorize";
+        authBtn.disabled = !clientReady || !row.valid;
+        authBtn.onclick=()=>startAuthorize(i); box.appendChild(authBtn);
+        if (row.authUrl && row.status==="authorizing"){ const a=document.createElement("a"); a.href=row.authUrl; a.target="_blank"; a.className="authlink"; a.textContent="open consent ↗"; box.appendChild(a); }
+      }
 
       const upBtn=document.createElement("button"); upBtn.className="ghost mini"; upBtn.textContent="Upload";
       upBtn.disabled = !row.authorized || ["running","queued"].includes(row.status);

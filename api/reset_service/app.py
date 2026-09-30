@@ -1410,10 +1410,16 @@ async def ui_authorize_workspace() -> RedirectResponse:
 
 @app.post("/ui/client")
 async def ui_client(file: UploadFile = File(...)) -> dict:
-    """Operator uploads the consumer OAuth *web* client (client.json)."""
+    """Operator drops the OAuth artifact. Auto-detected:
+
+    - an admin **service-account key** -> Workspace domain-wide delegation: every domain
+      account is authorized automatically (no per-account OAuth). Drop the key + the CSV
+      of domain accounts and just Upload.
+    - a consumer OAuth **web client** -> the per-account authorize flow (gmail.com).
+    """
     raw = await file.read()
     try:
-        status_info = upload.save_web_client(raw)
+        status_info = upload.save_client(raw)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, **(status_info or {})}
@@ -1577,9 +1583,13 @@ async def ui_authorize(req: UploadRequest, store: Store = Depends(get_store)) ->
 async def ui_account(email: str, store: Store = Depends(get_store)) -> dict:
     """Authorize status for one account (drives the operator UI's 'authorized ✓')."""
     r = await _resolve_reset_account(store, email) or {}
+    # In Workspace delegation mode a domain account is authorized automatically (the admin
+    # service-account impersonates it — no per-account OAuth needed).
+    delegated = upload.delegation_active() and upload.in_workspace_domain(email)
     return {
         "email": email.lower(),
-        "authorized": bool(r.get("authorized")) or _seeder_token_exists(email),
+        "authorized": bool(r.get("authorized")) or _seeder_token_exists(email) or delegated,
+        "delegated": delegated,
         "persona": r.get("persona"),
         "last_reset_persona": r.get("last_reset_persona"),
     }
