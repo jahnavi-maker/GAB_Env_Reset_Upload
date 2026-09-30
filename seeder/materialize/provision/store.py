@@ -257,6 +257,32 @@ class JobStore:
             claimed=False,
         )
 
+    def reset_to_pending(
+        self,
+        *,
+        services: tuple[str, ...] | list[str] | None = None,
+        actions: tuple[str, ...] | list[str] | None = None,
+    ) -> int:
+        """Flip SUCCESS jobs back to PENDING so a re-run re-verifies them against live Google
+        (reconcile: restore agent-deleted items, fix agent-modified ones). The store is
+        per-account, so no account filter is needed. Returns how many jobs were reset."""
+        now = _now()
+        clauses = ["status=?"]
+        args: list[Any] = [SUCCESS]
+        if services:
+            clauses.append(f"service IN ({','.join('?' for _ in services)})")
+            args.extend(services)
+        if actions:
+            clauses.append(f"action IN ({','.join('?' for _ in actions)})")
+            args.extend(actions)
+        sql = (
+            f"UPDATE jobs SET status='{PENDING}', claimed_at=NULL, error=NULL, updated_at=? "
+            f"WHERE {' AND '.join(clauses)}"
+        )
+        with self._lock:
+            cur = self._conn.execute(sql, [now, *args])
+            return int(cur.rowcount or 0)
+
     def list_runnable(self, service: str, statuses: tuple[str, ...] = (PENDING, RETRY)) -> list[Job]:
         placeholders = ",".join("?" * len(statuses))
         with self._lock:

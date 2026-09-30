@@ -246,7 +246,12 @@ def index_folder_tree(drive, root_id: str, log: Callable[[str], None]) -> dict[s
     return out
 
 
-def find_child_file(drive, parent_id: str, name: str, log: Callable[[str], None]) -> tuple[int, str] | None:
+def find_child_file(
+    drive, parent_id: str, name: str, log: Callable[[str], None]
+) -> tuple[int, str, str] | None:
+    """(size, file_id, md5Checksum) of a non-folder child by name, or None. md5Checksum comes
+    from the SAME list call (no extra request), so callers can detect content drift for free.
+    Google-native files (Docs/Sheets) have no md5; there it is "" and callers fall back to size."""
     safe = name.replace("\\", "\\\\").replace("'", "\\'")
     resp = _retry(
         lambda: drive.files()
@@ -255,7 +260,7 @@ def find_child_file(drive, parent_id: str, name: str, log: Callable[[str], None]
                 f"name = '{safe}' and '{parent_id}' in parents "
                 "and mimeType != 'application/vnd.google-apps.folder' and trashed = false"
             ),
-            fields="files(id, name, size)",
+            fields="files(id, name, size, md5Checksum)",
             pageSize=5,
         )
         .execute(),
@@ -268,7 +273,7 @@ def find_child_file(drive, parent_id: str, name: str, log: Callable[[str], None]
         size = int(files[0].get("size") or 0)
     except (TypeError, ValueError):
         size = 0
-    return (size, str(files[0].get("id") or ""))
+    return (size, str(files[0].get("id") or ""), str(files[0].get("md5Checksum") or ""))
 
 
 def download_file_bytes(drive, file_id: str, log: Callable[[str], None]) -> bytes:

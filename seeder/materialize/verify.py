@@ -39,7 +39,29 @@ def _gmail_label_id(gmail) -> str | None:
     return None
 
 
-def _count_gmail(gmail) -> int:
+def _live_gmail_message_ids(gmail) -> set:
+    out: set = set()
+    page = None
+    while True:
+        resp = (
+            gmail.users()
+            .messages()
+            .list(userId="me", maxResults=500, includeSpamTrash=False, pageToken=page)
+            .execute()
+        )
+        out |= {m["id"] for m in resp.get("messages") or [] if m.get("id")}
+        page = resp.get("nextPageToken")
+        if not page:
+            break
+    return out
+
+
+def _count_gmail(gmail, baseline_ids: set | None = None) -> int:
+    # Manifest-based (preferred): how many seeded messages (by google_object_id) are
+    # actually live. Label-independent, so an agent reply that inherited GAB-SEED can't
+    # inflate the count. Falls back to the GAB-SEED label only when no manifest is given.
+    if baseline_ids is not None:
+        return len(_live_gmail_message_ids(gmail) & set(baseline_ids))
     label_id = _gmail_label_id(gmail)
     if not label_id:
         return 0
@@ -106,6 +128,7 @@ def verify_seed(
     gmail=None,
     drive=None,
     drive_ineligible: int | None = None,
+    gmail_baseline: set | None = None,
 ) -> dict[str, Any]:
     calendar = calendar or build_service("calendar", "v3", creds)
     gmail = gmail or build_service("gmail", "v1", creds)
@@ -114,7 +137,8 @@ def verify_seed(
         folder_id = find_seed_folder(drive, persona, log)
 
     got_cal = _count_calendar(calendar) if expect_calendar is not None else None
-    got_mail = _count_gmail(gmail) if expect_gmail is not None else None
+    # Gmail: count by manifest ids when available (label-independent), else by GAB-SEED label.
+    got_mail = _count_gmail(gmail, gmail_baseline) if expect_gmail is not None else None
     got_drive = _count_drive(drive, folder_id) if expect_drive is not None else None
 
     def tone(got: int | None, expect: int | None) -> str:

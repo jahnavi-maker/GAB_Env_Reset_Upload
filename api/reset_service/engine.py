@@ -431,6 +431,9 @@ def _verify_seed(
     from materialize.verify import verify_seed  # type: ignore
 
     expect = result.get("expect") or {}
+    # Manifest gmail ids so verify counts by id (label-independent). None -> verify falls
+    # back to the GAB-SEED label (e.g. a manifest that predates id capture).
+    gmail_baseline = _baseline_ids(email, folder).get("gmail") or None
     v = verify_seed(
         creds,
         persona=folder,
@@ -439,6 +442,7 @@ def _verify_seed(
         expect_drive=expect.get("drive") if "drive" in picked else None,
         folder_id=result.get("folder_id"),
         log=lambda m: log.info("%s", m),
+        gmail_baseline=gmail_baseline,
     )
     record = {
         "email": email,
@@ -867,9 +871,34 @@ def _run_reconcile(
         log.warning("drive emptyTrash failed: %s", exc)
     log.info("reconcile %s removed orphans=%s", email, deleted)
 
-    # Restore the baseline. When the manifest was empty we just nuked everything, so force
-    # a fresh full seed ("reseed" wipes the store → seeds all → builds the manifest); with a
-    # manifest present a "delta" surgically restores only what's missing (usually nothing).
+    # FULL RE-VERIFY: a delta normally skips jobs already SUCCESS, so it would NOT restore an
+    # item the agent deleted nor fix one the agent modified. Flip the baseline jobs back to
+    # PENDING so the delta re-checks EVERY item against live Google — the executors then
+    # restore missing, overwrite drifted (Drive md5 / Calendar fields), and skip unchanged.
+    if not manifest_empty:
+        picked_svcs = tuple(
+            s for s in ("drive", "gmail", "calendar")
+            if s in {x.strip() for x in (services or "drive,gmail,calendar").split(",")}
+        )
+        try:
+            from materialize.provision.store import JobStore  # type: ignore
+
+            sp = _acct_dir(email, folder) / "provision.sqlite"
+            if sp.exists():
+                js = JobStore(sp)
+                try:
+                    n = js.reset_to_pending(
+                        services=picked_svcs,
+                        actions=("insert_message", "insert_event", "upload", "create_folder"),
+                    )
+                finally:
+                    js.close()
+                log.info("reconcile re-verify: reset %s baseline jobs to PENDING for %s", n, email)
+        except Exception as exc:  # noqa: BLE001 - re-verify is best-effort; fall back to plain delta
+            log.warning("reconcile reset_to_pending failed for %s: %s", email, exc)
+
+    # Restore the baseline. Empty manifest -> full reseed (wipe store + seed + rebuild manifest);
+    # otherwise a delta that (after the reset above) re-verifies and repairs every baseline item.
     restore = _run_seeder_reset(
         email, persona, "reseed" if manifest_empty else "delta", services, progress_id
     )

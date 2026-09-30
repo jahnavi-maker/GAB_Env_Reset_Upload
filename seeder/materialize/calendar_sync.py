@@ -397,3 +397,32 @@ def insert_event(calendar, body: dict[str, Any], log: Callable[[str], None]) -> 
         log,
     )
     return str(result["id"])
+
+
+def _event_start_end(ev: dict[str, Any]) -> tuple[int | None, int | None]:
+    def _pick(side: str) -> int | None:
+        node = ev.get(side) or {}
+        return _coerce_ts(node.get("dateTime") or node.get("date"))
+    return _pick("start"), _pick("end")
+
+
+def event_needs_update(desired_body: dict[str, Any], live_event: dict[str, Any]) -> bool:
+    """True when a seeded event drifted from the desired body (agent changed the time,
+    title, location, or description). Compared by value so a reconcile can restore it."""
+    for field in ("summary", "description", "location"):
+        if str(desired_body.get(field) or "") != str(live_event.get(field) or ""):
+            return True
+    ds, de = _event_start_end(desired_body)
+    ls, le = _event_start_end(live_event)
+    return ds != ls or de != le
+
+
+def update_event(calendar, event_id: str, body: dict[str, Any], log: Callable[[str], None]) -> str:
+    """Overwrite an existing event back to the desired body (resets agent drift)."""
+    _retry(
+        lambda: calendar.events()
+        .update(calendarId="primary", eventId=event_id, body=body, sendUpdates="none")
+        .execute(),
+        log,
+    )
+    return event_id

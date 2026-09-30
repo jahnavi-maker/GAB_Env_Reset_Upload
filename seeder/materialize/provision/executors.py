@@ -8,13 +8,16 @@ from typing import Any
 
 from materialize.auth import build_service
 from materialize.calendar_sync import (
+    event_needs_update,
     insert_event,
     match_seeded_event,
     seeded_event_index,
+    update_event,
     wipe_seeded_events,
 )
 from materialize.drive_sync import (
     SEED_FOLDER,
+    _retry as _drive_retry,
     ensure_child_folder,
     find_child_file,
     trash_file,
@@ -62,6 +65,36 @@ def parent_folder_id(store: JobStore, job: Job, payload: dict[str, Any]) -> str:
     return str(parent)
 
 
+def _list_children_index(drive, parent_id: str, log) -> dict[str, tuple[int, str, str]]:
+    """{name: (size, id, md5Checksum)} for every non-folder child of a Drive folder, in one
+    paginated listing. md5 lets a reconcile detect same-size content edits without per-file gets."""
+    out: dict[str, tuple[int, str, str]] = {}
+    safe = str(parent_id).replace("\\", "\\\\").replace("'", "\\'")
+    tok = None
+    while True:
+        resp = _drive_retry(
+            lambda t=tok: drive.files()
+            .list(
+                q=f"'{safe}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
+                fields="nextPageToken, files(id, name, size, md5Checksum)",
+                pageSize=1000,
+                pageToken=t,
+            )
+            .execute(),
+            log,
+        )
+        for f in resp.get("files", []) or []:
+            try:
+                sz = int(f.get("size") or 0)
+            except (TypeError, ValueError):
+                sz = 0
+            out[str(f.get("name") or "")] = (sz, str(f.get("id") or ""), str(f.get("md5Checksum") or ""))
+        tok = resp.get("nextPageToken")
+        if not tok:
+            break
+    return out
+
+
 class JobExecutor:
     def __init__(
         self,
@@ -82,6 +115,21 @@ class JobExecutor:
         self._folder_cache: dict[str, dict[str, str]] = {}
         self._cal_index: dict[str, tuple[dict, dict]] = {}
         self._mail_index: dict[str, dict[str, dict[str, str]]] = {}
+        # (account, parent_id) -> {name: (size, id, md5)} so a full reconcile lists each
+        # Drive folder once instead of one API call per file.
+        self._child_index: dict[tuple[str, str], dict[str, tuple[int, str, str]]] = {}
+        self._child_lock = threading.Lock()
+
+    def _child_entry(self, drive, account_id: str, parent_id: str, name: str):
+        """(size, id, md5) of a child file by name, from a per-parent cached listing."""
+        key = (account_id, parent_id)
+        with self._child_lock:
+            idx = self._child_index.get(key)
+        if idx is None:
+            idx = _list_children_index(drive, parent_id, self.log)
+            with self._child_lock:
+                self._child_index[key] = idx
+        return idx.get(name)
 
     def execute(self, job: Job) -> dict[str, Any]:
         if job.service == "generate":
@@ -123,14 +171,22 @@ class JobExecutor:
             else:
                 raw = read_cached_bytes(job.environment_id, job.payload.get("rel") or job.source_path)
             if (job.extra or {}).get("mode") == DELTA:
-                have = find_child_file(drive, parent, name, self.log)
-                if have and have[0] == len(raw):
-                    return {"id": have[1], "bytes": len(raw), "skipped": True}
-                if have and have[1]:
-                    try:
-                        trash_file(drive, have[1], self.log)
-                    except Exception as exc:
-                        self.log(f"Could not replace Drive {name}: {exc}")
+                have = self._child_entry(drive, job.account_id, parent, name)
+                if have:
+                    # Content drift by md5 (same-size edits too), not just size. A native file
+                    # with no md5 falls back to size. Matches -> keep; else replace in place.
+                    live_size, live_id, live_md5 = have[0], have[1], have[2]
+                    want_md5 = hashlib.md5(raw).hexdigest()
+                    content_ok = live_size == len(raw) and (
+                        live_md5 == want_md5 if live_md5 else True
+                    )
+                    if content_ok:
+                        return {"id": live_id, "bytes": len(raw), "skipped": True}
+                    if live_id:
+                        try:
+                            trash_file(drive, live_id, self.log)
+                        except Exception as exc:
+                            self.log(f"Could not replace Drive {name}: {exc}")
             file_id = upload_bytes(drive, parent, name, raw, mime, self.log)
             return {"id": file_id, "bytes": len(raw)}
         raise RuntimeError(f"unknown drive action {job.action}")
@@ -149,6 +205,15 @@ class JobExecutor:
                 by_key, by_gab = index
                 match = match_seeded_event(job.payload.get("item") or {"event_id": job.payload.get("event_id")}, by_key, by_gab)
                 if match and match.get("id"):
+                    # The event still exists — but the agent may have changed its time/title/
+                    # description/location. Overwrite it back to the seeded body on drift.
+                    body = job.payload["body"]
+                    if event_needs_update(body, match):
+                        try:
+                            update_event(calendar, str(match["id"]), body, self.log)
+                            return {"id": str(match["id"]), "updated": True}
+                        except Exception as exc:
+                            self.log(f"Could not reset drifted event {match['id']}: {exc}")
                     return {"id": str(match["id"]), "skipped": True}
             event_id = insert_event(calendar, job.payload["body"], self.log)
             return {"id": event_id}

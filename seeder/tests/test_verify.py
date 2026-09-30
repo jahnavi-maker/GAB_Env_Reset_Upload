@@ -95,6 +95,32 @@ def _file(name):
     return {"id": name, "name": name, "mimeType": "text/plain"}
 
 
+class ManifestGmailCountTests(unittest.TestCase):
+    def test_gmail_counts_by_manifest_ids_ignoring_extras(self):
+        # 3 messages live (m0,m1 seeded + m2 agent-added). Manifest baseline = {m0,m1}.
+        # Manifest-based count must be 2 (the agent message must NOT inflate it), regardless
+        # of any GAB-SEED label an agent reply might have inherited.
+        gmail = FakeGmail(
+            [{"id": "lab-1", "name": "GAB-SEED"}],
+            [{"messages": [{"id": "m0"}, {"id": "m1"}, {"id": "m2"}]}],
+        )
+        result = verify_seed(
+            None,
+            persona="Student",
+            expect_calendar=None,
+            expect_gmail=2,
+            expect_drive=None,
+            folder_id="folder-1",
+            log=lambda _m: None,
+            calendar=_calendar(0),
+            gmail=gmail,
+            drive=_drive([]),
+            gmail_baseline={"m0", "m1"},
+        )
+        self.assertEqual(result["modules"]["gmail"]["got"], 2)
+        self.assertEqual(result["modules"]["gmail"]["tone"], "ok")
+
+
 class VerifyToneTests(unittest.TestCase):
     def test_exact_counts_are_ok(self):
         result = _run(
