@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from materialize.csv_ingest import account_from_fields, normalize_persona_key, parse_accounts_csv
+
+from _env_fixture import EnvRootMixin
 
 
 CSV = (
@@ -22,7 +26,15 @@ CSV = (
 )
 
 
-class CsvIngestTests(unittest.TestCase):
+class CsvIngestTests(EnvRootMixin, unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._install_env_root(Path(self.tmp.name))
+
+    def tearDown(self):
+        self._restore_env_root()
+        self.tmp.cleanup()
+
     def test_normalize(self):
         self.assertEqual(
             normalize_persona_key("Applied ML and Data Scientist"),

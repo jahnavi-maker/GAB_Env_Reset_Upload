@@ -14,6 +14,7 @@ from materialize.rebase import rebase, rebase_calendar_events
 from materialize.auth import safe_email
 from materialize.drive_sync import drive_attempt_stats
 from materialize.runner import gmail_attachment_block
+from _env_fixture import EnvRootMixin
 from materialize.runstate import (
     batch_pool_settings,
     chunk_accounts,
@@ -96,7 +97,7 @@ CSV = (
 )
 
 
-class SourceResolutionTests(unittest.TestCase):
+class SourceResolutionTests(EnvRootMixin, unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         import materialize.runstate as rs
@@ -105,8 +106,12 @@ class SourceResolutionTests(unittest.TestCase):
         self._old = rs.RUNS
         rs.RUNS = Path(self.tmp.name) / "runs"
         rs.RUNS.mkdir()
+        # The persona tree isn't in the repo; point ENV_ROOT at a temp fixture so persona
+        # matching + auto-bind resolve deterministically.
+        self._install_env_root(Path(self.tmp.name))
 
     def tearDown(self):
+        self._restore_env_root()
         self.rs.RUNS = self._old
         self.tmp.cleanup()
 

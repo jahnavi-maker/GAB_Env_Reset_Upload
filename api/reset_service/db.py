@@ -7,7 +7,7 @@ Both backends expose the same async interface:
     get(reset_session_id)          -> fetch one record or None
 
 The record shape is a plain dict matching the ``reset_sessions`` table in
-``schema.sql``.
+``db/schema.sql`` (the single authoritative schema).
 """
 from __future__ import annotations
 

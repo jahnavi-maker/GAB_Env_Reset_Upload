@@ -77,7 +77,7 @@ Tests: `.venv/bin/python -m pytest tests/ -q` (4 tests, no network).
 ## Wire to Supabase
 
 1. Create a Supabase project (free tier is fine).
-2. Run [`schema.sql`](schema.sql) in the SQL editor.
+2. Run [`../db/schema.sql`](../db/schema.sql) in the SQL editor (the single authoritative schema for both the api and the seeder).
 3. Set `SUPABASE_URL` and `SUPABASE_KEY` (service-role or an insert/update key).
 
 The store auto-switches to Supabase once both are set. The table doubles as the

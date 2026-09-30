@@ -1,7 +1,10 @@
 .env
 .reset_sessions.json
-.reset_sessions.logins.json
+.reset_sessions.*.json
 *.logins.json
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
 __pycache__/
 *.pyc
 .venv/

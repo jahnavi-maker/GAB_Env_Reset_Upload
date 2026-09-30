@@ -24,9 +24,12 @@
 **/uploads/
 **/persona_drive_cache/
 .reset_sessions.json
-.reset_sessions.logins.json
+.reset_sessions.*.json
 *.logins.json
 *.manifest.json
+**/provision.sqlite
+**/*.sqlite-journal
+**/*.sqlite-wal
 
 # ---- Large data artifacts ----
 *.zip
