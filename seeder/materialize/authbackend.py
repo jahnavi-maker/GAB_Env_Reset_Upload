@@ -41,12 +41,12 @@ DEFAULT_WORKSPACE_DOMAIN = "deccanexperts.us"
 # delegation (SA) key is loaded for Workspace accounts.
 CONSUMER_DOMAINS = {"gmail.com", "googlemail.com"}
 # DWD tokens fail if we ask for openid / userinfo.email and Admin only authorized the APIs.
-# NOTE: https://mail.google.com/ was added to the DWD grant but had not propagated yet
-# (token request returned unauthorized_client). Staying on gmail.modify (delegated reseed
-# wipes via the Trash fallback) until the grant is confirmed live, then flip the first entry
-# back to "https://mail.google.com/" for true hard-delete.
+# Full https://mail.google.com/ is granted in the Workspace Admin DWD config for
+# teamdeccan.us (+ deccanexperts.us) on client 102040225590587840428 and verified live, so
+# delegated accounts HARD-DELETE mail (batchDelete) on reseed, matching consumer scope. The
+# Trash fallback in wipe_seeded_mail still covers any domain not yet granted the full scope.
 DWD_SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify",
+    "https://mail.google.com/",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/drive",
 ]
