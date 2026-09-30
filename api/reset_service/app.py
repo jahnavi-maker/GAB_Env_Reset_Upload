@@ -1583,9 +1583,10 @@ async def ui_authorize(req: UploadRequest, store: Store = Depends(get_store)) ->
 async def ui_account(email: str, store: Store = Depends(get_store)) -> dict:
     """Authorize status for one account (drives the operator UI's 'authorized ✓')."""
     r = await _resolve_reset_account(store, email) or {}
-    # In Workspace delegation mode a domain account is authorized automatically (the admin
-    # service-account impersonates it — no per-account OAuth needed).
-    delegated = upload.delegation_active() and upload.in_workspace_domain(email)
+    # Per-account: a Workspace account under delegation is authorized automatically (the
+    # admin service-account impersonates it). Consumer/token accounts are NOT delegated
+    # here and still need their saved OAuth token.
+    delegated = upload.account_uses_delegation(email)
     return {
         "email": email.lower(),
         "authorized": bool(r.get("authorized")) or _seeder_token_exists(email) or delegated,
@@ -1604,10 +1605,11 @@ async def ui_seed(
     """Operator step 3 (per-account or via Bulk upload): push the first data into
     an authorized account. Requires the account to be authorized already."""
     email = req.email.lower()
-    # In Workspace domain-wide-delegation mode the account is authorized implicitly (the
-    # admin service-account impersonates it — no per-account OAuth, so no gab_accounts.authorized
-    # flag is ever written). Mirror /ui/account: delegation counts as authorized.
-    delegated = upload.delegation_active() and upload.in_workspace_domain(email)
+    # Per-account: a Workspace account under delegation is authorized implicitly (the admin
+    # service-account impersonates it — no per-account OAuth, so no gab_accounts.authorized
+    # flag is ever written). Consumer/token accounts are not delegated and fall through to
+    # the DB-authorized check below (they need their saved refresh token).
+    delegated = upload.account_uses_delegation(email)
     if not delegated:
         try:
             acct = await store.query(

@@ -1,0 +1,283 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "GAB Environment Platform",
+    "quality_profile": "standard",
+    "viewBox": [
+      1180,
+      640
+    ],
+    "views": [
+      {
+        "id": "reset-path",
+        "label": "Reset path",
+        "focus": [
+          "cosmo",
+          "nginx",
+          "api",
+          "engine",
+          "google"
+        ],
+        "note": "A reset request flows from Cosmo through the platform and engine to Google Workspace."
+      },
+      {
+        "id": "onboarding",
+        "label": "Onboarding & state",
+        "focus": [
+          "operator",
+          "api",
+          "supabase",
+          "archive"
+        ],
+        "note": "Operators authorize accounts; the platform records state in Supabase and seeds from the baseline archive."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "freelancer",
+      "type": "external",
+      "label": "Freelancer",
+      "sublabel": "Reset page login",
+      "pos": [
+        40,
+        120
+      ],
+      "size": [
+        150,
+        70
+      ]
+    },
+    {
+      "id": "cosmo",
+      "type": "external",
+      "label": "Cosmo / Deccan",
+      "sublabel": "Reset API caller",
+      "pos": [
+        40,
+        300
+      ],
+      "size": [
+        150,
+        70
+      ]
+    },
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "Operator",
+      "sublabel": "Onboard + authorize",
+      "pos": [
+        40,
+        480
+      ],
+      "size": [
+        150,
+        70
+      ]
+    },
+    {
+      "id": "nginx",
+      "type": "cloud",
+      "label": "nginx",
+      "sublabel": "Reverse proxy 80/443",
+      "pos": [
+        260,
+        300
+      ],
+      "size": [
+        150,
+        70
+      ]
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "FastAPI Platform",
+      "sublabel": "reset \u00b7 onboard \u00b7 verify",
+      "brand": "fastapi",
+      "pos": [
+        480,
+        300
+      ],
+      "size": [
+        160,
+        70
+      ]
+    },
+    {
+      "id": "engine",
+      "type": "backend",
+      "label": "Reset Engine",
+      "sublabel": "gab-seed \u00b7 delta / reseed",
+      "pos": [
+        720,
+        300
+      ],
+      "size": [
+        160,
+        70
+      ]
+    },
+    {
+      "id": "google",
+      "type": "cloud",
+      "label": "Google Workspace",
+      "sublabel": "Gmail \u00b7 Drive \u00b7 Calendar",
+      "brand": "google-cloud",
+      "pos": [
+        960,
+        300
+      ],
+      "size": [
+        160,
+        70
+      ]
+    },
+    {
+      "id": "gsignin",
+      "type": "security",
+      "label": "Google Sign-In",
+      "sublabel": "verify freelancer",
+      "brand": "google-cloud",
+      "pos": [
+        960,
+        120
+      ],
+      "size": [
+        160,
+        70
+      ]
+    },
+    {
+      "id": "supabase",
+      "type": "database",
+      "label": "Supabase",
+      "sublabel": "accounts \u00b7 sessions \u00b7 freelancers",
+      "brand": "supabase",
+      "pos": [
+        480,
+        480
+      ],
+      "size": [
+        160,
+        70
+      ]
+    },
+    {
+      "id": "archive",
+      "type": "database",
+      "label": "Baseline Archive",
+      "sublabel": ".zip + personas",
+      "pos": [
+        720,
+        480
+      ],
+      "size": [
+        160,
+        70
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "cosmo-nginx",
+      "from": "cosmo",
+      "to": "nginx",
+      "label": "reset API",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "freelancer-nginx",
+      "from": "freelancer",
+      "to": "nginx",
+      "label": "/reset",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "operator-nginx",
+      "from": "operator",
+      "to": "nginx",
+      "label": "/onboard",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "nginx-api",
+      "from": "nginx",
+      "to": "api",
+      "label": "proxy :8791",
+      "variant": "emphasis"
+    },
+    {
+      "id": "api-engine",
+      "from": "api",
+      "to": "engine",
+      "label": "run reset"
+    },
+    {
+      "id": "engine-google",
+      "from": "engine",
+      "to": "google",
+      "label": "seed / reset",
+      "variant": "emphasis"
+    },
+    {
+      "id": "api-supabase",
+      "from": "api",
+      "to": "supabase",
+      "label": "sessions \u00b7 accounts",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        560,
+        410
+      ]
+    },
+    {
+      "id": "engine-archive",
+      "from": "engine",
+      "to": "archive",
+      "label": "read baseline",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        800,
+        410
+      ]
+    },
+    {
+      "id": "api-gsignin",
+      "from": "api",
+      "to": "gsignin",
+      "label": "verify ID token",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "bottom"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Reset routing",
+      "items": [
+        "Complete manifest \u2192 delta (surgical)",
+        "Otherwise \u2192 full reseed (wipe + seed)",
+        "Auto-recovers on cross-seed / drift"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Access control",
+      "items": [
+        "Cosmo \u2192 Bearer key on /api/*",
+        "Freelancer \u2192 Google sign-in + allow-list",
+        "Reset scoped by signed task link"
+      ]
+    }
+  ]
+}

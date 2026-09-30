@@ -340,29 +340,26 @@ class DelegationSeedTest(unittest.TestCase):
 
         email = "deleg-user@teamdeccan.us"
         self._prep_unauthorized(email)
-        orig_active = app_mod.upload.delegation_active
-        orig_dom = app_mod.upload.in_workspace_domain
-        app_mod.upload.delegation_active = lambda: True
-        app_mod.upload.in_workspace_domain = lambda e: True
+        orig = app_mod.upload.account_uses_delegation
+        app_mod.upload.account_uses_delegation = lambda e: True
         try:
             r = self.client.post("/ui/seed", json={"email": email, "persona": "Student"})
         finally:
-            app_mod.upload.delegation_active = orig_active
-            app_mod.upload.in_workspace_domain = orig_dom
+            app_mod.upload.account_uses_delegation = orig
         self.assertEqual(r.status_code, 200, r.text)
 
     def test_non_delegated_unauthorized_still_blocked(self) -> None:
-        # With delegation OFF, an unauthorized account is still rejected (regression guard).
+        # A consumer/token account that isn't delegated and has no token is still rejected.
         from reset_service import app as app_mod
 
         email = "no-deleg@gmail.com"
         self._prep_unauthorized(email)
-        orig_active = app_mod.upload.delegation_active
-        app_mod.upload.delegation_active = lambda: False
+        orig = app_mod.upload.account_uses_delegation
+        app_mod.upload.account_uses_delegation = lambda e: False
         try:
             r = self.client.post("/ui/seed", json={"email": email, "persona": "Student"})
         finally:
-            app_mod.upload.delegation_active = orig_active
+            app_mod.upload.account_uses_delegation = orig
         self.assertEqual(r.status_code, 400, r.text)
         self.assertIn("not authorized", r.text)
 

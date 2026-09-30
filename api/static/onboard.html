@@ -200,7 +200,7 @@
     try {
       const r = await fetch("/ui/client"); const d = await r.json();
       if (d && d.delegation) { clientReady = true; delegation = true;
-        $("clientName").innerHTML = "🔑 Domain delegation active ✓ <b>"+(d.domain||"workspace")+"</b> — domain accounts authorize automatically (drop the CSV and Upload)."; }
+        $("clientName").innerHTML = "🔑 Domain delegation active ✓ <b>"+(d.domain||"any Workspace domain")+"</b> — Workspace accounts authorize automatically; gmail.com accounts still authorize individually."; }
       else if (d && d.present) { clientReady = true; delegation = false;
         $("clientName").textContent = "OAuth web client configured ✓ (upload to replace)"; }
       else { clientReady = false; delegation = false; $("clientName").textContent = "No client configured — drop client.json or the admin service-account key."; }
@@ -219,7 +219,7 @@
       if (d.delegation) {
         delegation = true;
         $("clientNote").className="note ok";
-        $("clientNote").innerHTML = "🔑 Admin service-account key saved ✓ — <b>domain delegation active</b> ("+(d.domain||"workspace")+"). Domain accounts authorize automatically; just Upload.";
+        $("clientNote").innerHTML = "🔑 Admin service-account key saved ✓ — <b>domain delegation active</b> ("+(d.domain||"any Workspace domain")+"). Workspace accounts authorize automatically; gmail.com accounts still authorize individually.";
         // re-check auth for loaded rows so they flip to authorized ✓ without a click
         rows.forEach((row,i)=> refreshAuth(i));
       } else if (missing.length) { delegation=false; $("clientNote").className="note warn"; $("clientNote").textContent="Saved. Also register these redirect URIs in Google: "+missing.join(", "); }
@@ -295,8 +295,10 @@
 
       // actions
       const box = document.createElement("div"); box.className="actions"; tr.querySelector(".actcell").appendChild(box);
-      // In delegation mode accounts authorize automatically — no per-account button.
-      if (!delegation){
+      // Per-account: a Workspace account under delegation authorizes automatically (no
+      // button). A consumer gmail.com account still authorizes individually even when an
+      // admin SA key is loaded — so gate on THIS row's `delegated`, not a global flag.
+      if (!row.delegated){
         const authBtn=document.createElement("button"); authBtn.className="ghost mini";
         authBtn.textContent = row.authorized ? "Re-authorize" : "Authorize";
         authBtn.disabled = !clientReady || !row.valid;
@@ -376,6 +378,9 @@
   async function refreshAuth(i){
     const row=rows[i]; if(!row.valid) return;
     try { const r=await fetch("/ui/account?email="+encodeURIComponent(row.email)); const d=await r.json();
+      // Per-account delegation: Workspace accounts (delegated) hide the Authorize button;
+      // consumer gmail.com accounts stay individually authorized even with an SA key loaded.
+      if (row.delegated !== !!d.delegated){ row.delegated = !!d.delegated; renderRows(); }
       if (d.authorized){
         let changed=false;
         if(!row.authorized){ row.authorized=true; changed=true; }

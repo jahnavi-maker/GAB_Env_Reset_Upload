@@ -115,14 +115,25 @@ def delegation_active() -> bool:
 def in_workspace_domain(email: str) -> bool:
     """True when ``email`` is impersonable in delegation mode. Domain-agnostic unless the
     operator explicitly restricted it via ENV_LOADER_WORKSPACE_DOMAIN (Google's DWD grant
-    is the real gate)."""
+    is the real gate). Consumer domains (gmail.com) are never delegable."""
     try:
-        from materialize.authbackend import workspace_domain  # type: ignore
+        from materialize.authbackend import delegation_domain_ok  # type: ignore
 
-        dom = workspace_domain()
-        if "@" not in email:
-            return False
-        return (not dom) or email.lower().split("@", 1)[1] == dom
+        return delegation_domain_ok(email)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def account_uses_delegation(email: str) -> bool:
+    """Per-account: True iff THIS account resolves to Workspace delegation (Workspace
+    domain, SA key available, and no saved OAuth token). Consumer accounts and any account
+    with a saved token resolve to the token backend and return False here — so a delegated
+    Workspace account counts as authorized without a token, while a Gmail account still
+    needs its refresh token."""
+    try:
+        from materialize.authbackend import backend_for  # type: ignore
+
+        return backend_for(email).name == "workspace_delegation"
     except Exception:  # noqa: BLE001
         return False
 

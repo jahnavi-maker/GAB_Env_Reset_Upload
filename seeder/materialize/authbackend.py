@@ -36,6 +36,10 @@ from materialize.auth import (
 PENDING_PATH = TOKENS_DIR / "_oauth_pending.json"
 SA_KEY_PATH = ROOT / "gab-sa.json"
 DEFAULT_WORKSPACE_DOMAIN = "deccanexperts.us"
+# Consumer Google domains can NEVER be impersonated by a Workspace service account,
+# so accounts on these domains always use per-account OAuth tokens, even when a
+# delegation (SA) key is loaded for Workspace accounts.
+CONSUMER_DOMAINS = {"gmail.com", "googlemail.com"}
 # DWD tokens fail if we ask for openid / userinfo.email and Admin only authorized the APIs.
 DWD_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
@@ -150,7 +154,11 @@ def save_service_account_key(raw: bytes) -> dict[str, Any]:
             "Download the JSON key for the gab-seed service account."
         )
     secure_write(SA_KEY_PATH, text)
-    os.environ["ENV_LOADER_AUTH_BACKEND"] = "workspace_delegation"
+    # Record WHERE the key is, but do NOT force a global auth mode. Delegation is chosen
+    # PER ACCOUNT by backend_for(): Workspace accounts (no saved token) use the SA key,
+    # while consumer gmail.com accounts and any account with a saved OAuth token keep using
+    # their refresh token. This lets a DWD bulk upload and a Gmail-token reset run in
+    # parallel instead of one global switch clobbering the other.
     os.environ["ENV_LOADER_SA_KEY"] = str(SA_KEY_PATH)
     # Domain is left unrestricted (domain-agnostic) unless the operator explicitly set
     # ENV_LOADER_WORKSPACE_DOMAIN — the SA's DWD grant decides which domains it can reach.
@@ -510,3 +518,55 @@ def get_backend() -> AuthBackend:
 def reset_backend() -> None:
     global _BACKEND
     _BACKEND = None
+
+
+def _email_domain(email: str) -> str:
+    return email.lower().split("@", 1)[1] if "@" in (email or "") else ""
+
+
+def has_saved_token(email: str) -> bool:
+    """True when a per-account consumer OAuth token is already stored for this email."""
+    try:
+        return bool(email) and token_path(email).exists()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def sa_key_available() -> bool:
+    """True when a delegation (service-account) key is loaded/discoverable."""
+    env = (os.environ.get("ENV_LOADER_SA_KEY") or "").strip()
+    if env and Path(env).exists():
+        return True
+    return bool(discover_sa_key())
+
+
+def delegation_domain_ok(email: str) -> bool:
+    """Whether delegation may be used for this account's domain. Consumer domains are
+    never delegable; otherwise any non-consumer domain is allowed unless the operator
+    pinned a single Workspace domain via ENV_LOADER_WORKSPACE_DOMAIN."""
+    dom = _email_domain(email)
+    if not dom or dom in CONSUMER_DOMAINS:
+        return False
+    restrict = workspace_domain()
+    return (not restrict) or dom == restrict
+
+
+def backend_for(email: str) -> AuthBackend:
+    """Pick the auth backend for ONE account (not a global switch):
+
+      1. consumer domain (gmail.com/…)          -> ConsumerOAuthBackend (refresh token)
+      2. account already has a saved OAuth token -> ConsumerOAuthBackend (respect it)
+      3. Workspace domain + SA key available     -> WorkspaceDelegationBackend (impersonate)
+      4. otherwise                               -> ConsumerOAuthBackend (needs authorize)
+
+    This lets a DWD bulk upload (Workspace accounts) and Gmail-token resets run at the
+    same time — each account resolves independently.
+    """
+    dom = _email_domain(email)
+    if dom in CONSUMER_DOMAINS:
+        return ConsumerOAuthBackend()
+    if has_saved_token(email):
+        return ConsumerOAuthBackend()
+    if sa_key_available() and delegation_domain_ok(email):
+        return WorkspaceDelegationBackend()
+    return ConsumerOAuthBackend()

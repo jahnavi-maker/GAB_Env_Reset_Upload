@@ -357,7 +357,7 @@ def _run_seeder_reset(
     """
     _ensure_seeder_path()
     try:
-        from materialize.authbackend import get_backend  # type: ignore
+        from materialize.authbackend import backend_for  # type: ignore
         from materialize.provision.route import apply_mode  # type: ignore
         from materialize.runstate import ENV_ROOT, persona_file  # type: ignore
         from materialize.runner import run_populate  # type: ignore
@@ -368,7 +368,7 @@ def _run_seeder_reset(
     picked = {s.strip() for s in (services or "drive,gmail,calendar").split(",") if s.strip()}
     flags = apply_mode(mode if mode in ("seed", "delta", "reseed") else "delta")
     try:
-        creds = get_backend().credentials_for(email)
+        creds = backend_for(email).credentials_for(email)
     except Exception as exc:
         return ResetResult(False, f"no saved Google token for {email}: {exc}", mode)
 
@@ -540,9 +540,9 @@ def reverify(email: str, persona: str) -> dict | None:
         prev = json.loads(vpath.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    from materialize.authbackend import get_backend  # type: ignore
+    from materialize.authbackend import backend_for  # type: ignore
 
-    creds = get_backend().credentials_for(email)
+    creds = backend_for(email).credentials_for(email)
     picked = {k for k, val in (prev.get("expect") or {}).items() if val is not None}
     synthetic = {"expect": prev.get("expect") or {}, "folder_id": prev.get("folder_id")}
     return _verify_seed(email, folder, picked, synthetic, creds)
@@ -680,12 +680,12 @@ def reconcile_preview(email: str, persona: str) -> dict:
     """
     _ensure_seeder_path()
     from materialize.auth import build_service  # type: ignore
-    from materialize.authbackend import get_backend  # type: ignore
+    from materialize.authbackend import backend_for  # type: ignore
     from materialize.gmail_sync import GAB_LABEL  # type: ignore
 
     folder = _persona_dir(persona)
     base = _baseline_ids(email, folder)
-    creds = get_backend().credentials_for(email)
+    creds = backend_for(email).credentials_for(email)
 
     # Gmail: identity by the GAB-SEED label (message ids are unstable across threading /
     # re-insert). Baseline = labeled; orphans = unlabeled.
@@ -804,13 +804,13 @@ def _run_reconcile(
     exists yet, fall back to a full reseed to build it."""
     _ensure_seeder_path()
     from materialize.auth import build_service  # type: ignore
-    from materialize.authbackend import get_backend  # type: ignore
+    from materialize.authbackend import backend_for  # type: ignore
     from materialize.gmail_sync import GAB_LABEL  # type: ignore
 
     folder = _persona_dir(persona)
     base = _baseline_ids(email, folder)
     try:
-        creds = get_backend().credentials_for(email)
+        creds = backend_for(email).credentials_for(email)
     except Exception as exc:  # noqa: BLE001
         return ResetResult(False, f"no saved Google token for {email}: {exc}", "reconcile")
     gmail = build_service("gmail", "v1", creds)
