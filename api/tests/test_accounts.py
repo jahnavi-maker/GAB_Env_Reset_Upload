@@ -316,6 +316,60 @@ class UploadAutoRouteTest(unittest.TestCase):
         self.assertEqual(r.json()["mode"], "reseed")
 
 
+class ExplicitModeTest(unittest.TestCase):
+    """An explicit CSV `mode` is honored verbatim, overriding the persona auto-route."""
+
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+
+    def _prep(self, email: str, *, last, persona: str = "Student") -> None:
+        import asyncio
+
+        from reset_service.app import get_store
+        from reset_service.config import settings
+
+        store = get_store()
+
+        async def go() -> None:
+            await store.upsert_account(email, persona)
+            fields = {"authorized": True}
+            if last is not None:
+                fields["last_reset_persona"] = last
+            await store.patch_table(settings.accounts_table, {"email": f"eq.{email}"}, fields)
+
+        asyncio.run(go())
+
+    def test_explicit_reseed_overrides_same_persona(self) -> None:
+        # Same persona would auto-route to reconcile; explicit reseed must win.
+        email = "exp-reseed@gmail.com"
+        self._prep(email, last="Student")
+        r = self.client.post("/ui/seed", json={"email": email, "persona": "Student", "mode": "reseed"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["mode"], "reseed")
+
+    def test_explicit_reconcile_on_never_seeded(self) -> None:
+        # Never seeded would auto-route to upload; explicit reconcile is still honored.
+        email = "exp-reconcile@gmail.com"
+        self._prep(email, last=None)
+        r = self.client.post("/ui/seed", json={"email": email, "persona": "Student", "mode": "reconcile"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["mode"], "reconcile")
+
+    def test_explicit_upload_and_delta(self) -> None:
+        for mode in ("upload", "delta"):
+            email = f"exp-{mode}@gmail.com"
+            self._prep(email, last="Student")
+            r = self.client.post("/ui/seed", json={"email": email, "persona": "Student", "mode": mode})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()["mode"], mode)
+
+    def test_invalid_mode_rejected(self) -> None:
+        email = "exp-bad@gmail.com"
+        self._prep(email, last="Student")
+        r = self.client.post("/ui/seed", json={"email": email, "persona": "Student", "mode": "nuke"})
+        self.assertEqual(r.status_code, 422, r.text)
+
+
 class DelegationSeedTest(unittest.TestCase):
     """In Workspace domain-wide-delegation mode an account has no per-account OAuth token
     and no gab_accounts.authorized flag, yet Upload must still proceed (the admin

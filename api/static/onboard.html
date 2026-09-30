@@ -69,12 +69,12 @@
 
   <!-- Step 1: CSV (email, persona, password) -->
   <div class="card">
-    <div class="step">1 · Accounts (CSV: email, persona, password)</div>
-    <textarea id="csv" placeholder="email, persona, password&#10;geminiapp.gab.demo.user411@gmail.com, Applied_ML_and_data_scientist, hunter2&#10;geminiapp.gab.demo.user414@gmail.com, Backend_software_engineer, s3cret!"></textarea>
+    <div class="step">1 · Accounts (CSV: email, persona, password, mode)</div>
+    <textarea id="csv" placeholder="email, persona, password, mode&#10;geminiapp.gab.demo.user411@gmail.com, Applied_ML_and_data_scientist, hunter2, upload&#10;geminiapp.gab.demo.user414@gmail.com, Backend_software_engineer, s3cret!, reconcile"></textarea>
     <div class="bar" style="margin-top:10px">
       <label class="file">Choose CSV<input id="csvFile" type="file" accept=".csv,text/csv,text/plain" hidden></label>
       <button class="ghost" id="loadBtn">Load accounts</button>
-      <span class="hint">Each line: <b>email, persona, password</b> (any column order; persona is auto-detected). The password column is optional, stays in your browser, and is never sent to the server.</span>
+      <span class="hint">Each line: <b>email, persona, password, mode</b> (any column order; persona &amp; mode auto-detected). <b>mode</b> is optional — one of <b>upload</b> (first seed), <b>reconcile</b> (reset to baseline), <b>reseed</b> (wipe + seed), <b>delta</b> (finish/retry). Blank = auto. Password stays in your browser, never sent to the server.</span>
     </div>
   </div>
 
@@ -143,6 +143,7 @@
     try {
       localStorage.setItem(ONB_KEY, JSON.stringify(rows.map(r => ({
         email:r.email, persona:r.persona, rawP:r.rawP, valid:r.valid, password:r.password||null,
+        mode:r.mode||null,
         authorized:!!r.authorized, status:r.status, sid:r.sid||null, uid:r.uid||null,
         progress:r.progress||null, verify:r.verify||null,
       }))));
@@ -251,7 +252,13 @@
       const parts = t.split(/[,\t]/).map(x=>x.trim()).filter(x=>x.length);
       const email = parts.find(p => p.includes("@")); if (!email) continue;
       if (/^e?mail$/i.test(email)) continue;
-      const cols = parts.filter(p => p !== email && !/^(e?mail|persona|password)$/i.test(p));
+      let cols = parts.filter(p => p !== email && !/^(e?mail|persona|password|mode)$/i.test(p));
+      // Pull out an explicit operation from a `mode` column (upload|reconcile|reseed|delta),
+      // by CONTENT so column order doesn't matter. When present the server honors it instead
+      // of auto-routing; when absent the server auto-picks (never-seeded->upload, etc.).
+      const MODES = ["upload","reconcile","reseed","delta"];
+      let mode=null; const modeIdx = cols.findIndex(c => MODES.includes(c.toLowerCase()));
+      if (modeIdx>=0){ mode = cols[modeIdx].toLowerCase(); cols = cols.filter((_,j)=> j!==modeIdx); }
       // Detect the persona by CONTENT (matches a known key) so column order doesn't
       // matter; the other column is then the password.
       let persona=null, rawP=null, personaIdx=-1;
@@ -259,7 +266,7 @@
       let password=null;
       if (personaIdx>=0){ password = cols.find((c,j)=> j!==personaIdx) || null; }
       else { rawP = cols[0]||null; password = cols[1]||null; }
-      rows.push({ email:email.toLowerCase(), persona, rawP, valid:!!persona, password,
+      rows.push({ email:email.toLowerCase(), persona, rawP, valid:!!persona, password, mode,
                   authorized:false, status:"idle", sid:null, uid:null });
     }
     $("tableCard").style.display = rows.length ? "block" : "none";
@@ -274,7 +281,8 @@
       const tr = document.createElement("tr");
       tr.innerHTML =
         `<td class="email">${row.email}</td>`+
-        `<td class="persona ${row.valid?"":"bad"}">${row.valid?row.persona:("? "+(row.rawP||"missing"))}</td>`+
+        `<td class="persona ${row.valid?"":"bad"}">${row.valid?row.persona:("? "+(row.rawP||"missing"))}`+
+          `${row.mode?` <span class="hint" title="explicit mode from CSV">· ${row.mode}</span>`:""}</td>`+
         `<td class="pwcell"></td>`+
         `<td class="actcell"></td>`+
         `<td class="stcell"><span class="st ${row.status}">${statusLabel(row)}</span></td>`+
@@ -421,9 +429,11 @@
     const row=rows[i]; if(!row.authorized||!row.valid) return;
     row.status="running"; row.error=null; renderRows();
     try {
-      const r=await fetch("/ui/seed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:row.email,persona:row.persona,return_to:"/authorized"})});
+      const body={email:row.email,persona:row.persona,return_to:"/authorized"};
+      if(row.mode) body.mode=row.mode;   // explicit CSV mode -> server honors it (no auto-route)
+      const r=await fetch("/ui/seed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
       const d=await r.json(); if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
-      row.uid=d.reset_session_id; row.sid=d.reset_session_id; renderRows(); pollSeed(i);
+      row.uid=d.reset_session_id; row.sid=d.reset_session_id; if(d.mode) row.opMode=d.mode; renderRows(); pollSeed(i);
     } catch(err){ row.status="failed"; row.error=err.message; renderRows(); }
   }
   async function pollSeed(i){

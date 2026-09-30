@@ -1517,33 +1517,46 @@ async def ui_upload_verify(upload_session_id: str, store: Store = Depends(get_st
     return {"upload_session_id": upload_session_id, "verify": verify}
 
 
+# CSV `mode` -> (engine_mode, reset_sessions.mode). The operator's explicit choice.
+_EXPLICIT_MODE_MAP = {
+    "upload": ("seed", "upload"),
+    "reconcile": ("reconcile", "reconcile"),
+    "reseed": ("reseed", "reseed"),
+    "delta": ("delta", "delta"),
+}
+
+
 async def _seed_upload(
     store: Store,
     background: BackgroundTasks,
     email: str,
     persona: str,
     services: list[str] | None,
+    explicit_mode: str | None = None,
 ) -> tuple[str, str, str]:
-    """Upload = reconcile an authorized account to its persona baseline.
+    """Upload = bring an authorized account to its persona baseline.
 
-    Auto-routes by comparing the CSV persona against what the DB has seeded:
-      - never seeded            -> ``seed``   (first full seed, no wipe)
-      - same persona            -> ``delta``  (surgical: only missing/changed items)
-      - a different persona     -> ``reseed`` (wipe the old persona, seed the new one)
+    If the CSV specified a ``mode`` (upload|reconcile|reseed|delta) we HONOR it. Otherwise
+    we auto-route by comparing the CSV persona against what the DB has seeded:
+      - never seeded            -> ``seed``      (first full seed, no wipe)
+      - same persona            -> ``reconcile`` (remove agent content + restore missing)
+      - a different persona     -> ``reseed``    (wipe the old persona, seed the new one)
 
-    So a second Upload of an already-seeded account no longer errors — it delta-
-    reconciles it to baseline. Returns (id, task_id, op_mode).
+    Returns (id, task_id, op_mode).
     """
     email = email.lower()
-    last = await _last_reset_persona(store, email)
-    if not last:
-        engine_mode, row_mode = "seed", "upload"
-    elif _persona_key(last) == _persona_key(persona):
-        # already seeded with this persona -> full baseline reconcile (remove agent
-        # content + restore missing), not a restore-only delta.
-        engine_mode, row_mode = "reconcile", "reconcile"
+    if explicit_mode:
+        engine_mode, row_mode = _EXPLICIT_MODE_MAP[explicit_mode]
     else:
-        engine_mode, row_mode = "reseed", "reseed"
+        last = await _last_reset_persona(store, email)
+        if not last:
+            engine_mode, row_mode = "seed", "upload"
+        elif _persona_key(last) == _persona_key(persona):
+            # already seeded with this persona -> full baseline reconcile (remove agent
+            # content + restore missing), not a restore-only delta.
+            engine_mode, row_mode = "reconcile", "reconcile"
+        else:
+            engine_mode, row_mode = "reseed", "reseed"
     reset_session_id = str(uuid.uuid4())
     task_allocation_id = f"upload-{uuid.uuid4()}"
     await store.create({
@@ -1623,7 +1636,7 @@ async def ui_seed(
         if not acct or not acct[0].get("authorized"):
             raise HTTPException(status_code=400, detail="account not authorized yet")
     try:
-        rsid, tid, op_mode = await _seed_upload(store, background, email, req.persona, req.services)
+        rsid, tid, op_mode = await _seed_upload(store, background, email, req.persona, req.services, req.mode)
     except Exception as exc:
         if "409" in str(exc) or "duplicate" in str(exc).lower() or "conflict" in str(exc).lower():
             raise HTTPException(status_code=409, detail="an operation is already running for this account") from exc

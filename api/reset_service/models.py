@@ -35,8 +35,23 @@ class UploadRequest(BaseModel):
     # for Google access (OAuth handles that).
     password: Optional[str] = Field(default=None, repr=False, exclude=True)
     services: Optional[list[str]] = Field(default=None, description="subset of drive,gmail,calendar")
+    # Explicit operation from the CSV `mode` column: upload|reconcile|reseed|delta. When set,
+    # the server honors it instead of auto-routing by last_reset_persona.
+    mode: Optional[str] = Field(default=None, description="upload|reconcile|reseed|delta")
     # Local path to return the browser to after OAuth consent (operator UI only).
     return_to: Optional[str] = Field(default=None, description="e.g. /onboard/authorize")
+
+    @field_validator("mode")
+    @classmethod
+    def _known_mode(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip().lower()
+        if not v:
+            return None
+        if v not in {"upload", "reconcile", "reseed", "delta"}:
+            raise ValueError("mode must be one of upload, reconcile, reseed, delta")
+        return v
 
     @field_validator("email")
     @classmethod
