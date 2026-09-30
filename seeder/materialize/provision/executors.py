@@ -320,6 +320,8 @@ def checksum_of(job: Job, builder: EnvironmentBuilder) -> str | None:
             raw = Path(job.payload.get("abs") or job.source_path).read_bytes()
         else:
             raw = read_cached_bytes(job.environment_id, job.payload.get("rel") or job.source_path)
-        return hashlib.sha256(raw).hexdigest()
+        # md5, to MATCH Drive's md5Checksum — lets reconcile detect content drift by comparing
+        # the stored checksum to the live md5 with NO byte re-read (the bulk-diff fast path).
+        return hashlib.md5(raw).hexdigest()
     except Exception:
         return None

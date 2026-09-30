@@ -262,10 +262,13 @@ class JobStore:
         *,
         services: tuple[str, ...] | list[str] | None = None,
         actions: tuple[str, ...] | list[str] | None = None,
+        synthetic_ids: set[str] | tuple[str, ...] | list[str] | None = None,
     ) -> int:
         """Flip SUCCESS jobs back to PENDING so a re-run re-verifies them against live Google
         (reconcile: restore agent-deleted items, fix agent-modified ones). The store is
-        per-account, so no account filter is needed. Returns how many jobs were reset."""
+        per-account, so no account filter is needed. ``synthetic_ids`` restricts the reset to
+        just those items — the reconcile bulk-diff uses it to re-run ONLY the drifted/missing
+        baseline items instead of every one (the big speedup). Returns how many were reset."""
         now = _now()
         clauses = ["status=?"]
         args: list[Any] = [SUCCESS]
@@ -275,6 +278,12 @@ class JobStore:
         if actions:
             clauses.append(f"action IN ({','.join('?' for _ in actions)})")
             args.extend(actions)
+        if synthetic_ids is not None:
+            ids = tuple(synthetic_ids)
+            if not ids:
+                return 0  # nothing drifted -> reset nothing (fast path: reconcile is a no-op)
+            clauses.append(f"synthetic_id IN ({','.join('?' for _ in ids)})")
+            args.extend(ids)
         sql = (
             f"UPDATE jobs SET status='{PENDING}', claimed_at=NULL, error=NULL, updated_at=? "
             f"WHERE {' AND '.join(clauses)}"

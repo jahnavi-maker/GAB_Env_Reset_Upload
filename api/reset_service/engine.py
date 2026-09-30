@@ -792,6 +792,98 @@ def _live_calendar_ids(cal) -> set:
     return out
 
 
+def _live_calendar_events(cal) -> dict:
+    """{event_id: event} for primary-calendar events, carrying the fields event_needs_update
+    compares (summary/description/location/start/end). One bulk listing, so reconcile can
+    detect field drift without a per-event GET."""
+    out: dict = {}
+    tok = None
+    while True:
+        resp = cal.events().list(
+            calendarId="primary", maxResults=2500, pageToken=tok,
+            singleEvents=False, showDeleted=False,
+        ).execute()
+        for e in resp.get("items", []) or []:
+            if e.get("id"):
+                out[e["id"]] = e
+        tok = resp.get("nextPageToken")
+        if not tok:
+            break
+    return out
+
+
+def _reconcile_drift(email: str, folder: str, picked_svcs: tuple[str, ...], gmail, cal, drive) -> dict:
+    """Return {service: set(synthetic_id)} of baseline items that DRIFTED — missing (agent
+    deleted), content-changed (Drive md5), field-changed (Calendar), renamed or moved — so
+    reconcile can re-run ONLY those instead of pushing every baseline item through the queue.
+
+    CONSERVATIVE: an item is skipped only when CERTAINLY unchanged; anything we can't cheaply
+    verify (no stored md5, no live md5, unresolved parent) is marked drifted so the executor
+    makes the final call. A false 'drifted' just re-checks an unchanged item (harmless); a
+    false 'unchanged' would miss a reset, so we never skip on doubt."""
+    from materialize.provision.store import JobStore, SUCCESS  # type: ignore
+    from materialize.provision.executors import parent_folder_id  # type: ignore
+    from materialize.drive_sync import list_owned_files_index  # type: ignore
+    from materialize.calendar_sync import event_needs_update  # type: ignore
+
+    drift: dict = {s: set() for s in picked_svcs}
+    sp = _acct_dir(email, folder) / "provision.sqlite"
+    if not sp.exists():
+        return drift
+    _nolog = lambda _m: None  # noqa: E731
+    live_drive = list_owned_files_index(drive, _nolog) if "drive" in picked_svcs else {}
+    live_mail = _live_gmail_ids(gmail) if "gmail" in picked_svcs else set()
+    live_cal = _live_calendar_events(cal) if "calendar" in picked_svcs else {}
+
+    def _is_md5(s: str) -> bool:
+        return len(s) == 32 and all(c in "0123456789abcdef" for c in s)
+
+    js = JobStore(sp)
+    try:
+        for job in js.list_account(email):
+            svc = job.service
+            if svc not in picked_svcs or job.status != SUCCESS or job.action not in _BASELINE_ACTIONS:
+                continue
+            gid = str(job.google_object_id or "")
+            if not gid or gid in ("", "wiped"):
+                drift[svc].add(job.synthetic_id)
+                continue
+            if svc == "gmail":
+                if gid not in live_mail:  # messages are immutable -> only "missing" is drift
+                    drift["gmail"].add(job.synthetic_id)
+            elif svc == "calendar":
+                ev = live_cal.get(gid)
+                if ev is None or event_needs_update(job.payload.get("body") or {}, ev):
+                    drift["calendar"].add(job.synthetic_id)
+            elif svc == "drive":
+                lf = live_drive.get(gid)
+                if lf is None:  # agent deleted it
+                    drift["drive"].add(job.synthetic_id)
+                    continue
+                want_name = str(job.payload.get("filename") or job.payload.get("name") or "")
+                if want_name and lf.get("name") != want_name:  # renamed
+                    drift["drive"].add(job.synthetic_id)
+                    continue
+                try:
+                    want_parent = parent_folder_id(js, job, job.payload)
+                except Exception:
+                    drift["drive"].add(job.synthetic_id)
+                    continue
+                if want_parent and want_parent not in (lf.get("parents") or ()):  # moved
+                    drift["drive"].add(job.synthetic_id)
+                    continue
+                if job.action == "upload":  # content: stored md5 vs live md5, no byte read
+                    ck = (job.checksum or "").lower()
+                    live_md5 = (lf.get("md5") or "").lower()
+                    if not _is_md5(ck) or not live_md5 or ck != live_md5:
+                        drift["drive"].add(job.synthetic_id)
+                        continue
+                # else: exists, right name/parent, matching content -> unchanged -> skip
+    finally:
+        js.close()
+    return drift
+
+
 def _owned_drive_files(drive) -> list:
     """(id, parent) for every file/folder the account OWNS (skips 'shared with me' and
     trashed). One listing; parent chain is used to decide 'under the seed folder'."""
@@ -1048,10 +1140,13 @@ def _run_reconcile(
         log.warning("drive emptyTrash failed: %s", exc)
     log.info("reconcile %s removed orphans=%s", email, deleted)
 
-    # FULL RE-VERIFY: a delta normally skips jobs already SUCCESS, so it would NOT restore an
-    # item the agent deleted nor fix one the agent modified. Flip the baseline jobs back to
-    # PENDING so the delta re-checks EVERY item against live Google — the executors then
-    # restore missing, overwrite drifted (Drive md5 / Calendar fields), and skip unchanged.
+    # RE-VERIFY via BULK-DIFF: a delta normally skips jobs already SUCCESS, so it would NOT
+    # restore an item the agent deleted nor fix one it modified. Rather than flip EVERY
+    # baseline job to PENDING (which pushes all N items — often thousands of GitHub files —
+    # through the queue just to skip the unchanged ones), compute the drift in-process from
+    # bulk listings + the manifest's stored md5s, and reset ONLY the items that actually
+    # changed. Unchanged items never touch the queue. Falls back to a full re-verify if the
+    # diff can't be computed, so correctness is never traded for speed.
     # (Only meaningful on the trusted-delta path; the reseed below wipes the store anyway.)
     if not manifest_untrusted:
         try:
@@ -1059,17 +1154,36 @@ def _run_reconcile(
 
             sp = _acct_dir(email, folder) / "provision.sqlite"
             if sp.exists():
+                drift = _reconcile_drift(email, folder, picked_svcs, gmail, cal, drive)
+                drifted_ids: set = set()
+                for s in picked_svcs:
+                    drifted_ids |= drift.get(s, set())
                 js = JobStore(sp)
                 try:
                     n = js.reset_to_pending(
                         services=picked_svcs,
                         actions=_BASELINE_ACTIONS,
+                        synthetic_ids=drifted_ids,
                     )
                 finally:
                     js.close()
-                log.info("reconcile re-verify: reset %s baseline jobs to PENDING for %s", n, email)
-        except Exception as exc:  # noqa: BLE001 - re-verify is best-effort; fall back to plain delta
-            log.warning("reconcile reset_to_pending failed for %s: %s", email, exc)
+                log.info("reconcile bulk-diff %s: drift gmail=%d calendar=%d drive=%d -> re-run %d items",
+                         email, len(drift.get("gmail", set())), len(drift.get("calendar", set())),
+                         len(drift.get("drive", set())), n)
+        except Exception as exc:  # noqa: BLE001 - bulk-diff failed -> full re-verify (safe, slow)
+            log.warning("reconcile bulk-diff failed for %s: %s; full re-verify fallback", email, exc)
+            try:
+                from materialize.provision.store import JobStore  # type: ignore
+
+                sp = _acct_dir(email, folder) / "provision.sqlite"
+                if sp.exists():
+                    js = JobStore(sp)
+                    try:
+                        js.reset_to_pending(services=picked_svcs, actions=_BASELINE_ACTIONS)
+                    finally:
+                        js.close()
+            except Exception as exc2:  # noqa: BLE001
+                log.warning("reconcile full re-verify fallback also failed for %s: %s", email, exc2)
 
     # Restore the baseline. Untrusted manifest (empty or incomplete) -> full reseed (wipe
     # store + seed + rebuild a clean manifest); otherwise a delta that (after the reset
