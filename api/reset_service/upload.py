@@ -95,7 +95,10 @@ def save_client(raw: bytes) -> dict[str, Any]:
         return {"kind": "service_account", "delegation": True,
                 "domain": workspace_domain(), **(info or {})}
     info = save_web_client(raw)
-    reset_backend()  # a web client was (re)uploaded — rebuild the backend on next use
+    # Explicitly pin consumer mode so dropping a web client switches BACK from a prior
+    # delegation setup (the SA key file/env would otherwise keep delegation sticky).
+    os.environ["ENV_LOADER_AUTH_BACKEND"] = "consumer_oauth"
+    reset_backend()
     return {"kind": "web", "delegation": False, **(info or {})}
 
 
