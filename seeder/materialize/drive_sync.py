@@ -294,36 +294,69 @@ def upload_bytes(
     raw: bytes,
     mime: str,
     log: Callable[[str], None],
+    tries: int = 6,
 ) -> str:
-    """Create one Drive file and return its id. Media uploads are not batched."""
+    """Create one Drive file and return its id. Media uploads are not batched.
+
+    IDEMPOTENT on retry: a plain ``_retry`` around files().create() can DUPLICATE a file
+    when the create succeeds server-side but the response stalls (the retry creates a second
+    copy). Here, before every retry we look for the same-name child already in the parent:
+    if it exists at the right size we reuse it (no duplicate); a wrong-size leftover from a
+    torn upload is trashed and re-created. Each attempt rebuilds the media (a consumed
+    BytesIO can't be replayed).
+    """
     safe_name = str(name)[:200]
-    if not raw:
-        created = _retry(
-            lambda: drive.files()
-            .create(
-                body={"name": safe_name, "parents": [parent_id]},
-                fields="id",
-            )
-            .execute(),
-            log,
+    size = len(raw)
+
+    def _fresh_media():
+        if not raw:
+            return None
+        return MediaIoBaseUpload(
+            io.BytesIO(raw),
+            mimetype=mime or "application/octet-stream",
+            resumable=size > 5 * 1024 * 1024,
         )
-        return str(created["id"])
-    media = MediaIoBaseUpload(
-        io.BytesIO(raw),
-        mimetype=mime or "application/octet-stream",
-        resumable=len(raw) > 5 * 1024 * 1024,
-    )
-    created = _retry(
-        lambda: drive.files()
-        .create(
-            body={"name": safe_name, "parents": [parent_id]},
-            media_body=media,
-            fields="id",
-        )
-        .execute(),
-        log,
-    )
-    return str(created["id"])
+
+    delay = 1.0
+    for i in range(tries):
+        if i > 0:
+            # A prior attempt may have already created the file before the stall/error.
+            try:
+                existing = find_child_file(drive, parent_id, safe_name, log)
+            except Exception:  # noqa: BLE001 - existence check is best-effort
+                existing = None
+            if existing and existing[0] == size:
+                log(f"Idempotent upload: {safe_name} already present, not duplicating")
+                return existing[1]
+            if existing and existing[1]:
+                try:  # partial/wrong-size leftover -> replace it
+                    trash_file(drive, existing[1], log)
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            body = {"name": safe_name, "parents": [parent_id]}
+            kwargs: dict[str, Any] = {"body": body, "fields": "id"}
+            media = _fresh_media()
+            if media is not None:
+                kwargs["media_body"] = media
+            created = drive.files().create(**kwargs).execute()
+            return str(created["id"])
+        except HttpError as exc:
+            status = getattr(exc.resp, "status", None)
+            if status in (403, 429, 500, 503) and i < tries - 1:
+                log(f"Drive API {status}, retrying in {delay:.0f}s")
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
+            raise
+        except (socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
+            if i < tries - 1:
+                log(f"Drive network stall ({type(exc).__name__}), retrying in {delay:.0f}s")
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
+            raise
+    raise RuntimeError(f"upload_bytes exhausted retries for {safe_name}")
 
 
 def ensure_child_folder(
