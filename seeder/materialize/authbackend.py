@@ -41,8 +41,10 @@ DEFAULT_WORKSPACE_DOMAIN = "deccanexperts.us"
 # delegation (SA) key is loaded for Workspace accounts.
 CONSUMER_DOMAINS = {"gmail.com", "googlemail.com"}
 # DWD tokens fail if we ask for openid / userinfo.email and Admin only authorized the APIs.
+# Full https://mail.google.com/ (granted in the DWD config for teamdeccan.us + deccanexperts.us)
+# so delegated accounts can HARD-DELETE mail (batchDelete) on reseed, matching consumer scope.
 DWD_SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify",
+    "https://mail.google.com/",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/drive",
 ]
@@ -489,7 +491,7 @@ class WorkspaceDelegationBackend:
                 f"(unauthorized_client). In admin.google.com → Security → API controls → "
                 f"Domain-wide delegation, the Client ID must be {cid or '(open the JSON: client_id)'} "
                 "and the scopes must include exactly: "
-                "https://www.googleapis.com/auth/gmail.modify,"
+                "https://mail.google.com/,"
                 "https://www.googleapis.com/auth/calendar,"
                 "https://www.googleapis.com/auth/drive. "
                 "Also on the gab-seed service account in Cloud Console, turn on "
