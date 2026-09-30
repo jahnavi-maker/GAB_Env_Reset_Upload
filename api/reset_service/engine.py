@@ -603,6 +603,24 @@ def _gmail_ids_by_query(gmail, q: str) -> set:
     return out
 
 
+def _live_gmail_ids(gmail) -> set:
+    """Every live (non-trash, non-spam) message id in the mailbox — for manifest-based
+    reconcile: orphans = live − manifest baseline, missing = baseline − live."""
+    out: set = set()
+    tok = None
+    while True:
+        resp = gmail.users().messages().list(
+            userId="me", maxResults=500, includeSpamTrash=False, pageToken=tok
+        ).execute()
+        for m in resp.get("messages", []) or []:
+            if m.get("id"):
+                out.add(m["id"])
+        tok = resp.get("nextPageToken")
+        if not tok:
+            break
+    return out
+
+
 def _live_calendar_ids(cal) -> set:
     out: set = set()
     tok = None
@@ -681,21 +699,21 @@ def reconcile_preview(email: str, persona: str) -> dict:
     _ensure_seeder_path()
     from materialize.auth import build_service  # type: ignore
     from materialize.authbackend import backend_for  # type: ignore
-    from materialize.gmail_sync import GAB_LABEL  # type: ignore
 
     folder = _persona_dir(persona)
     base = _baseline_ids(email, folder)
     creds = backend_for(email).credentials_for(email)
 
-    # Gmail: identity by the GAB-SEED label (message ids are unstable across threading /
-    # re-insert). Baseline = labeled; orphans = unlabeled.
+    # Gmail: identity by MANIFEST message ids (same as Calendar/Drive) — NOT the GAB-SEED
+    # label. Orphans = live messages whose id isn't in the manifest (agent-added, or stale
+    # duplicate copies from a re-seed). Exact, and immune to a reply inheriting the label.
     gmail = build_service("gmail", "v1", creds)
-    g_orphans = _gmail_ids_by_query(gmail, f"-label:{GAB_LABEL}")
-    g_baseline = _gmail_ids_by_query(gmail, f"label:{GAB_LABEL}")
+    g_live = _live_gmail_ids(gmail)
+    g_orphans = g_live - base["gmail"]
     services: dict = {
         "gmail": {
-            "baseline": len(g_baseline),
-            "live": len(g_baseline) + len(g_orphans),
+            "baseline": len(base["gmail"]),
+            "live": len(g_live),
             "orphans": len(g_orphans),
             "orphan_ids": sorted(g_orphans)[:50],
         }
@@ -719,8 +737,8 @@ def reconcile_preview(email: str, persona: str) -> dict:
         "orphans": len(c_orphans),
         "orphan_ids": c_orphans[:50],
     }
-    # "never seeded" = no manifest for the manifest-backed surfaces (calendar/drive).
-    manifest_empty = not (base["calendar"] or base["drive"])
+    # "never seeded" = no manifest for any surface (gmail/calendar/drive).
+    manifest_empty = not (base["gmail"] or base["calendar"] or base["drive"])
     log.info("reconcile dry-run %s persona=%s manifest_empty=%s :: %s", email, folder,
              manifest_empty, {s: services[s]["orphans"] for s in services})
     return {"email": email, "persona": folder, "manifest_empty": manifest_empty,
@@ -805,7 +823,6 @@ def _run_reconcile(
     _ensure_seeder_path()
     from materialize.auth import build_service  # type: ignore
     from materialize.authbackend import backend_for  # type: ignore
-    from materialize.gmail_sync import GAB_LABEL  # type: ignore
 
     folder = _persona_dir(persona)
     base = _baseline_ids(email, folder)
@@ -817,18 +834,17 @@ def _run_reconcile(
     cal = build_service("calendar", "v3", creds)
     drive = build_service("drive", "v3", creds)
 
-    # "Never seeded" = no manifest for the manifest-backed surfaces (calendar/drive). Then
-    # the diff treats ALL current content as orphans → full nuke, and a forced reseed
-    # rebuilds baseline + manifest + Gmail labels. We never fall back to a marker-only
-    # reseed (it would leave unlabeled agent content behind).
-    manifest_empty = not (base["calendar"] or base["drive"])
+    # "Never seeded" = no manifest for ANY surface. Then the diff treats ALL current content
+    # as orphans → full nuke, and a forced reseed rebuilds baseline + manifest. We never fall
+    # back to a marker-only reseed (it would leave agent content behind).
+    manifest_empty = not (base["gmail"] or base["calendar"] or base["drive"])
     if manifest_empty:
         log.info("reconcile: no manifest for %s -> full nuke + seed", email)
 
-    # Gmail: delete unlabeled (baseline = GAB-SEED-labeled). Calendar: delete events not in
-    # the manifest. Drive: delete owned files not recorded in the manifest AND not under a
-    # manifest-recorded folder (robust vs per-file gaps on big github repos).
-    g_orphans = _gmail_ids_by_query(gmail, f"-label:{GAB_LABEL}")
+    # All three surfaces identify the baseline by MANIFEST google_object_id (exact, no label):
+    # orphans = live items whose id isn't in the manifest (agent-added or stale re-seed dups).
+    # Drive additionally keeps anything under a manifest-recorded folder (github-repo ancestry).
+    g_orphans = _live_gmail_ids(gmail) - base["gmail"]
     c_orphans = _live_calendar_ids(cal) - base["calendar"]
     d_orphans = _drive_orphans(drive, base["drive"])
     deleted = {
