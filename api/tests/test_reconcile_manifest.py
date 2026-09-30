@@ -92,5 +92,35 @@ class ManifestIncompleteTests(unittest.TestCase):
                 self.assertFalse(engine._manifest_incomplete("a@b.com", "P", ("drive",)))
 
 
+class LegacyWrapperTests(unittest.TestCase):
+    """A manifest that still has the GAB_UltraEvals wrapper must route reconcile to a full
+    reseed so the account migrates to the clean no-wrapper layout."""
+
+    def _run(self, folder_names):
+        with tempfile.TemporaryDirectory() as td:
+            store = JobStore(Path(td) / "provision.sqlite")
+            for i, name in enumerate(folder_names):
+                store.upsert(Job(
+                    job_id="", account_id="a@b.com", persona_id="P", environment_id="P",
+                    service="drive", action="create_folder", synthetic_id=f"f{i}",
+                    source_type="generated", google_object_id=f"F{i}",
+                    payload={"name": name, "parent": "root"}, status=SUCCESS,
+                ))
+            store.close()
+            with patch.object(engine, "_acct_dir", return_value=Path(td)):
+                return engine._manifest_has_legacy_wrapper("a@b.com", "P")
+
+    def test_detects_wrapper(self):
+        self.assertTrue(self._run(["architecture", "GAB_UltraEvals__Backend_software_engineer", "memos"]))
+
+    def test_clean_no_wrapper(self):
+        self.assertFalse(self._run(["architecture", "memos", "Github", "reports"]))
+
+    def test_no_store(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(engine, "_acct_dir", return_value=Path(td)):
+                self.assertFalse(engine._manifest_has_legacy_wrapper("a@b.com", "P"))
+
+
 if __name__ == "__main__":
     unittest.main()

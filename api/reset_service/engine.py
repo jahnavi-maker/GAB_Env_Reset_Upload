@@ -696,6 +696,38 @@ def _baseline_ids(email: str, folder: str) -> dict[str, set]:
 _BASELINE_ACTIONS = ("insert_message", "insert_event", "upload", "create_folder")
 
 
+def _manifest_has_legacy_wrapper(email: str, folder: str) -> bool:
+    """True if the account's manifest still contains a legacy ``GAB_UltraEvals__<persona>``
+    wrapper folder — i.e. it was seeded before the no-wrapper migration (generated files now
+    live directly in My Drive root). Such a manifest can't be reconciled into the clean
+    layout in place (its items are recorded under the wrapper), so the reconcile treats it
+    as untrusted and does a full reseed, which rebuilds a wrapper-free baseline + md5
+    manifest (and thereby also enables the fast bulk-diff on future reconciles)."""
+    p = _acct_dir(email, folder) / "provision.sqlite"
+    if not p.exists():
+        return False
+    import sqlite3
+
+    try:
+        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        try:
+            rows = con.execute(
+                "SELECT payload FROM jobs WHERE service='drive' AND action='create_folder'"
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+    for (payload,) in rows:
+        try:
+            name = str((json.loads(payload or "{}") or {}).get("name") or "")
+        except (TypeError, ValueError):
+            name = ""
+        if name.startswith("GAB_UltraEvals"):
+            return True
+    return False
+
+
 def _manifest_incomplete(email: str, folder: str, services: tuple[str, ...]) -> bool:
     """True when the manifest can't be trusted to compute orphans for a reconcile.
 
@@ -1090,10 +1122,19 @@ def _run_reconcile(
     manifest_empty = not (base["gmail"] or base["calendar"] or base["drive"])
     # An INCOMPLETE manifest (interrupted/partial prior seed) can't be trusted for orphan
     # diffing — it would delete genuinely-seeded Gmail/Calendar items whose ids weren't
-    # recorded. Fall back to the same full nuke + reseed, which rebuilds a clean manifest.
-    manifest_untrusted = manifest_empty or _manifest_incomplete(email, folder, picked_svcs)
+    # recorded. A LEGACY-WRAPPER manifest (seeded before the no-wrapper migration) records
+    # its items under a GAB_UltraEvals__<persona> folder and can't be reconciled into the
+    # clean root layout in place. Both fall back to a full nuke + reseed, which rebuilds a
+    # clean, wrapper-free baseline + md5 manifest.
+    legacy_wrapper = _manifest_has_legacy_wrapper(email, folder)
+    manifest_untrusted = (
+        manifest_empty or _manifest_incomplete(email, folder, picked_svcs) or legacy_wrapper
+    )
     if manifest_empty:
         log.info("reconcile: no manifest for %s -> full nuke + seed", email)
+    elif legacy_wrapper:
+        log.warning("reconcile: %s has a legacy GAB_UltraEvals wrapper -> full reseed to "
+                    "migrate to the no-wrapper layout (+ md5 manifest)", email)
     elif manifest_untrusted:
         log.warning("reconcile: manifest for %s is incomplete (interrupted/partial seed) "
                     "-> full nuke + reseed instead of an untrusted orphan diff", email)

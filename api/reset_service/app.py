@@ -1611,10 +1611,18 @@ async def ui_account(email: str, store: Store = Depends(get_store)) -> dict:
     # admin service-account impersonates it). Consumer/token accounts are NOT delegated
     # here and still need their saved OAuth token.
     delegated = upload.account_uses_delegation(email)
+    # "authorized" must reflect a credential USABLE ON THIS SERVER: a saved OAuth token
+    # (consumer) or domain delegation (Workspace). The gab_accounts.authorized flag lives
+    # in shared Supabase and can be True from a *prior* server even when no token exists on
+    # this box (tokens are per-server on disk and don't migrate) — trusting it made the UI
+    # show "authorized ✓" for accounts a reset would fail on. So gate on the real token.
+    has_token = _seeder_token_exists(email)
     return {
         "email": email.lower(),
-        "authorized": bool(r.get("authorized")) or _seeder_token_exists(email) or delegated,
+        "authorized": has_token or delegated,
         "delegated": delegated,
+        "has_token": has_token,
+        "db_flag": bool(r.get("authorized")),  # surfaced for clarity; not used for the gate
         "persona": r.get("persona"),
         "last_reset_persona": r.get("last_reset_persona"),
     }
