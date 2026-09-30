@@ -4,17 +4,22 @@ from collections.abc import Callable
 from typing import Any
 
 from materialize.auth import build_service
-from materialize.drive_sync import SEED_FOLDER, find_seed_folder
-from materialize.gmail_sync import GAB_LABEL
-from materialize.calendar_sync import SEED_PROP
+from materialize.drive_sync import SEED_FOLDER, find_seed_folder, _retry as _drive_retry
+from materialize.gmail_sync import GAB_LABEL, _retry as _gmail_retry
+from materialize.calendar_sync import SEED_PROP, _retry as _cal_retry
+
+# Verification is authoritative (its result gates whether a reset is reported clean), so
+# its read calls MUST NOT fail on a single transient 429/5xx/network stall — that would
+# make a good reset look dirty (or, worse, silently skip verification). Every .execute()
+# below is wrapped in the same per-service retry the seed/reconcile writes already use.
 
 
-def _count_calendar(calendar) -> int:
+def _count_calendar(calendar, log: Callable[[str], None]) -> int:
     total = 0
     page = None
     while True:
-        resp = (
-            calendar.events()
+        resp = _cal_retry(
+            lambda: calendar.events()
             .list(
                 calendarId="primary",
                 privateExtendedProperty=f"{SEED_PROP}=true",
@@ -22,7 +27,8 @@ def _count_calendar(calendar) -> int:
                 pageToken=page,
                 showDeleted=False,
             )
-            .execute()
+            .execute(),
+            log,
         )
         total += len(resp.get("items") or [])
         page = resp.get("nextPageToken")
@@ -31,23 +37,24 @@ def _count_calendar(calendar) -> int:
     return total
 
 
-def _gmail_label_id(gmail) -> str | None:
-    labels = gmail.users().labels().list(userId="me").execute().get("labels") or []
-    for lab in labels:
+def _gmail_label_id(gmail, log: Callable[[str], None]) -> str | None:
+    resp = _gmail_retry(lambda: gmail.users().labels().list(userId="me").execute(), log)
+    for lab in resp.get("labels") or []:
         if lab.get("name") == GAB_LABEL:
             return lab["id"]
     return None
 
 
-def _live_gmail_message_ids(gmail) -> set:
+def _live_gmail_message_ids(gmail, log: Callable[[str], None]) -> set:
     out: set = set()
     page = None
     while True:
-        resp = (
-            gmail.users()
+        resp = _gmail_retry(
+            lambda: gmail.users()
             .messages()
             .list(userId="me", maxResults=500, includeSpamTrash=False, pageToken=page)
-            .execute()
+            .execute(),
+            log,
         )
         out |= {m["id"] for m in resp.get("messages") or [] if m.get("id")}
         page = resp.get("nextPageToken")
@@ -56,23 +63,24 @@ def _live_gmail_message_ids(gmail) -> set:
     return out
 
 
-def _count_gmail(gmail, baseline_ids: set | None = None) -> int:
+def _count_gmail(gmail, log: Callable[[str], None], baseline_ids: set | None = None) -> int:
     # Manifest-based (preferred): how many seeded messages (by google_object_id) are
     # actually live. Label-independent, so an agent reply that inherited GAB-SEED can't
     # inflate the count. Falls back to the GAB-SEED label only when no manifest is given.
     if baseline_ids is not None:
-        return len(_live_gmail_message_ids(gmail) & set(baseline_ids))
-    label_id = _gmail_label_id(gmail)
+        return len(_live_gmail_message_ids(gmail, log) & set(baseline_ids))
+    label_id = _gmail_label_id(gmail, log)
     if not label_id:
         return 0
     total = 0
     page = None
     while True:
-        resp = (
-            gmail.users()
+        resp = _gmail_retry(
+            lambda: gmail.users()
             .messages()
             .list(userId="me", labelIds=[label_id], maxResults=500, pageToken=page)
-            .execute()
+            .execute(),
+            log,
         )
         total += len(resp.get("messages") or [])
         page = resp.get("nextPageToken")
@@ -81,7 +89,7 @@ def _count_gmail(gmail, baseline_ids: set | None = None) -> int:
     return total
 
 
-def _count_drive(drive, folder_id: str | None) -> int:
+def _count_drive(drive, folder_id: str | None, log: Callable[[str], None]) -> int:
     # Generated files now live directly in My Drive (no GAB_UltraEvals wrapper), so with no
     # explicit folder we count from the My Drive root, skipping the Github folder + zip.
     count = 0
@@ -90,15 +98,16 @@ def _count_drive(drive, folder_id: str | None) -> int:
         fid = folders.pop()
         page = None
         while True:
-            resp = (
-                drive.files()
+            resp = _drive_retry(
+                lambda: drive.files()
                 .list(
                     q=f"'{fid}' in parents and trashed = false",
                     fields="nextPageToken, files(id, mimeType, name)",
                     pageSize=100,
                     pageToken=page,
                 )
-                .execute()
+                .execute(),
+                log,
             )
             for item in resp.get("files") or []:
                 if item.get("mimeType") == "application/vnd.google-apps.folder":
@@ -136,10 +145,10 @@ def verify_seed(
     if not folder_id:
         folder_id = find_seed_folder(drive, persona, log)
 
-    got_cal = _count_calendar(calendar) if expect_calendar is not None else None
+    got_cal = _count_calendar(calendar, log) if expect_calendar is not None else None
     # Gmail: count by manifest ids when available (label-independent), else by GAB-SEED label.
-    got_mail = _count_gmail(gmail, gmail_baseline) if expect_gmail is not None else None
-    got_drive = _count_drive(drive, folder_id) if expect_drive is not None else None
+    got_mail = _count_gmail(gmail, log, gmail_baseline) if expect_gmail is not None else None
+    got_drive = _count_drive(drive, folder_id, log) if expect_drive is not None else None
 
     def tone(got: int | None, expect: int | None) -> str:
         if got is None or expect is None:

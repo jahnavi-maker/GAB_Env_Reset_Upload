@@ -122,5 +122,52 @@ class FallbackChainTests(unittest.TestCase):
         self.assertTrue(res.success, res.detail)
 
 
+class CleanGateTests(unittest.TestCase):
+    """A reset that left the environment short of baseline must NOT be reported clean —
+    otherwise last_reset_persona advances and the next eval runs on a dirty account."""
+
+    def test_ok_status_no_verify_is_clean(self):
+        self.assertTrue(engine._reset_is_clean("ok", None))
+
+    def test_ok_status_verify_ok_is_clean(self):
+        self.assertTrue(engine._reset_is_clean("ok", {"overall": "ok"}))
+
+    def test_partial_status_is_not_clean(self):
+        # some baseline jobs hit PERMANENT_FAILURE -> items missing.
+        self.assertFalse(engine._reset_is_clean("partial", {"overall": "ok"}))
+
+    def test_failed_status_is_not_clean(self):
+        self.assertFalse(engine._reset_is_clean("failed", None))
+
+    def test_none_status_is_not_clean(self):
+        self.assertFalse(engine._reset_is_clean(None, {"overall": "ok"}))
+
+    def test_ok_status_but_verify_empty_module_is_not_clean(self):
+        # object recorded SUCCESS but a whole module is empty on read-back.
+        self.assertFalse(engine._reset_is_clean("ok", {"overall": "failed"}))
+
+    def test_ok_status_verify_short_count_stays_clean(self):
+        # verify "partial" (short/over) can be legitimate agent drift on a delta;
+        # reconcile owns that, so the seed path does not fail on it.
+        self.assertTrue(engine._reset_is_clean("ok", {"overall": "partial"}))
+
+    def test_verify_inconclusive_falls_back_to_status(self):
+        # verify couldn't run (None) -> don't block a good reset, but don't rescue a bad one.
+        self.assertTrue(engine._reset_is_clean("ok", None))
+        self.assertFalse(engine._reset_is_clean("partial", None))
+
+    def test_degraded_reason_reports_permanent_failures(self):
+        acct = {"skips": {"permanent": 3}, "error": "HttpError 403"}
+        reason = engine._degraded_reason("partial", acct, None)
+        self.assertIn("3", reason)
+        self.assertIn("permanent", reason.lower())
+
+    def test_degraded_reason_reports_empty_verify_module(self):
+        verify = {"overall": "failed", "modules": {"gmail": {"tone": "err"}, "drive": {"tone": "ok"}}}
+        reason = engine._degraded_reason("ok", {}, verify)
+        self.assertIn("gmail", reason)
+        self.assertNotIn("drive", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -104,6 +104,20 @@ class Pipeline:
         }
         self.retries = {name: RetryHeap() for name in self.queues}
         self.stop = threading.Event()
+        # Job ids a LIVE worker is currently executing. The reaper reclaims a stale
+        # PROCESSING row only when it is NOT here — i.e. its worker died or the process
+        # restarted — so a slow-but-alive job is never re-queued into a concurrent second
+        # execution (which would duplicate a Gmail/Calendar insert). See _run_one/_reaper.
+        self._inflight: set[str] = set()
+        self._inflight_lock = threading.Lock()
+        # One Credentials object per account, shared across that account's service workers.
+        # This is intentional and safe in CPython: google.auth refreshes the token in place
+        # on expiry, and the attribute writes (.token/.expiry) are individually GIL-atomic,
+        # so a concurrent double-refresh just fetches a valid token twice — no corruption.
+        # A raw 401 that survives the client's own auto-refresh means the refresh itself
+        # failed (revoked / invalid_grant), which classify_error correctly treats as
+        # PERMANENT for that account. Do NOT deep-copy creds per thread: service-account
+        # (delegated) credentials hold a signer that is not safely copyable.
         self._creds = {w.email: w.creds for w in works}
         self._logs = {w.email: (w.log or log) for w in works}
         self._attachments: dict[str, dict[str, bytes]] = {}
@@ -147,10 +161,32 @@ class Pipeline:
         extra = dict(job.extra)
         extra.update({k: v for k, v in result.items() if k != "id"})
         self.store.persist_success(job.job_id, result.get("id"), extra=extra)
+        self._audit(job, result)
         if self.cfg.checksum_workers and job.service == "drive" and job.action == "upload":
             fresh = self.store.get(job.job_id)
             if fresh:
                 self._checksums.put(fresh)
+
+    def _audit(self, job: Job, result: dict[str, Any]) -> None:
+        """One account-attributed line per state-MUTATING op, so a reset leaves a per-object
+        trail ("restored/overwrote/deleted <id>") that proves the environment was cleaned.
+        No-op verifications (an item already matching baseline) are not logged — the
+        got/expect verify summary covers those, and logging every unchanged item across a
+        200-account reconcile would bury the actual changes."""
+        if job.service == "generate":
+            return
+        oid = result.get("id")
+        if job.action == "wipe":
+            n = result.get("trashed") or result.get("deleted") or 0
+            self._alog(job.account_id, f"AUDIT {job.service} wipe: removed {n} item(s)")
+            return
+        if result.get("skipped"):
+            return  # unchanged — matches baseline, nothing mutated
+        verb = "reset(overwrote)" if result.get("updated") else "applied"
+        self._alog(
+            job.account_id,
+            f"AUDIT {job.service}/{job.action} {verb} id={oid} sid={job.synthetic_id}",
+        )
 
     def _fail_job(self, job: Job, exc: BaseException) -> None:
         kind = classify_error(exc)
@@ -198,6 +234,8 @@ class Pipeline:
         if job.action == "wipe":
             self.store.reset_children_after_wipe(job.account_id, job.service)
         self.store.mark(job.job_id, PROCESSING, claimed=True)
+        with self._inflight_lock:
+            self._inflight.add(job.job_id)
         self.limiters.acquire(job.service, job.account_id)
         started = time.monotonic()
         try:
@@ -219,6 +257,12 @@ class Pipeline:
                 server=is_server_error(exc),
             )
             self._fail_job(job, exc)
+        finally:
+            # Release the fence whether we succeeded or failed. A hard thread kill can't
+            # happen in CPython (exceptions are caught above), so this always runs and the
+            # reaper's view of "who is alive" stays accurate.
+            with self._inflight_lock:
+                self._inflight.discard(job.job_id)
 
     def _worker(self, service: str, name: str) -> None:
         executor = JobExecutor(
@@ -259,7 +303,11 @@ class Pipeline:
 
     def _reaper(self) -> None:
         while not self.stop.is_set():
-            stale = self.store.reclaim_stale(self.cfg.stale_processing_s)
+            with self._inflight_lock:
+                busy = set(self._inflight)
+            # Only reclaim PROCESSING rows whose worker is NOT live here (crashed thread or
+            # a previous process that left orphaned rows). A slow-but-alive job stays fenced.
+            stale = self.store.reclaim_stale(self.cfg.stale_processing_s, exclude_ids=busy)
             for job in stale:
                 self.queues[job.service].put(job)
                 self.log(f"Reclaimed stale {job.service}/{job.synthetic_id} for {job.account_id}")

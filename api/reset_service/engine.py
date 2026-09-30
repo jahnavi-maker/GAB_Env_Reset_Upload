@@ -408,19 +408,74 @@ def _run_seeder_reset(
     except Exception as exc:
         log.exception("seeder reset failed for %s", email)
         return ResetResult(False, f"{type(exc).__name__}: {exc}", mode)
-    status = (result.get("accounts") or {}).get(email, {}).get("status")
-    # Best-effort post-seed verification: count what actually landed per service and
-    # persist it durably (in the account's store dir) so the Upload page can show real
-    # verified counts that survive a refresh. Never let verification fail the reset.
+    acct = (result.get("accounts") or {}).get(email, {})
+    status = acct.get("status")
+    # Post-seed verification: count what actually landed per service and persist it durably
+    # (in the account's store dir) so the Upload page shows real verified counts across a
+    # refresh. This is AUTHORITATIVE, not cosmetic — its result feeds the clean/dirty gate
+    # below. The counts are retry-wrapped inside verify_seed, so reaching the except here
+    # means verification was genuinely inconclusive (not that the reset failed); we then
+    # fall back to the pipeline status alone rather than blocking a good reset.
+    verify = None
     try:
         verify = _verify_seed(email, folder, picked, result, creds)
         if verify:
             result["verify"] = verify
     except Exception as exc:  # noqa: BLE001
-        log.warning("post-seed verify failed for %s: %s", email, exc)
-    if status in (None, "ok", "partial"):
+        log.warning("post-seed verify inconclusive for %s: %s", email, exc)
+    # A reset is CLEAN only when the pipeline applied every planned baseline item
+    # (status == "ok": no PERMANENT_FAILURE jobs) AND verification didn't find a whole
+    # module empty when it should have content (verify overall == "failed"). status ==
+    # "partial" means some baseline items permanently failed -> the environment is missing
+    # items -> NOT clean. Reporting it clean would advance last_reset_persona and ship a
+    # dirty environment to the next eval. A failed reset stays retryable: a delta re-runs
+    # exactly the non-SUCCESS jobs. (verify "partial"/short counts are recorded but do not
+    # fail the run, because on a delta a short/over count can be legitimate agent drift that
+    # reconcile — not this seed path — is responsible for.)
+    if _reset_is_clean(status, verify):
         return ResetResult(True, f"reset completed via seeder ({mode})", mode, returncode=0, raw=result)
-    return ResetResult(False, f"seeder reset {status}: {result}", mode, returncode=1, raw=result)
+    reason = _degraded_reason(status, acct, verify)
+    log.warning("seeder reset NOT clean for %s (mode=%s): %s", email, mode, reason)
+    return ResetResult(False, f"reset incomplete ({mode}): {reason}", mode, returncode=1, raw=result)
+
+
+def _reset_is_clean(status: str | None, verify: dict | None) -> bool:
+    """A reset is clean iff the pipeline applied every planned baseline item
+    (status == "ok": no PERMANENT_FAILURE jobs) AND verification didn't find a whole
+    module empty when it should have content (verify overall == "failed").
+
+    - status "partial"/"failed"/None -> NOT clean (items are genuinely missing).
+    - verify overall "failed" (a module is empty) -> NOT clean even if status == "ok",
+      because an object was recorded SUCCESS but isn't actually live.
+    - verify None (inconclusive after retries) -> fall back to status alone; a good
+      reset is not blocked just because the read-back couldn't run.
+    - verify "partial"/short counts -> clean-per-status; on a delta a short/over count
+      can be legitimate agent drift that reconcile (not this seed path) owns.
+    """
+    verify_failed = bool(verify) and verify.get("overall") == "failed"
+    return status == "ok" and not verify_failed
+
+
+def _degraded_reason(status: str | None, acct: dict, verify: dict | None) -> str:
+    """Human-readable why a reset wasn't clean, for the reset_sessions.error + QC log."""
+    parts: list[str] = []
+    if status == "partial":
+        perm = (acct.get("skips") or {}).get("permanent")
+        parts.append(f"{perm} baseline item(s) failed permanently" if perm
+                     else "some baseline items failed permanently")
+        if acct.get("error"):
+            parts.append(f"first error: {acct['error']}")
+    elif status == "failed":
+        parts.append("every baseline item failed")
+        if acct.get("error"):
+            parts.append(f"error: {acct['error']}")
+    elif status is None:
+        parts.append("account produced no pipeline result")
+    if verify and verify.get("overall") == "failed":
+        empties = [k for k, m in (verify.get("modules") or {}).items()
+                   if isinstance(m, dict) and m.get("tone") == "err"]
+        parts.append("verify: empty " + ", ".join(sorted(empties)) if empties else "verify failed")
+    return "; ".join(parts) or f"status {status}"
 
 
 def _verify_seed(
@@ -588,6 +643,53 @@ def _baseline_ids(email: str, folder: str) -> dict[str, set]:
         elif svc == "drive" and action in ("create_folder", "upload"):
             ids["drive"].add(gid)
     return ids
+
+
+_BASELINE_ACTIONS = ("insert_message", "insert_event", "upload", "create_folder")
+
+
+def _manifest_incomplete(email: str, folder: str, services: tuple[str, ...]) -> bool:
+    """True when the manifest can't be trusted to compute orphans for a reconcile.
+
+    Orphan deletion is ``live − manifest``. That is only safe when the manifest records a
+    live id for EVERY baseline item. If a prior seed was interrupted or partial, the store
+    can hold baseline jobs that are still PENDING/PROCESSING/RETRY, or SUCCESS rows whose
+    ``google_object_id`` was never captured — in both cases the item may exist live but be
+    absent from the baseline set, so the diff would flag a genuinely-seeded item as an
+    orphan and hard-delete it. Drive is protected by folder-ancestry; Gmail/Calendar are
+    not. When this returns True the caller falls back to a full nuke + reseed (which rebuilds
+    a clean manifest) instead of diffing against a manifest it cannot trust.
+    """
+    p = _acct_dir(email, folder) / "provision.sqlite"
+    if not p.exists():
+        return False  # no store at all is handled by the caller's manifest_empty branch
+    import sqlite3
+
+    placeholders = ",".join("?" for _ in _BASELINE_ACTIONS)
+    svc_filter = ""
+    params: list = list(_BASELINE_ACTIONS)
+    if services:
+        svc_filter = f" AND service IN ({','.join('?' for _ in services)})"
+        params.extend(services)
+    try:
+        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        try:
+            # A baseline item is "unrecorded" (over-deletion risk) when it is still in a
+            # non-terminal state, or it succeeded but carries no usable id.
+            row = con.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE action IN ({placeholders}){svc_filter} AND ("
+                "  status IN ('PENDING','PROCESSING','RETRY') OR "
+                "  (status='SUCCESS' AND (google_object_id IS NULL OR google_object_id IN ('','wiped')))"
+                ")",
+                params,
+            ).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        # If we can't read the store, don't risk a diff against an unknown manifest.
+        log.warning("manifest completeness check failed for %s (%s); treating as incomplete", email, exc)
+        return True
+    return bool(row and row[0])
 
 
 def _gmail_ids_by_query(gmail, q: str) -> set:
@@ -838,19 +940,46 @@ def _run_reconcile(
     cal = build_service("calendar", "v3", creds)
     drive = build_service("drive", "v3", creds)
 
+    picked_svcs = tuple(
+        s for s in ("drive", "gmail", "calendar")
+        if s in {x.strip() for x in (services or "drive,gmail,calendar").split(",")}
+    )
     # "Never seeded" = no manifest for ANY surface. Then the diff treats ALL current content
     # as orphans → full nuke, and a forced reseed rebuilds baseline + manifest. We never fall
     # back to a marker-only reseed (it would leave agent content behind).
     manifest_empty = not (base["gmail"] or base["calendar"] or base["drive"])
+    # An INCOMPLETE manifest (interrupted/partial prior seed) can't be trusted for orphan
+    # diffing — it would delete genuinely-seeded Gmail/Calendar items whose ids weren't
+    # recorded. Fall back to the same full nuke + reseed, which rebuilds a clean manifest.
+    manifest_untrusted = manifest_empty or _manifest_incomplete(email, folder, picked_svcs)
     if manifest_empty:
         log.info("reconcile: no manifest for %s -> full nuke + seed", email)
+    elif manifest_untrusted:
+        log.warning("reconcile: manifest for %s is incomplete (interrupted/partial seed) "
+                    "-> full nuke + reseed instead of an untrusted orphan diff", email)
 
-    # All three surfaces identify the baseline by MANIFEST google_object_id (exact, no label):
-    # orphans = live items whose id isn't in the manifest (agent-added or stale re-seed dups).
-    # Drive additionally keeps anything under a manifest-recorded folder (github-repo ancestry).
-    g_orphans = _live_gmail_ids(gmail) - base["gmail"]
-    c_orphans = _live_calendar_ids(cal) - base["calendar"]
-    d_orphans = _drive_orphans(drive, base["drive"])
+    if manifest_untrusted:
+        # No trustworthy baseline: nuke EVERYTHING live and let the forced reseed below
+        # rebuild a clean baseline + manifest from data.json. (For an empty manifest this
+        # is identical to the diff, since base is empty; for an incomplete one it avoids
+        # keeping the partially-recorded baseline that the reseed would wipe anyway.)
+        g_orphans = _live_gmail_ids(gmail)
+        c_orphans = _live_calendar_ids(cal)
+        d_orphans = {fid for fid, _ in _owned_drive_files(drive)}
+    else:
+        # All three surfaces identify the baseline by MANIFEST google_object_id (exact, no label):
+        # orphans = live items whose id isn't in the manifest (agent-added or stale re-seed dups).
+        # Drive additionally keeps anything under a manifest-recorded folder (github-repo ancestry).
+        g_orphans = _live_gmail_ids(gmail) - base["gmail"]
+        c_orphans = _live_calendar_ids(cal) - base["calendar"]
+        d_orphans = _drive_orphans(drive, base["drive"])
+    # Audit trail: record which agent-created items we are about to remove (capped sample),
+    # so a reset leaves proof of exactly what was cleaned per account.
+    for svc, ids in (("gmail", g_orphans), ("calendar", c_orphans), ("drive", d_orphans)):
+        if ids:
+            sample = ", ".join(list(ids)[:10])
+            log.info("reconcile %s AUDIT delete %s orphans [%d]: %s%s",
+                     email, svc, len(ids), sample, " …" if len(ids) > 10 else "")
     deleted = {
         "gmail": _delete_gmail(gmail, g_orphans),
         "calendar": _delete_calendar_events(cal, c_orphans),
@@ -875,11 +1004,8 @@ def _run_reconcile(
     # item the agent deleted nor fix one the agent modified. Flip the baseline jobs back to
     # PENDING so the delta re-checks EVERY item against live Google — the executors then
     # restore missing, overwrite drifted (Drive md5 / Calendar fields), and skip unchanged.
-    if not manifest_empty:
-        picked_svcs = tuple(
-            s for s in ("drive", "gmail", "calendar")
-            if s in {x.strip() for x in (services or "drive,gmail,calendar").split(",")}
-        )
+    # (Only meaningful on the trusted-delta path; the reseed below wipes the store anyway.)
+    if not manifest_untrusted:
         try:
             from materialize.provision.store import JobStore  # type: ignore
 
@@ -889,7 +1015,7 @@ def _run_reconcile(
                 try:
                     n = js.reset_to_pending(
                         services=picked_svcs,
-                        actions=("insert_message", "insert_event", "upload", "create_folder"),
+                        actions=_BASELINE_ACTIONS,
                     )
                 finally:
                     js.close()
@@ -897,10 +1023,11 @@ def _run_reconcile(
         except Exception as exc:  # noqa: BLE001 - re-verify is best-effort; fall back to plain delta
             log.warning("reconcile reset_to_pending failed for %s: %s", email, exc)
 
-    # Restore the baseline. Empty manifest -> full reseed (wipe store + seed + rebuild manifest);
-    # otherwise a delta that (after the reset above) re-verifies and repairs every baseline item.
+    # Restore the baseline. Untrusted manifest (empty or incomplete) -> full reseed (wipe
+    # store + seed + rebuild a clean manifest); otherwise a delta that (after the reset
+    # above) re-verifies and repairs every baseline item.
     restore = _run_seeder_reset(
-        email, persona, "reseed" if manifest_empty else "delta", services, progress_id
+        email, persona, "reseed" if manifest_untrusted else "delta", services, progress_id
     )
     raw = restore.raw if isinstance(restore.raw, dict) else {}
     raw["reconcile_deleted"] = deleted

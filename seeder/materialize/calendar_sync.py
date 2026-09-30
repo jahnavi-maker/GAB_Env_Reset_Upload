@@ -113,6 +113,7 @@ def wipe_seeded_events(calendar, log: Callable[[str], None]) -> int:
         log(f"calendars().clear() failed ({exc}); falling back to list-delete wipe")
 
     deleted = 0
+    survivors: dict[str, str] = {}  # id -> reason for events we could not delete
     while True:
         resp = _retry(
             lambda: calendar.events()
@@ -128,18 +129,36 @@ def wipe_seeded_events(calendar, log: Callable[[str], None]) -> int:
         batch = resp.get("items") or []
         if not batch:
             break
+        progressed = False
         for event in batch:
+            eid = event.get("id")
+            if not eid:
+                continue
             try:
                 _retry(
-                    lambda eid=event["id"]: calendar.events()
+                    lambda eid=eid: calendar.events()
                     .delete(calendarId="primary", eventId=eid, sendUpdates="none")
                     .execute(),
                     log,
                 )
                 deleted += 1
-            except Exception:
-                pass  # e.g. read-only imported/birthday events on primary
-    log(f"Full calendar wipe (fallback): deleted {deleted} events")
+                progressed = True
+                survivors.pop(eid, None)
+            except Exception as exc:  # noqa: BLE001
+                # e.g. read-only imported/birthday events on primary. Record them and,
+                # critically, stop re-listing once a full pass deletes nothing — otherwise
+                # list() keeps returning the same undeletable batch forever and hangs the
+                # account's worker until the stale-reaper reclaims it.
+                survivors[eid] = f"{event.get('summary', '?')}: {type(exc).__name__}: {exc}"
+        if not progressed:
+            break
+    if survivors:
+        sample = "; ".join(list(survivors.values())[:5])
+        log(f"WARNING calendar wipe INCOMPLETE: {len(survivors)} event(s) could not be "
+            f"deleted (likely read-only imported/birthday): {sample}"
+            + (" …" if len(survivors) > 5 else ""))
+    log(f"Full calendar wipe (fallback): deleted {deleted} events"
+        + (f", {len(survivors)} undeletable" if survivors else ""))
     return deleted
 
 

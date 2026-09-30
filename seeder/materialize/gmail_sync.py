@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import socket
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -27,6 +28,15 @@ def _retry(fn, log: Callable[[str], None], tries: int = 6):
             status = getattr(exc.resp, "status", None)
             if status in (403, 429, 500, 503) and i < tries - 1:
                 log(f"Gmail API {status}, retrying in {delay:.0f}s")
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
+            raise
+        except (socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
+            # Network stall (surfaced by the global socket timeout): retry like a transient
+            # 5xx instead of aborting — parity with the Drive/Calendar retries.
+            if i < tries - 1:
+                log(f"Gmail network stall ({type(exc).__name__}), retrying in {delay:.0f}s")
                 time.sleep(delay)
                 delay = min(delay * 2, 30)
                 continue

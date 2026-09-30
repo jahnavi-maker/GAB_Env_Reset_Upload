@@ -323,14 +323,22 @@ class JobStore:
         counts = self.counts()
         return counts[PENDING] + counts[PROCESSING] + counts[RETRY]
 
-    def reclaim_stale(self, older_than_s: float) -> list[Job]:
+    def reclaim_stale(self, older_than_s: float, exclude_ids: set[str] | None = None) -> list[Job]:
+        """Re-queue PROCESSING rows whose claim is older than ``older_than_s``.
+
+        ``exclude_ids`` are job ids a live worker is currently executing (the pipeline's
+        in-flight fence): they are skipped so a slow-but-alive job is never reclaimed into
+        a concurrent second execution. Rows not excluded are orphans from a dead worker or
+        a previous process, and are safe to re-run.
+        """
         cutoff = _now() - older_than_s
+        exclude = exclude_ids or set()
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM jobs WHERE status=? AND claimed_at IS NOT NULL AND claimed_at < ?",
                 (PROCESSING, cutoff),
             ).fetchall()
-            stale = [self._row(r) for r in rows]
+            stale = [self._row(r) for r in rows if r["job_id"] not in exclude]
             for job in stale:
                 self._conn.execute(
                     "UPDATE jobs SET status=?, updated_at=?, claimed_at=NULL, retry_count=retry_count+1 "

@@ -17,10 +17,11 @@ from materialize.calendar_sync import (
 )
 from materialize.drive_sync import (
     SEED_FOLDER,
-    _retry as _drive_retry,
     ensure_child_folder,
-    find_child_file,
+    list_owned_files_index,
+    patch_file_metadata,
     trash_file,
+    update_file_media,
     upload_bytes,
     wipe_seed_folder,
 )
@@ -65,36 +66,6 @@ def parent_folder_id(store: JobStore, job: Job, payload: dict[str, Any]) -> str:
     return str(parent)
 
 
-def _list_children_index(drive, parent_id: str, log) -> dict[str, tuple[int, str, str]]:
-    """{name: (size, id, md5Checksum)} for every non-folder child of a Drive folder, in one
-    paginated listing. md5 lets a reconcile detect same-size content edits without per-file gets."""
-    out: dict[str, tuple[int, str, str]] = {}
-    safe = str(parent_id).replace("\\", "\\\\").replace("'", "\\'")
-    tok = None
-    while True:
-        resp = _drive_retry(
-            lambda t=tok: drive.files()
-            .list(
-                q=f"'{safe}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
-                fields="nextPageToken, files(id, name, size, md5Checksum)",
-                pageSize=1000,
-                pageToken=t,
-            )
-            .execute(),
-            log,
-        )
-        for f in resp.get("files", []) or []:
-            try:
-                sz = int(f.get("size") or 0)
-            except (TypeError, ValueError):
-                sz = 0
-            out[str(f.get("name") or "")] = (sz, str(f.get("id") or ""), str(f.get("md5Checksum") or ""))
-        tok = resp.get("nextPageToken")
-        if not tok:
-            break
-    return out
-
-
 class JobExecutor:
     def __init__(
         self,
@@ -117,19 +88,31 @@ class JobExecutor:
         self._mail_index: dict[str, dict[str, dict[str, str]]] = {}
         # (account, parent_id) -> {name: (size, id, md5)} so a full reconcile lists each
         # Drive folder once instead of one API call per file.
-        self._child_index: dict[tuple[str, str], dict[str, tuple[int, str, str]]] = {}
-        self._child_lock = threading.Lock()
+        # One bulk Drive listing per account, reused by every drive delta job:
+        #   _owned_by_id: {file_id: meta}         -> identify a baseline file by its manifest id
+        #                                            even after an agent rename/move
+        #   _owned_by_loc: {(parent_id, name): meta} -> name/location lookup for the restore path
+        self._owned_by_id: dict[str, dict[str, dict]] = {}
+        self._owned_by_loc: dict[str, dict[tuple[str, str], dict]] = {}
+        self._owned_lock = threading.Lock()
 
-    def _child_entry(self, drive, account_id: str, parent_id: str, name: str):
-        """(size, id, md5) of a child file by name, from a per-parent cached listing."""
-        key = (account_id, parent_id)
-        with self._child_lock:
-            idx = self._child_index.get(key)
-        if idx is None:
-            idx = _list_children_index(drive, parent_id, self.log)
-            with self._child_lock:
-                self._child_index[key] = idx
-        return idx.get(name)
+    def _drive_owned(self, drive, account_id: str) -> tuple[dict[str, dict], dict[tuple[str, str], dict]]:
+        """Lazily build (and cache) the account's owned-file indexes: by id and by (parent,name)."""
+        with self._owned_lock:
+            by_id = self._owned_by_id.get(account_id)
+            by_loc = self._owned_by_loc.get(account_id)
+        if by_id is None:
+            by_id = list_owned_files_index(drive, self.log)
+            by_loc = {}
+            for fid, meta in by_id.items():
+                if meta.get("is_folder"):
+                    continue  # by_loc is for file restore lookups; folders handled by id/name
+                for par in meta.get("parents") or ():
+                    by_loc[(str(par), meta["name"])] = {**meta, "id": fid}
+            with self._owned_lock:
+                self._owned_by_id[account_id] = by_id
+                self._owned_by_loc[account_id] = by_loc
+        return by_id, by_loc
 
     def execute(self, job: Job) -> dict[str, Any]:
         if job.service == "generate":
@@ -159,6 +142,23 @@ class JobExecutor:
         if job.action == "create_folder":
             parent = parent_folder_id(self.store, job, job.payload)
             name = str(job.payload.get("name") or job.source_path or "folder")
+            if (job.extra or {}).get("mode") == DELTA:
+                # If the seeded folder still exists by its manifest id, repair an agent
+                # rename/move in place (keeps the id, so child files stay linked) instead of
+                # creating a duplicate empty folder.
+                by_id, _ = self._drive_owned(drive, job.account_id)
+                gid = str(job.google_object_id or "")
+                live = by_id.get(gid) if gid else None
+                if live and live.get("is_folder"):
+                    if live["name"] != name or parent not in (live.get("parents") or ()):
+                        remove = [p for p in (live.get("parents") or ()) if p != parent] or None
+                        patch_file_metadata(
+                            drive, gid, self.log,
+                            name=name if live["name"] != name else None,
+                            add_parent=parent if parent not in (live.get("parents") or ()) else None,
+                            remove_parents=remove,
+                        )
+                    return {"id": gid}
             cache = self._folder_cache.setdefault(job.account_id, {})
             folder_id = ensure_child_folder(drive, name, parent, self.log, cache)
             return {"id": folder_id}
@@ -171,22 +171,59 @@ class JobExecutor:
             else:
                 raw = read_cached_bytes(job.environment_id, job.payload.get("rel") or job.source_path)
             if (job.extra or {}).get("mode") == DELTA:
-                have = self._child_entry(drive, job.account_id, parent, name)
-                if have:
-                    # Content drift by md5 (same-size edits too), not just size. A native file
-                    # with no md5 falls back to size. Matches -> keep; else replace in place.
-                    live_size, live_id, live_md5 = have[0], have[1], have[2]
-                    want_md5 = hashlib.md5(raw).hexdigest()
-                    content_ok = live_size == len(raw) and (
-                        live_md5 == want_md5 if live_md5 else True
-                    )
-                    if content_ok:
-                        return {"id": live_id, "bytes": len(raw), "skipped": True}
-                    if live_id:
+                by_id, by_loc = self._drive_owned(drive, job.account_id)
+                want_md5 = hashlib.md5(raw).hexdigest()
+                gid = str(job.google_object_id or "")
+                live = by_id.get(gid) if gid else None
+                if live:
+                    # The seeded file still exists (by its manifest id) — the agent may have
+                    # RENAMED, MOVED, or edited its CONTENT. Repair each in place (same id).
+                    changed = False
+                    if live["name"] != name or parent not in (live.get("parents") or ()):
+                        remove = [p for p in (live.get("parents") or ()) if p != parent] or None
+                        patch_file_metadata(
+                            drive, gid, self.log,
+                            name=name if live["name"] != name else None,
+                            add_parent=parent if parent not in (live.get("parents") or ()) else None,
+                            remove_parents=remove,
+                        )
+                        changed = True
+                    if live.get("md5"):
+                        # Binary seed (always has an md5): compare content, overwrite on drift.
+                        if live["md5"] != want_md5:
+                            update_file_media(drive, gid, raw, mime, self.log)
+                            changed = True
+                    else:
+                        # No md5 => the file is now a Google-native/converted type, so its bytes
+                        # can't be verified. Seeds are uploaded binaries, so a md5-less live file
+                        # means the content drifted (e.g. converted to a Doc). Restore the seeded
+                        # bytes in place; if Drive refuses an in-place media update on a native
+                        # file, fall back to trash + re-upload (persist_success records the new id).
                         try:
-                            trash_file(drive, live_id, self.log)
-                        except Exception as exc:
-                            self.log(f"Could not replace Drive {name}: {exc}")
+                            update_file_media(drive, gid, raw, mime, self.log)
+                            changed = True
+                        except Exception as exc:  # noqa: BLE001
+                            self.log(f"native-file restore in place failed for {gid} ({name}): "
+                                     f"{exc}; re-uploading")
+                            try:
+                                trash_file(drive, gid, self.log)
+                            except Exception as exc2:  # noqa: BLE001
+                                self.log(f"could not trash drifted native file {gid}: {exc2}")
+                            new_id = upload_bytes(drive, parent, name, raw, mime, self.log)
+                            return {"id": new_id, "bytes": len(raw), "updated": True}
+                    return {"id": gid, "bytes": len(raw), "updated": changed, "skipped": not changed}
+                # Not found by id -> the agent DELETED it (or it predates id capture). Avoid a
+                # duplicate: reuse a correct same-name file in the target folder if one exists,
+                # else re-upload to restore it.
+                loc = by_loc.get((parent, name))
+                if loc:
+                    live_md5 = loc.get("md5") or ""
+                    if loc.get("size") == len(raw) and (live_md5 == want_md5 if live_md5 else True):
+                        return {"id": loc["id"], "bytes": len(raw), "skipped": True}
+                    try:
+                        trash_file(drive, loc["id"], self.log)
+                    except Exception as exc:
+                        self.log(f"Could not replace Drive {name}: {exc}")
             file_id = upload_bytes(drive, parent, name, raw, mime, self.log)
             return {"id": file_id, "bytes": len(raw)}
         raise RuntimeError(f"unknown drive action {job.action}")

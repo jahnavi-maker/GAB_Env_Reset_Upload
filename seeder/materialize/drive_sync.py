@@ -66,6 +66,7 @@ def wipe_seed_folder(drive, persona: str, log: Callable[[str], None]) -> int:
     flag, so we re-list `trashed = false` owned items until none remain.
     """
     trashed = 0
+    survivors: dict[str, str] = {}  # id -> "name: error" for items we could not trash
     while True:
         resp = _retry(
             lambda: drive.files()
@@ -83,19 +84,30 @@ def wipe_seed_folder(drive, persona: str, log: Callable[[str], None]) -> int:
             break
         progressed = False
         for f in files:
+            fid = f["id"]
             try:
                 _retry(
-                    lambda fid=f["id"]: drive.files().update(fileId=fid, body={"trashed": True}).execute(),
+                    lambda fid=fid: drive.files().update(fileId=fid, body={"trashed": True}).execute(),
                     log,
                 )
                 trashed += 1
                 progressed = True
-            except Exception:
-                pass  # skip undeletable items so the loop can't spin forever
+                survivors.pop(fid, None)
+            except Exception as exc:  # noqa: BLE001
+                # Skip undeletable items so the loop can't spin forever, but RECORD which
+                # ones survived and why — a silently-skipped file leaves the next eval a
+                # dirty environment, so the caller must be able to see the wipe was partial.
+                survivors[fid] = f"{f.get('name', '?')}: {type(exc).__name__}: {exc}"
         log(f"Trashed {trashed} Drive items so far (full wipe)")
         if not progressed:
             break
-    log(f"Full Drive wipe: trashed {trashed} items")
+    if survivors:
+        sample = "; ".join(list(survivors.values())[:5])
+        log(f"WARNING Full Drive wipe INCOMPLETE: {len(survivors)} item(s) could not be "
+            f"trashed and remain in the account: {sample}"
+            + (" …" if len(survivors) > 5 else ""))
+    log(f"Full Drive wipe: trashed {trashed} items"
+        + (f", {len(survivors)} undeletable" if survivors else ""))
     return trashed
 
 
@@ -381,6 +393,84 @@ def trash_file(drive, file_id: str, log: Callable[[str], None]) -> None:
         lambda: drive.files().update(fileId=file_id, body={"trashed": True}).execute(),
         log,
     )
+
+
+FOLDER_MIME = "application/vnd.google-apps.folder"
+
+
+def list_owned_files_index(drive, log: Callable[[str], None]) -> dict[str, dict[str, Any]]:
+    """One bulk pass over every owned, non-trashed file AND folder ->
+    {id: {name, parents(tuple), size, md5, mime, is_folder}}. Lets reconcile identify a
+    baseline item by its manifest id even if the agent RENAMED or MOVED it (id is stable),
+    and compare file content by md5 — all from a single listing instead of a call per item."""
+    out: dict[str, dict[str, Any]] = {}
+    tok = None
+    while True:
+        resp = _retry(
+            lambda t=tok: drive.files()
+            .list(
+                q="'me' in owners and trashed = false",
+                spaces="drive",
+                fields="nextPageToken, files(id, name, parents, size, md5Checksum, mimeType)",
+                pageSize=1000,
+                pageToken=t,
+            )
+            .execute(),
+            log,
+        )
+        for f in resp.get("files", []) or []:
+            try:
+                sz = int(f.get("size") or 0)
+            except (TypeError, ValueError):
+                sz = 0
+            mime = str(f.get("mimeType") or "")
+            out[str(f.get("id"))] = {
+                "name": str(f.get("name") or ""),
+                "parents": tuple(f.get("parents") or []),
+                "size": sz,
+                "md5": str(f.get("md5Checksum") or ""),
+                "mime": mime,
+                "is_folder": mime == FOLDER_MIME,
+            }
+        tok = resp.get("nextPageToken")
+        if not tok:
+            break
+    return out
+
+
+def update_file_media(drive, file_id: str, raw: bytes, mime: str, log: Callable[[str], None]) -> str:
+    """Replace a file's CONTENT in place (same id) — resets an agent's edit without a new id."""
+    media = MediaIoBaseUpload(
+        io.BytesIO(raw),
+        mimetype=mime or "application/octet-stream",
+        resumable=len(raw) > 5 * 1024 * 1024,
+    )
+    _retry(
+        lambda: drive.files().update(fileId=file_id, media_body=media, fields="id").execute(),
+        log,
+    )
+    return file_id
+
+
+def patch_file_metadata(
+    drive,
+    file_id: str,
+    log: Callable[[str], None],
+    *,
+    name: str | None = None,
+    add_parent: str | None = None,
+    remove_parents: list[str] | None = None,
+) -> str:
+    """Rename and/or move a file back in place (same id) — undoes an agent rename/move."""
+    kwargs: dict[str, Any] = {"fileId": file_id, "fields": "id"}
+    if name is not None:
+        kwargs["body"] = {"name": str(name)[:200]}
+    if add_parent:
+        kwargs["addParents"] = add_parent
+    if remove_parents:
+        kwargs["removeParents"] = ",".join(remove_parents)
+    _retry(lambda: drive.files().update(**kwargs).execute(), log)
+    return file_id
 
 
 def populate_drive_from_cache(
