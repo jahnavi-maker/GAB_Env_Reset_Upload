@@ -113,12 +113,16 @@ def delegation_active() -> bool:
 
 
 def in_workspace_domain(email: str) -> bool:
-    """True when ``email`` is inside the configured Workspace domain."""
+    """True when ``email`` is impersonable in delegation mode. Domain-agnostic unless the
+    operator explicitly restricted it via ENV_LOADER_WORKSPACE_DOMAIN (Google's DWD grant
+    is the real gate)."""
     try:
         from materialize.authbackend import workspace_domain  # type: ignore
 
         dom = workspace_domain()
-        return bool(dom) and "@" in email and email.lower().split("@", 1)[1] == dom
+        if "@" not in email:
+            return False
+        return (not dom) or email.lower().split("@", 1)[1] == dom
     except Exception:  # noqa: BLE001
         return False
 

@@ -85,8 +85,10 @@ def discover_sa_key() -> str:
 
 
 def workspace_domain() -> str:
-    raw = (os.environ.get("ENV_LOADER_WORKSPACE_DOMAIN") or DEFAULT_WORKSPACE_DOMAIN).strip()
-    return raw.lower().lstrip("@")
+    # Empty unless an operator explicitly restricts to one domain. When empty, delegation
+    # is domain-agnostic: the service account's Google-side DWD grant decides which domains
+    # (and scopes) it may impersonate, so we don't hardcode one here.
+    return (os.environ.get("ENV_LOADER_WORKSPACE_DOMAIN") or "").strip().lower().lstrip("@")
 
 
 def resolve_auth_mode() -> str:
@@ -150,7 +152,8 @@ def save_service_account_key(raw: bytes) -> dict[str, Any]:
     secure_write(SA_KEY_PATH, text)
     os.environ["ENV_LOADER_AUTH_BACKEND"] = "workspace_delegation"
     os.environ["ENV_LOADER_SA_KEY"] = str(SA_KEY_PATH)
-    os.environ.setdefault("ENV_LOADER_WORKSPACE_DOMAIN", DEFAULT_WORKSPACE_DOMAIN)
+    # Domain is left unrestricted (domain-agnostic) unless the operator explicitly set
+    # ENV_LOADER_WORKSPACE_DOMAIN — the SA's DWD grant decides which domains it can reach.
     reset_backend()
     return sa_client_status(str(SA_KEY_PATH))
 
@@ -401,9 +404,12 @@ class WorkspaceDelegationBackend:
         return sa_client_status(self.key_path)
 
     def _in_domain(self, email: str) -> bool:
-        if not self.domain or "@" not in email:
+        if "@" not in email:
             return False
-        return email.lower().split("@", 1)[1] == self.domain
+        # No explicit domain restriction -> accept any account; the service account's
+        # Google-side DWD grant is the real gate (an undelegated domain/scope fails at the
+        # actual API call with a clear error). Set ENV_LOADER_WORKSPACE_DOMAIN to restrict.
+        return (not self.domain) or email.lower().split("@", 1)[1] == self.domain
 
     def status(self, email: str) -> AuthState:
         if not self._in_domain(email):
@@ -439,7 +445,7 @@ class WorkspaceDelegationBackend:
             "state": "authorized",
             "verified_email": email.lower(),
             "expires_at": None,
-            "detail": f"Domain delegation active for {self.domain}",
+            "detail": f"Domain delegation active for {self.domain or 'any delegated Workspace domain'}",
             "got_email": email.lower(),
             "backend": self.name,
         }
