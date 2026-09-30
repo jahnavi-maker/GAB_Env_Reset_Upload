@@ -475,6 +475,17 @@ async def _run_and_record(
                 )
             except Exception:
                 log.warning("last_reset_persona update failed for %s", email)
+            # Record the operation mode per account too (upload|reconcile|reseed|delta).
+            # Best-effort + separate so a missing `last_reset_mode` column never blocks the
+            # persona/routing write above.
+            try:
+                await store.patch_table(
+                    settings.accounts_table,
+                    {"email": f"eq.{email}"},
+                    {"last_reset_mode": row_mode or result.mode},
+                )
+            except Exception:
+                log.warning("last_reset_mode update failed for %s (add the column?)", email)
         log.info("reset %s (%s) -> %s", reset_session_id, mode, "completed" if ok else "failed")
     except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}"

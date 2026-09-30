@@ -143,6 +143,7 @@ def public_account(row: dict[str, Any]) -> dict[str, Any]:
         "email": row.get("email"),
         "persona": row.get("persona"),
         "last_reset_persona": row.get("last_reset_persona"),
+        "last_reset_mode": row.get("last_reset_mode"),
         "authorized": bool(row.get("authorized")),
         "status": row.get("status") or "active",
         "last_reset_at": row.get("last_reset_at"),

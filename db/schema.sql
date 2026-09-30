@@ -17,6 +17,7 @@ create table if not exists gab_accounts (
     authorized_at       timestamptz,
     status              text not null default 'active',
     last_reset_persona  text,          -- drives "same persona -> reset / new -> reseed"
+    last_reset_mode     text,          -- last op applied: upload | reconcile | reseed | delta
     last_reset_id       uuid,
     last_reset_at       timestamptz,
     created_at          timestamptz not null default now(),
