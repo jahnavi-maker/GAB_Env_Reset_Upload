@@ -466,26 +466,26 @@ async def _run_and_record(
             },
         )
         if ok:
-            # reflect the current persona so future resets route correctly
+            # Record WHAT happened and WHEN atomically, only on a clean op: the persona
+            # (drives routing), the operation mode (upload|reconcile|reseed|delta) and the
+            # timestamp all move together, so last_reset_mode always matches last_reset_at.
+            fields = {
+                "last_reset_persona": persona,
+                "last_reset_id": reset_session_id,
+                "last_reset_at": _now(),
+                "last_reset_mode": row_mode or result.mode,
+            }
             try:
-                await store.patch_table(
-                    settings.accounts_table,
-                    {"email": f"eq.{email}"},
-                    {"last_reset_persona": persona, "last_reset_id": reset_session_id, "last_reset_at": _now()},
-                )
+                await store.patch_table(settings.accounts_table, {"email": f"eq.{email}"}, fields)
             except Exception:
-                log.warning("last_reset_persona update failed for %s", email)
-            # Record the operation mode per account too (upload|reconcile|reseed|delta).
-            # Best-effort + separate so a missing `last_reset_mode` column never blocks the
-            # persona/routing write above.
-            try:
-                await store.patch_table(
-                    settings.accounts_table,
-                    {"email": f"eq.{email}"},
-                    {"last_reset_mode": row_mode or result.mode},
-                )
-            except Exception:
-                log.warning("last_reset_mode update failed for %s (add the column?)", email)
+                # An older Supabase without the last_reset_mode column: retry without it so
+                # the persona/routing + timestamp still land (mode is best-effort).
+                log.warning("account update failed for %s; retrying without last_reset_mode (add the column?)", email)
+                fields.pop("last_reset_mode", None)
+                try:
+                    await store.patch_table(settings.accounts_table, {"email": f"eq.{email}"}, fields)
+                except Exception:
+                    log.warning("last_reset_* update failed for %s", email)
         log.info("reset %s (%s) -> %s", reset_session_id, mode, "completed" if ok else "failed")
     except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}"
