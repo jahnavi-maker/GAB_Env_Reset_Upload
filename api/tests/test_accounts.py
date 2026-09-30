@@ -316,6 +316,57 @@ class UploadAutoRouteTest(unittest.TestCase):
         self.assertEqual(r.json()["mode"], "reseed")
 
 
+class DelegationSeedTest(unittest.TestCase):
+    """In Workspace domain-wide-delegation mode an account has no per-account OAuth token
+    and no gab_accounts.authorized flag, yet Upload must still proceed (the admin
+    service-account impersonates it). /ui/seed must not 400 'not authorized yet'."""
+
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+
+    def _prep_unauthorized(self, email: str) -> None:
+        import asyncio
+
+        from reset_service.app import get_store
+
+        async def go() -> None:
+            # Registered demo account, but never OAuth-authorized (authorized stays false).
+            await get_store().upsert_account(email, "Student")
+
+        asyncio.run(go())
+
+    def test_delegated_account_seeds_without_authorized_flag(self) -> None:
+        from reset_service import app as app_mod
+
+        email = "deleg-user@teamdeccan.us"
+        self._prep_unauthorized(email)
+        orig_active = app_mod.upload.delegation_active
+        orig_dom = app_mod.upload.in_workspace_domain
+        app_mod.upload.delegation_active = lambda: True
+        app_mod.upload.in_workspace_domain = lambda e: True
+        try:
+            r = self.client.post("/ui/seed", json={"email": email, "persona": "Student"})
+        finally:
+            app_mod.upload.delegation_active = orig_active
+            app_mod.upload.in_workspace_domain = orig_dom
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_non_delegated_unauthorized_still_blocked(self) -> None:
+        # With delegation OFF, an unauthorized account is still rejected (regression guard).
+        from reset_service import app as app_mod
+
+        email = "no-deleg@gmail.com"
+        self._prep_unauthorized(email)
+        orig_active = app_mod.upload.delegation_active
+        app_mod.upload.delegation_active = lambda: False
+        try:
+            r = self.client.post("/ui/seed", json={"email": email, "persona": "Student"})
+        finally:
+            app_mod.upload.delegation_active = orig_active
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("not authorized", r.text)
+
+
 class ReconcilePreviewTest(unittest.TestCase):
     """The reconcile dry-run is guarded to registered demo accounts."""
 

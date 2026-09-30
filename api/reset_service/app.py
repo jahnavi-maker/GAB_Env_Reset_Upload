@@ -1604,17 +1604,22 @@ async def ui_seed(
     """Operator step 3 (per-account or via Bulk upload): push the first data into
     an authorized account. Requires the account to be authorized already."""
     email = req.email.lower()
-    try:
-        acct = await store.query(
-            settings.accounts_table,
-            {"select": "authorized", "email": f"eq.{email}", "limit": "1"},
-        )
-    except Exception:
-        # Don't mask a store outage as "not authorized" silently — log it.
-        log.warning("authorized-state lookup failed for %s", email, exc_info=True)
-        acct = []
-    if not acct or not acct[0].get("authorized"):
-        raise HTTPException(status_code=400, detail="account not authorized yet")
+    # In Workspace domain-wide-delegation mode the account is authorized implicitly (the
+    # admin service-account impersonates it — no per-account OAuth, so no gab_accounts.authorized
+    # flag is ever written). Mirror /ui/account: delegation counts as authorized.
+    delegated = upload.delegation_active() and upload.in_workspace_domain(email)
+    if not delegated:
+        try:
+            acct = await store.query(
+                settings.accounts_table,
+                {"select": "authorized", "email": f"eq.{email}", "limit": "1"},
+            )
+        except Exception:
+            # Don't mask a store outage as "not authorized" silently — log it.
+            log.warning("authorized-state lookup failed for %s", email, exc_info=True)
+            acct = []
+        if not acct or not acct[0].get("authorized"):
+            raise HTTPException(status_code=400, detail="account not authorized yet")
     try:
         rsid, tid, op_mode = await _seed_upload(store, background, email, req.persona, req.services)
     except Exception as exc:
