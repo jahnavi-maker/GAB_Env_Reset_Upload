@@ -166,6 +166,27 @@ class PlannerTests(unittest.TestCase):
             uploads = [j for j in jobs if j.action == "upload" and j.source_type == "generated"]
             self.assertEqual({j.payload["rel"] for j in uploads}, {"docs/a.txt", "docs/b.txt"})
 
+    def test_generated_drive_goes_into_my_drive_root_no_wrapper(self):
+        # data.json files land directly in My Drive (no GAB_UltraEvals wrapper). The
+        # data.json folder tree is preserved: a top-level dir parents to "root".
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = _work("a@ex.com", "Student", root, do_github=False, wipe=False)
+            builder = EnvironmentBuilder()
+            artifacts = validate_accounts([work], builder, lambda _m: None)
+            store = JobStore(root / "jobs.sqlite")
+            jobs = plan_account_jobs(work, artifacts["Student"], store, max_file_bytes=10**9, log=lambda _m: None)
+            gen_folders = [j for j in jobs if j.action == "create_folder" and j.source_type == "generated"]
+            # No GAB_UltraEvals wrapper folder is created any more.
+            self.assertFalse(any("GAB_UltraEvals" in (j.payload.get("name") or "") for j in gen_folders))
+            # The top-level data.json dir ("docs") goes straight into My Drive root.
+            docs = next(j for j in gen_folders if j.payload.get("name") == "docs")
+            self.assertEqual(docs.payload.get("parent"), "root")
+            self.assertNotIn("parent_sid", docs.payload)
+            # Files under it still parent to the docs folder (structure preserved).
+            for up in (j for j in jobs if j.action == "upload" and j.source_type == "generated"):
+                self.assertEqual(up.payload.get("parent_sid"), docs.synthetic_id)
+
     def test_duplicate_and_malformed_records_fail_only_those_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

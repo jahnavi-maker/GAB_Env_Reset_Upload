@@ -172,29 +172,46 @@ def _drive_folder_jobs(
     source_type: str,
     wipe_sid: str | None,
     extra_deps: list[str],
+    wrap_root: bool = True,
 ) -> dict[str, str]:
-    """Create folder jobs for root + relative dirs. Returns rel -> synthetic_id."""
-    ids: dict[str, str] = {"": root_sid}
-    _remember(
-        store,
-        _job(
-            work,
-            service="drive",
-            action="create_folder",
-            synthetic_id=root_sid,
-            source_type=source_type,
-            source_path=root_name,
-            depends_on=([wipe_sid] if wipe_sid else []) + extra_deps,
-            payload={"name": root_name, "parent": "root"},
-        ),
-        planned,
-    )
+    """Create folder jobs for the data.json dir tree. Returns rel -> synthetic_id.
+
+    wrap_root=True (default, e.g. GitHub): everything nests under a single ``root_name``
+    folder created in My Drive.
+    wrap_root=False (generated Drive files): NO wrapper folder — the data.json tree is
+    created directly in My Drive root, so top-level dirs/files parent to ``"root"``.
+    """
+    ids: dict[str, str] = {}
+    root_deps = ([wipe_sid] if wipe_sid else []) + extra_deps
+    if wrap_root:
+        ids[""] = root_sid
+        _remember(
+            store,
+            _job(
+                work,
+                service="drive",
+                action="create_folder",
+                synthetic_id=root_sid,
+                source_type=source_type,
+                source_path=root_name,
+                depends_on=root_deps,
+                payload={"name": root_name, "parent": "root"},
+            ),
+            planned,
+        )
     for rel in sorted(rel_dirs, key=lambda r: (r.count("/"), r)):
         parts = [p for p in rel.split("/") if p]
         parent_rel = "/".join(parts[:-1])
-        parent_sid = ids[parent_rel] if parent_rel in ids else root_sid
         sid = _sid(source_type, "folder", rel)
         ids[rel] = sid
+        if parent_rel in ids:
+            parent_payload = {"parent_sid": ids[parent_rel]}
+            deps = [ids[parent_rel]]
+        else:
+            # Top-level dir with no wrapper -> straight into My Drive root. Depend on the
+            # wipe (and any generate step) so the account is cleared before we create it.
+            parent_payload = {"parent": "root"}
+            deps = list(root_deps)
         _remember(
             store,
             _job(
@@ -204,8 +221,8 @@ def _drive_folder_jobs(
                 synthetic_id=sid,
                 source_type=source_type,
                 source_path=rel,
-                depends_on=[parent_sid],
-                payload={"name": parts[-1], "parent_sid": parent_sid},
+                depends_on=deps,
+                payload={"name": parts[-1], **parent_payload},
             ),
             planned,
         )
@@ -417,8 +434,12 @@ def plan_account_jobs(
             )
 
     if work.do_drive and art.drive_path:
-        root_name = f"GAB_UltraEvals__{work.persona}"
+        # Generated Drive files go DIRECTLY into My Drive (no GAB_UltraEvals wrapper) —
+        # the data.json folder tree is recreated at the My Drive root. Top-level entries
+        # depend on the wipe/generate step so the account is cleared first.
+        root_name = "My Drive"
         root_sid = _sid("generated", "folder", root_name)
+        root_deps = ([wipe_drive] if wipe_drive else []) + generate_dep
         entries = [
             e
             for e in (art.drive_entries or metadata_drive_entries(art))
@@ -443,6 +464,7 @@ def plan_account_jobs(
             source_type="generated",
             wipe_sid=wipe_drive,
             extra_deps=generate_dep,
+            wrap_root=False,
         )
         seen_files: set[str] = set()
         for entry in entries:
@@ -465,7 +487,6 @@ def plan_account_jobs(
             seen_files.add(rel)
             size = int(entry.get("size") or 0)
             parent_rel = "/".join(rel.split("/")[:-1])
-            parent_sid = folder_ids.get(parent_rel, root_sid)
             sid = _sid("generated", "file", rel)
             if size > max_file_bytes:
                 _remember(
@@ -483,6 +504,14 @@ def plan_account_jobs(
                     planned,
                 )
                 continue
+            # A file inside a data.json subfolder parents to that folder job; a top-level
+            # file goes straight into My Drive root (no wrapper), gated on the wipe/generate.
+            if parent_rel in folder_ids:
+                file_parent = {"parent_sid": folder_ids[parent_rel]}
+                file_deps = [folder_ids[parent_rel]]
+            else:
+                file_parent = {"parent": "root"}
+                file_deps = list(root_deps)
             _remember(
                 store,
                 _job(
@@ -492,13 +521,13 @@ def plan_account_jobs(
                     synthetic_id=sid,
                     source_type="generated",
                     source_path=rel,
-                    depends_on=[parent_sid],
+                    depends_on=file_deps,
                     payload={
                         "rel": rel,
                         "filename": entry.get("filename") or rel.rsplit("/", 1)[-1],
                         "mime": entry.get("mime_type") or "application/octet-stream",
                         "size": size,
-                        "parent_sid": parent_sid,
+                        **file_parent,
                     },
                 ),
                 planned,

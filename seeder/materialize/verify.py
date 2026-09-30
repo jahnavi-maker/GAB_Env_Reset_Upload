@@ -60,10 +60,10 @@ def _count_gmail(gmail) -> int:
 
 
 def _count_drive(drive, folder_id: str | None) -> int:
-    if not folder_id:
-        return 0
+    # Generated files now live directly in My Drive (no GAB_UltraEvals wrapper), so with no
+    # explicit folder we count from the My Drive root, skipping the Github folder + zip.
     count = 0
-    folders = [folder_id]
+    folders = [folder_id or "root"]
     while folders:
         fid = folders.pop()
         page = None
