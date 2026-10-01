@@ -1,0 +1,8 @@
+{
+  "spreadsheet_id": "REPLACE_WITH_CONTROL_SHEET_ID",
+  "spreadsheet_url": "https://docs.google.com/spreadsheets/d/REPLACE_WITH_CONTROL_SHEET_ID/edit",
+  "script_id": "REPLACE_AFTER_APPS_SCRIPT_PROJECT_CREATION",
+  "deployment_id": "REPLACE_AFTER_WEB_APP_DEPLOYMENT",
+  "web_app_url": "https://script.google.com/a/macros/example.com/s/REPLACE_AFTER_WEB_APP_DEPLOYMENT/exec",
+  "version": 0
+}

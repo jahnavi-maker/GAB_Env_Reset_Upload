@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Reset logins</title>
+<style>
+  :root { --bg:#f6f3f0; --card:#fff; --ink:#111113; --muted:#6b6b70; --brand:#175fff;
+    --ok:#12855a; --err:#c0392b; --line:#e6e2dd; --chip:#eef1f6; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#111113; --card:#1b1b1e; --ink:#f6f3f0; --muted:#9a9aa0; --line:#2c2c30; --chip:#23232a; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); padding:24px 16px;
+    font-family:-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",sans-serif; }
+  .wrap { max-width:720px; margin:0 auto; }
+  h1 { font-size:22px; margin:0 0 4px; letter-spacing:-.01em; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:22px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; margin-bottom:16px; }
+  .step { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin-bottom:10px; }
+  label.file, button { appearance:none; border:0; cursor:pointer; border-radius:10px; font-weight:600; }
+  button.primary, label.file { background:var(--brand); color:#fff; padding:11px 16px; font-size:14px; display:inline-block; }
+  button.ghost { background:var(--chip); color:var(--ink); padding:9px 14px; font-size:13px; }
+  button.mini { padding:6px 11px; font-size:12px; }
+  button:disabled { opacity:.45; cursor:default; }
+  input[type=email], textarea { width:100%; border:1px solid var(--line); border-radius:10px; padding:12px 14px;
+    font-size:15px; background:var(--bg); color:var(--ink); }
+  textarea { min-height:120px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; resize:vertical; }
+  input[type=email]:focus, textarea:focus { outline:2px solid var(--brand); outline-offset:1px; }
+  .hint { color:var(--muted); font-size:12px; }
+  .note { font-size:12px; margin-top:8px; }
+  .note.ok{color:var(--ok);} .note.err{color:var(--err);}
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.03em; }
+  td.email { word-break:break-all; }
+  .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .nav { font-size:13px; margin-bottom:18px; }
+  .nav a { color:var(--brand); text-decoration:none; font-weight:600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="nav"><a href="/onboard">Onboarding</a> · <a href="/reset">Reset page</a></div>
+  <h1>Reset logins</h1>
+  <p class="sub">Emails that may sign in on /reset. Only the Supabase <b>freelancers</b> table. Reset targets stay in <b>gab_accounts</b>.</p>
+
+  <div class="card">
+    <div class="step">Add one email</div>
+    <div class="bar">
+      <input id="oneEmail" type="email" placeholder="operator@gmail.com" style="flex:1;min-width:220px" />
+      <button class="primary" id="addOne">Add</button>
+    </div>
+    <div id="oneNote" class="note"></div>
+  </div>
+
+  <div class="card">
+    <div class="step">Or upload emails</div>
+    <textarea id="bulk" placeholder="one email per line&#10;operator@gmail.com&#10;rater@deccan.ai"></textarea>
+    <div class="bar" style="margin-top:10px">
+      <label class="file">Choose CSV<input id="csvFile" type="file" accept=".csv,text/csv,text/plain" hidden></label>
+      <button class="ghost" id="addBulk">Add emails</button>
+      <span class="hint">One email per line, or a CSV whose first column is email. Extra columns are ignored.</span>
+    </div>
+    <div id="bulkNote" class="note"></div>
+  </div>
+
+  <div class="card">
+    <div class="step">Current logins</div>
+    <div class="bar" style="margin-bottom:10px">
+      <button class="ghost" id="refresh">Refresh</button>
+      <span class="hint" id="count"></span>
+    </div>
+    <table>
+      <thead><tr><th>Email</th><th></th></tr></thead>
+      <tbody id="rows"><tr><td class="hint" colspan="2">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+<script>
+  const $ = id => document.getElementById(id);
+  function note(id, kind, text){ const el=$(id); el.className="note "+(kind||""); el.textContent=text||""; }
+
+  async function listLogins(){
+    const r = await fetch("/ui/logins");
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
+    return d.logins || [];
+  }
+  async function render(){
+    try {
+      const rows = await listLogins();
+      $("count").textContent = rows.length ? (rows.length + " email" + (rows.length===1?"":"s")) : "none yet";
+      const tb = $("rows");
+      if (!rows.length){ tb.innerHTML = '<tr><td class="hint" colspan="2">No login emails yet.</td></tr>'; return; }
+      tb.innerHTML = rows.map(row => {
+        const email = row.email || "";
+        return `<tr><td class="email">${email}</td><td><button class="ghost mini" data-del="${email}">Remove</button></td></tr>`;
+      }).join("");
+      tb.querySelectorAll("[data-del]").forEach(btn => {
+        btn.onclick = async () => {
+          if (!confirm("Remove "+btn.dataset.del+" from the login list?")) return;
+          await fetch("/ui/logins/"+encodeURIComponent(btn.dataset.del), { method:"DELETE" });
+          render();
+        };
+      });
+    } catch(e){
+      $("rows").innerHTML = '<tr><td class="hint" colspan="2">Could not load logins.</td></tr>';
+    }
+  }
+
+  async function addEmails(emails){
+    const clean = [...new Set(emails.map(e => (e||"").trim().toLowerCase()).filter(e => e.includes("@")))];
+    if (!clean.length) throw new Error("No valid emails");
+    const r = await fetch("/ui/logins", {
+      method:"POST", headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ logins: clean.map(email => ({ email })) }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
+    return d;
+  }
+
+  $("addOne").onclick = async () => {
+    note("oneNote","","");
+    try {
+      const d = await addEmails([$("oneEmail").value]);
+      $("oneEmail").value = "";
+      note("oneNote","ok","Added "+d.upserted+" email");
+      render();
+    } catch(e){ note("oneNote","err", e.message); }
+  };
+  $("oneEmail").addEventListener("keydown", e => { if (e.key==="Enter") $("addOne").click(); });
+
+  $("csvFile").addEventListener("change", e => {
+    const f = e.target.files[0]; if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => { $("bulk").value = String(reader.result||""); };
+    reader.readAsText(f);
+  });
+  $("addBulk").onclick = async () => {
+    note("bulkNote","","");
+    try {
+      const r = await fetch("/ui/logins/csv", {
+        method:"POST",
+        headers:{ "Content-Type":"text/plain" },
+        body: $("bulk").value,
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
+      const extra = (d.errors||[]).length ? " · skipped "+d.errors.length : "";
+      note("bulkNote","ok","Added "+d.upserted+" email"+(d.upserted===1?"":"s")+extra);
+      render();
+    } catch(e){ note("bulkNote","err", e.message); }
+  };
+  $("refresh").onclick = render;
+  render();
+</script>
+</body>
+</html>
