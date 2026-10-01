@@ -137,7 +137,10 @@ class JobExecutor:
     def _drive(self, job: Job, creds) -> dict[str, Any]:
         drive = service_for(job.account_id, "drive", "v3", creds)
         if job.action == "wipe":
-            n = wipe_seed_folder(drive, job.environment_id, self.log)
+            # Pass creds so the wipe deletes across a thread pool (per-thread Drive services)
+            # instead of one-by-one — the single-threaded wipe of a ~9000-file account was
+            # the dominant cost of a reseed.
+            n = wipe_seed_folder(drive, job.environment_id, self.log, creds=creds, workers=10)
             return {"id": "wiped", "trashed": n}
         if job.action == "create_folder":
             parent = parent_folder_id(self.store, job, job.payload)

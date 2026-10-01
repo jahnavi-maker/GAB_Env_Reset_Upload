@@ -59,48 +59,88 @@ def find_seed_folder(drive, persona: str, log: Callable[[str], None]) -> str | N
     return files[0]["id"] if files else None
 
 
-def wipe_seed_folder(drive, persona: str, log: Callable[[str], None]) -> int:
+def wipe_seed_folder(
+    drive,
+    persona: str,
+    log: Callable[[str], None],
+    *,
+    creds: Any = None,
+    workers: int = 10,
+) -> int:
     """FULL wipe: trash ALL files/folders owned by the account (no marker match).
 
     Loop-until-empty: trashing a folder does not flip its children's `trashed`
     flag, so we re-list `trashed = false` owned items until none remain.
+
+    With ``creds`` the per-batch deletes run across ``workers`` threads — each thread gets
+    its OWN Drive service (googleapiclient/httplib2 is not thread-safe), exactly like the
+    upload worker pool. This turns a ~9000-file wipe from a single-threaded ~1/s crawl into
+    a parallel job (the dominant cost of reseeding a large existing account). Without
+    ``creds`` it falls back to the safe sequential path, so existing callers are unchanged.
+    ``_retry`` still backs off per delete, so a 429 burst self-regulates.
     """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    _tl = threading.local()
+
+    def _svc():
+        if creds is None:
+            return drive  # sequential fallback: one shared service
+        svc = getattr(_tl, "drive", None)
+        if svc is None:
+            from materialize.auth import build_service  # lazy: avoid import cycle
+
+            svc = build_service("drive", "v3", creds)
+            _tl.drive = svc
+        return svc
+
+    def _trash(f: dict) -> tuple[str, str | None]:
+        fid = f["id"]
+        try:
+            _retry(lambda: _svc().files().update(fileId=fid, body={"trashed": True}).execute(), log)
+            return fid, None
+        except Exception as exc:  # noqa: BLE001
+            # Skip undeletable items so the loop can't spin forever, but RECORD which ones
+            # survived — a silently-skipped file leaves the next eval a dirty environment.
+            return fid, f"{f.get('name', '?')}: {type(exc).__name__}: {exc}"
+
     trashed = 0
     survivors: dict[str, str] = {}  # id -> "name: error" for items we could not trash
-    while True:
-        resp = _retry(
-            lambda: drive.files()
-            .list(
-                q="'me' in owners and trashed = false",
-                spaces="drive",
-                fields="files(id, name)",
-                pageSize=200,
-            )
-            .execute(),
-            log,
-        )
-        files = resp.get("files") or []
-        if not files:
-            break
-        progressed = False
-        for f in files:
-            fid = f["id"]
-            try:
-                _retry(
-                    lambda fid=fid: drive.files().update(fileId=fid, body={"trashed": True}).execute(),
-                    log,
+    pool = ThreadPoolExecutor(max_workers=workers) if (creds is not None and workers > 1) else None
+    try:
+        while True:
+            resp = _retry(
+                lambda: drive.files()
+                .list(
+                    q="'me' in owners and trashed = false",
+                    spaces="drive",
+                    fields="files(id, name)",
+                    pageSize=1000,
                 )
-                trashed += 1
-                progressed = True
-                survivors.pop(fid, None)
-            except Exception as exc:  # noqa: BLE001
-                # Skip undeletable items so the loop can't spin forever, but RECORD which
-                # ones survived and why — a silently-skipped file leaves the next eval a
-                # dirty environment, so the caller must be able to see the wipe was partial.
-                survivors[fid] = f"{f.get('name', '?')}: {type(exc).__name__}: {exc}"
-        log(f"Trashed {trashed} Drive items so far (full wipe)")
-        if not progressed:
-            break
+                .execute(),
+                log,
+            )
+            files = resp.get("files") or []
+            if not files:
+                break
+            progressed = False
+            # Results are consumed here in the caller thread, so trashed/survivors/progressed
+            # are never touched by worker threads — no lock needed.
+            results = pool.map(_trash, files) if pool else map(_trash, files)
+            for fid, err in results:
+                if err is None:
+                    trashed += 1
+                    progressed = True
+                    survivors.pop(fid, None)
+                else:
+                    survivors[fid] = err
+            log(f"Trashed {trashed} Drive items so far (full wipe)")
+            if not progressed:
+                break
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
     if survivors:
         sample = "; ".join(list(survivors.values())[:5])
         log(f"WARNING Full Drive wipe INCOMPLETE: {len(survivors)} item(s) could not be "

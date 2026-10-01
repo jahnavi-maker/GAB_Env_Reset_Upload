@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import threading
 import unittest
+from unittest.mock import patch
 
 from materialize.calendar_sync import wipe_seeded_events
 from materialize.drive_sync import wipe_seed_folder
@@ -124,6 +126,45 @@ class DriveWipeGuardTests(unittest.TestCase):
         self.assertEqual(trashed, 1)  # only "a" trashed
         self.assertTrue(any("INCOMPLETE" in m for m in logs))
         self.assertTrue(any("1 undeletable" in m for m in logs))
+
+
+class _TSFakeDrive:
+    """Thread-safe fake: list() returns what's left, update() trashes under a lock."""
+    def __init__(self, files):
+        self._files = {f["id"]: f for f in files}
+        self._lock = threading.Lock()
+        self.list_calls = 0
+
+    def files(self):
+        return self
+
+    def list(self, **_kw):
+        with self._lock:
+            self.list_calls += 1
+            snapshot = list(self._files.values())
+        return _Req({"files": snapshot})
+
+    def update(self, fileId=None, body=None, **_kw):
+        with self._lock:
+            self._files.pop(fileId, None)
+        return _Req({"id": fileId})
+
+    def remaining(self):
+        with self._lock:
+            return len(self._files)
+
+
+class DriveWipeParallelTests(unittest.TestCase):
+    def test_parallel_wipe_trashes_all_files(self):
+        import materialize.drive_sync as ds
+        files = [{"id": f"f{i}", "name": f"n{i}.txt"} for i in range(60)]
+        drive = _TSFakeDrive(files)
+        # per-thread services come from build_service; point them all at the same thread-safe fake
+        with patch("materialize.auth.build_service", lambda *a, **k: drive):
+            logs: list[str] = []
+            trashed = ds.wipe_seed_folder(drive, "Student", logs.append, creds=object(), workers=8)
+        self.assertEqual(trashed, 60)        # all trashed via the worker pool
+        self.assertEqual(drive.remaining(), 0)
 
 
 if __name__ == "__main__":
