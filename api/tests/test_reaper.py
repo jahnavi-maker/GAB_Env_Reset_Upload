@@ -1,9 +1,10 @@
 """Stuck-session reaper + best-effort status writes (audit #1).
 
-A background task must never leave a row stuck queued/running (that blocks the
-account via the one-active-per-email lock). These verify the two guards:
+A background task must never leave a row stuck *running* (that blocks the
+account via the one-active-per-email lock). Queued wait is not stuck.
+These verify the two guards:
   * _safe_update never raises, even when the DB write fails
-  * _reap_stuck_sessions marks old non-terminal rows failed
+  * _reap_stuck_sessions marks old running rows failed (not queued)
 """
 import dataclasses
 import os
@@ -49,15 +50,17 @@ class ReaperTests(unittest.IsolatedAsyncioTestCase):
         await app._reap_stuck_sessions(store)
         self.assertEqual(store.patches, [])
 
-    async def test_reap_marks_old_nonterminal_rows_failed(self):
+    async def test_reap_marks_old_running_not_queued(self):
         store = _FakeStore()
         supa = dataclasses.replace(app.settings, supabase_url="http://x", supabase_key="k")
         with patch.object(app, "settings", supa):
             await app._reap_stuck_sessions(store)
         self.assertEqual(len(store.patches), 1)
-        table, params, fields = store.patches[0]
-        self.assertIn("in.(queued,running)", params["status"])
-        self.assertTrue(params["created_at"].startswith("lt."))
+        _table, params, fields = store.patches[0]
+        self.assertEqual(params["status"], "eq.running")
+        self.assertNotIn("queued", params["status"])
+        self.assertTrue(params["started_at"].startswith("lt."))
+        self.assertNotIn("created_at", params)
         self.assertEqual(fields["status"], "failed")
         self.assertIn("reaped", fields["error"])
 

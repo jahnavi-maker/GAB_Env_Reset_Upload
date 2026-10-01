@@ -66,22 +66,85 @@ def _db_hooks():
 
 def save_web_client(raw: bytes) -> dict[str, Any]:
     """Persist an uploaded consumer OAuth *web* client (client.json) so make_flow
-    uses it. Consumer-OAuth only (a service-account/DWD key is rejected upstream).
-    Reuses the seeder's validated saver (writes credentials.json, reports any
-    redirect URIs still missing from the client)."""
+    uses it. Reuses the seeder's validated saver (writes credentials.json)."""
     from materialize.authbackend import ConsumerOAuthBackend  # type: ignore
 
     return ConsumerOAuthBackend().save_web_client(raw)
 
 
-def client_status() -> dict[str, Any]:
-    """Whether a consumer OAuth web client is already configured server-side."""
-    try:
-        from materialize.authbackend import ConsumerOAuthBackend  # type: ignore
+def save_client(raw: bytes) -> dict[str, Any]:
+    """Save the dropped file. A service-account key enables domain-wide delegation
+    (no per-account Google login). A web client.json keeps one-time OAuth + saved token."""
+    import json as _json
 
-        return ConsumerOAuthBackend().client_status()
+    from materialize.authbackend import (  # type: ignore
+        is_service_account_info,
+        reset_backend,
+        save_service_account_key,
+        workspace_domain,
+    )
+
+    try:
+        data = _json.loads(raw.decode("utf-8-sig"))
     except Exception:
-        return {"present": False}
+        data = None
+    if is_service_account_info(data):
+        info = save_service_account_key(raw)
+        return {
+            "kind": "service_account",
+            "delegation": True,
+            "domain": workspace_domain() or "any Workspace domain",
+            **(info or {}),
+        }
+    info = save_web_client(raw)
+    os.environ["ENV_LOADER_AUTH_BACKEND"] = "consumer_oauth"
+    reset_backend()
+    return {"kind": "web", "delegation": False, **(info or {})}
+
+
+def delegation_active() -> bool:
+    try:
+        from materialize.authbackend import resolve_auth_mode  # type: ignore
+
+        return resolve_auth_mode() == "workspace_delegation"
+    except Exception:
+        return False
+
+
+def account_uses_delegation(email: str) -> bool:
+    """True when this account is impersonated via DWD (no saved consumer token)."""
+    try:
+        from materialize.authbackend import backend_for  # type: ignore
+
+        return backend_for(email).name == "workspace_delegation"
+    except Exception:
+        return False
+
+
+def client_status() -> dict[str, Any]:
+    """Delegation key if DWD is on; otherwise the consumer web client."""
+    try:
+        from materialize.authbackend import (  # type: ignore
+            ConsumerOAuthBackend,
+            discover_sa_key,
+            resolve_auth_mode,
+            sa_client_status,
+            workspace_domain,
+        )
+
+        if resolve_auth_mode() == "workspace_delegation":
+            key = discover_sa_key()
+            st = sa_client_status(key) if key else {}
+            return {
+                "present": bool(key),
+                "kind": "service_account",
+                "delegation": True,
+                "domain": workspace_domain() or "any Workspace domain",
+                **(st or {}),
+            }
+        return {"delegation": False, **ConsumerOAuthBackend().client_status()}
+    except Exception:
+        return {"present": False, "delegation": False}
 
 
 # Pending OAuth handshakes, keyed by the opaque `state` Google echoes back.

@@ -67,6 +67,46 @@ def _flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def normalize_deploy_mode(raw: str | None) -> str:
+    """``local`` (laptop) or ``ec2`` (hosted). Aliases: prod/production → ec2."""
+    v = (raw or "local").strip().lower()
+    if v in {"ec2", "prod", "production"}:
+        return "ec2"
+    return "local"
+
+
+def current_deploy_mode() -> str:
+    """Live mode. Reads the env so tests (and a restart after .env edit) pick it up."""
+    return normalize_deploy_mode(os.environ.get("GAB_DEPLOY_MODE"))
+
+
+def login_gate_enabled() -> bool:
+    """EC2 requires a freelancer Google sign-in on /reset and status pages."""
+    return current_deploy_mode() == "ec2"
+
+
+def require_signed_links() -> bool:
+    """EC2 always requires a signed Cosmo link; local does only when a secret is set."""
+    return current_deploy_mode() == "ec2" or bool(os.environ.get("RESET_LINK_SECRET", "").strip())
+
+
+def _default_state_dir() -> str:
+    if os.environ.get("GAB_STATE_DIR"):
+        return os.environ["GAB_STATE_DIR"]
+    if normalize_deploy_mode(os.environ.get("GAB_DEPLOY_MODE")) == "ec2":
+        return "/home/ubuntu/gab-state"
+    return ""
+
+
+def _default_log_dir() -> str:
+    if os.environ.get("RESET_LOG_DIR"):
+        return os.environ["RESET_LOG_DIR"]
+    state = _default_state_dir()
+    if state:
+        return str(Path(state).expanduser() / "qc_logs")
+    return str(Path(__file__).resolve().parent.parent / "qc_logs")
+
+
 @dataclass(frozen=True)
 class Settings:
     # --- API auth -----------------------------------------------------------
@@ -90,11 +130,9 @@ class Settings:
     # reference/back-compat but is intentionally ignored by the resolver.
     reset_services: str = os.environ.get("GAB_RESET_SERVICES", "")
     reset_timeout_s: int = _int_env("GAB_RESET_TIMEOUT_S", 5400)  # 90 min
-    # A queued/running session older than this is presumed dead (task crashed, DB
-    # write blipped, or the process restarted) and is reaped -> 'failed', so the
-    # one-active-per-email lock can't block an account forever. Must exceed the max
-    # legit runtime (reset_timeout_s) + a buffer.
-    stuck_reset_ttl_s: int = _int_env("STUCK_RESET_TTL_S", _int_env("GAB_RESET_TIMEOUT_S", 5400) + 1800)
+    # Running-only: reap if started_at is older than this. Must exceed the slowest
+    # legit Backend reseed (wipe + ~9k Drive). Queued wait is never reaped.
+    stuck_reset_ttl_s: int = _int_env("STUCK_RESET_TTL_S", 14400)  # 4h from started_at
     reaper_interval_s: int = _int_env("REAPER_INTERVAL_S", 600)  # sweep every 10 min
 
     # --- Parallelism + routing + QC logging ---------------------------------
@@ -105,16 +143,26 @@ class Settings:
     # use reset_concurrency; seed/reseed use this. ~6-8 is the safe ceiling per quota
     # bucket before Drive backoff kicks in on big batches.
     seed_concurrency: int = _int_env("SEED_CONCURRENCY", 6)
+    # Post-upload Google read-back (lists every Drive/Gmail/Calendar item). Off by
+    # default so bulk runs do not spend quota on verify. Set GAB_SKIP_VERIFY=0 to enable.
+    skip_verify: bool = _flag("GAB_SKIP_VERIFY", True)
     # Auto-decide delta vs reseed from gab_accounts.last_reset_persona.
     reset_auto_route: bool = _flag("RESET_AUTO_ROUTE", True)
+    # local = this laptop (login gate off, HTTP OAuth ok).
+    # ec2   = hosted (login gate on, signed links required, persistent gab-state paths).
+    deploy_mode: str = normalize_deploy_mode(os.environ.get("GAB_DEPLOY_MODE", "local"))
+    # Persistent data root on EC2 (tokens / manifests / qc logs). Empty on local.
+    state_dir: str = _default_state_dir()
     # Compact per-task QC logs (purged on QC confirm).
-    reset_log_dir: str = os.environ.get(
-        "RESET_LOG_DIR", str(Path(__file__).resolve().parent.parent / "qc_logs")
-    )
+    reset_log_dir: str = _default_log_dir()
+    # Readable async run/email logs (5-min snapshots + every update).
+    run_logs_dir: str = os.environ.get("GAB_LOGS_DIR", "")
     # QC logs are auto-purged this many days after they were last written. DB audit
     # rows are always kept. QC itself can no longer purge (review-only); this job and
     # the Bearer-protected /api/qc/{id}/confirm are the only ways a log is deleted.
     qc_log_retention_days: int = _int_env("QC_LOG_RETENTION_DAYS", 15)
+    # Readable run/email/drive/gmail/calendar logs are deleted after this many days.
+    log_retention_days: int = _int_env("LOG_RETENTION_DAYS", 5)
     accounts_table: str = os.environ.get("SUPABASE_ACCOUNTS_TABLE", "gab_accounts")
     # Google sign-in allow-list for /reset. Not the accounts that get reset.
     # Same table as /ui/freelancer/verify. gab_logins is not used for sign-in.
@@ -176,8 +224,25 @@ class Settings:
     def use_supabase_logins(self) -> bool:
         return self.use_supabase and self.logins_use_supabase
 
+    @property
+    def is_ec2(self) -> bool:
+        return current_deploy_mode() == "ec2"
+
 
 settings = Settings()
+
+
+def _apply_mode_paths() -> None:
+    """Point seeder tokens/runs at gab-state on EC2 (setup-ec2.sh creates these)."""
+    if settings.deploy_mode != "ec2":
+        return
+    state = Path(settings.state_dir or "/home/ubuntu/gab-state").expanduser()
+    os.environ.setdefault("GAB_TOKEN_DIR", str(state / "tokens"))
+    os.environ.setdefault("GAB_RUNS_DIR", str(state / "state"))
+    os.environ.setdefault("GAB_LOGS_DIR", str(state / "logs"))
+
+
+_apply_mode_paths()
 
 # The seeder (imported in-process for OAuth) derives its callback URL from
 # ENV_LOADER_BASE_URL. Point it at the platform's public URL so the client.json

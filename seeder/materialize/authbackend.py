@@ -35,7 +35,7 @@ from materialize.auth import (
 
 PENDING_PATH = TOKENS_DIR / "_oauth_pending.json"
 SA_KEY_PATH = ROOT / "gab-sa.json"
-DEFAULT_WORKSPACE_DOMAIN = "deccanexperts.us"
+CONSUMER_DOMAINS = {"gmail.com", "googlemail.com", "google.com"}
 # DWD tokens fail if we ask for openid / userinfo.email and Admin only authorized the APIs.
 DWD_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
@@ -85,8 +85,47 @@ def discover_sa_key() -> str:
 
 
 def workspace_domain() -> str:
-    raw = (os.environ.get("ENV_LOADER_WORKSPACE_DOMAIN") or DEFAULT_WORKSPACE_DOMAIN).strip()
-    return raw.lower().lstrip("@")
+    # Empty unless an operator pins one domain. Empty = any Workspace domain;
+    # Google's DWD grant is the real gate.
+    return (os.environ.get("ENV_LOADER_WORKSPACE_DOMAIN") or "").strip().lower().lstrip("@")
+
+
+def _email_domain(email: str) -> str:
+    raw = (email or "").strip().lower()
+    if "@" not in raw:
+        return ""
+    return raw.split("@", 1)[1]
+
+
+def has_saved_token(email: str) -> bool:
+    try:
+        return token_path(email).exists()
+    except Exception:
+        return False
+
+
+def sa_key_available() -> bool:
+    return bool(discover_sa_key())
+
+
+def delegation_domain_ok(email: str) -> bool:
+    """Consumer Gmail is never DWD. Other domains are allowed unless restricted."""
+    dom = _email_domain(email)
+    if not dom or dom in CONSUMER_DOMAINS:
+        return False
+    restrict = workspace_domain()
+    return (not restrict) or dom == restrict
+
+
+def backend_for(email: str) -> AuthBackend:
+    """Per-account backend: saved token or gmail.com → OAuth; Workspace + SA key → DWD."""
+    if _email_domain(email) in CONSUMER_DOMAINS:
+        return ConsumerOAuthBackend()
+    if has_saved_token(email):
+        return ConsumerOAuthBackend()
+    if sa_key_available() and delegation_domain_ok(email):
+        return WorkspaceDelegationBackend()
+    return ConsumerOAuthBackend()
 
 
 def resolve_auth_mode() -> str:
@@ -150,7 +189,6 @@ def save_service_account_key(raw: bytes) -> dict[str, Any]:
     secure_write(SA_KEY_PATH, text)
     os.environ["ENV_LOADER_AUTH_BACKEND"] = "workspace_delegation"
     os.environ["ENV_LOADER_SA_KEY"] = str(SA_KEY_PATH)
-    os.environ.setdefault("ENV_LOADER_WORKSPACE_DOMAIN", DEFAULT_WORKSPACE_DOMAIN)
     reset_backend()
     return sa_client_status(str(SA_KEY_PATH))
 
@@ -401,9 +439,9 @@ class WorkspaceDelegationBackend:
         return sa_client_status(self.key_path)
 
     def _in_domain(self, email: str) -> bool:
-        if not self.domain or "@" not in email:
+        if "@" not in email:
             return False
-        return email.lower().split("@", 1)[1] == self.domain
+        return (not self.domain) or email.lower().split("@", 1)[1] == self.domain
 
     def status(self, email: str) -> AuthState:
         if not self._in_domain(email):

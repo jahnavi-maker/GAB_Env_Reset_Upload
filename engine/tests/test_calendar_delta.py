@@ -368,6 +368,7 @@ def test_calendar_semantic_verify_rejects_extra_event():
 
 
 def test_calendar_only_verify_initializes_archive(monkeypatch, tmp_path):
+    monkeypatch.setenv("GAB_SKIP_VERIFY", "0")
     archive_instance = object()
     calendar_service = object()
     monkeypatch.setattr(

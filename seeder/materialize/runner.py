@@ -280,6 +280,7 @@ def run_populate(
     retry_plan: dict[str, Any] | None = None,
     replace_gmail_attachments: bool = False,
     mode: str = "seed",
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     del rebase_gmail, rebase_calendar
     from materialize.provision.pipeline import AccountWork, provision_accounts
@@ -344,6 +345,7 @@ def run_populate(
         run_id=run_id,
         log=log,
         verify=False,
+        on_progress=on_progress,
     )
     if skips:
         result.setdefault("skips", {})

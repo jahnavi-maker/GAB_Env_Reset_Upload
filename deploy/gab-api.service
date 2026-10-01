@@ -10,6 +10,10 @@ After=network.target
 [Service]
 User=ubuntu
 WorkingDirectory=/home/ubuntu/gab-env-platform/api
+Environment=GAB_DEPLOY_MODE=ec2
+Environment=GAB_STATE_DIR=/home/ubuntu/gab-state
+Environment=GAB_LOGS_DIR=/home/ubuntu/gab-state/logs
+Environment=LOG_RETENTION_DAYS=5
 EnvironmentFile=/home/ubuntu/gab-env-platform/.env
 # --workers 1 is REQUIRED for now: OAuth pending state is in-memory, so a second
 # worker would not see a consent started on the first. --proxy-headers lets the

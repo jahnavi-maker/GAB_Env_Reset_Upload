@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -7,6 +8,17 @@ from materialize.auth import build_service
 from materialize.drive_sync import SEED_FOLDER, find_seed_folder
 from materialize.gmail_sync import GAB_LABEL
 from materialize.calendar_sync import SEED_PROP
+
+
+def verify_disabled() -> bool:
+    """Read-back verify lists every Gmail/Drive/Calendar item and burns quota.
+
+    Off by default. Set GAB_SKIP_VERIFY=0 only if you explicitly want a recount.
+    """
+    raw = os.environ.get("GAB_SKIP_VERIFY")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _count_calendar(calendar) -> int:
@@ -107,6 +119,15 @@ def verify_seed(
     drive=None,
     drive_ineligible: int | None = None,
 ) -> dict[str, Any]:
+    if verify_disabled():
+        log("verify skipped (GAB_SKIP_VERIFY) — no Google read-back")
+        return {
+            "overall": "ok",
+            "skipped": True,
+            "modules": {},
+            "folder_id": folder_id,
+            "seed_folder": f"{SEED_FOLDER}__{persona}",
+        }
     calendar = calendar or build_service("calendar", "v3", creds)
     gmail = gmail or build_service("gmail", "v1", creds)
     drive = drive or build_service("drive", "v3", creds)

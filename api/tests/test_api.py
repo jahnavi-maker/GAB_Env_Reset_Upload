@@ -144,6 +144,8 @@ class FreelancerUiTest(unittest.TestCase):
         # Persona is shown (read-only) so the freelancer sees which environment they're
         # resetting; it's fetched from /ui/task, never editable here.
         self.assertIn("Persona", r.text)
+        self.assertIn("/ui/task", r.text)
+        self.assertIn("/ui/task/reset", r.text)
         # The staged progress card is part of the page.
         self.assertIn("Restore progress", r.text)
 

@@ -39,8 +39,9 @@ from .accounts import (
     public_account,
     resolve_google_client_id,
 )
-from .config import settings
+from .config import current_deploy_mode, login_gate_enabled, require_signed_links, settings
 from .db import Store, make_store
+from .runlog import RunLog, purge_old_logs
 from . import links
 from .models import (
     AccountLoginRequest,
@@ -58,8 +59,10 @@ from .models import (
     ResetApiResponse,
     ResetResponse,
     TaskLookupRequest,
+    OnboardSeedRequest,
     UploadRequest,
     UploadResponse,
+    ENGINE_FOR_ONBOARD,
 )
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -97,11 +100,20 @@ def _purge_expired_qc_logs() -> int:
     return removed
 
 
+def _purge_expired_run_logs() -> int:
+    try:
+        return purge_old_logs(days=settings.log_retention_days)
+    except Exception:
+        log.exception("run-log retention pass failed")
+        return 0
+
+
 async def _qc_retention_loop() -> None:
-    """Purge expired QC logs on startup, then once a day. Cancelled at shutdown."""
+    """Purge expired QC + run logs on startup, then once a day. Cancelled at shutdown."""
     while True:
         try:
             await asyncio.to_thread(_purge_expired_qc_logs)
+            await asyncio.to_thread(_purge_expired_run_logs)
         except Exception:  # noqa: BLE001 - background task must never crash the app
             log.exception("qc-log retention pass failed")
         await asyncio.sleep(86400)  # daily
@@ -110,8 +122,18 @@ async def _qc_retention_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store = _ensure_store(app)
+    mode = current_deploy_mode()
+    log.info("deploy_mode=%s login_gate=%s signed_links=%s", mode, login_gate_enabled(), require_signed_links())
     if not settings.api_key:
-        log.warning("RESET_API_KEY not set -> API authentication is DISABLED (dev only)")
+        if mode == "ec2":
+            log.error("RESET_API_KEY is required in EC2 mode — /api/* will reject every request")
+        else:
+            log.warning("RESET_API_KEY not set -> API authentication is DISABLED (dev only)")
+    if mode == "ec2":
+        if not settings.reset_link_secret:
+            log.error("RESET_LINK_SECRET is required in EC2 mode — freelancer links will 403")
+        if not settings.public_base_url.startswith("https://"):
+            log.warning("EC2 mode expects PUBLIC_BASE_URL=https://<host> (got %s)", settings.public_base_url)
     retention_task = asyncio.create_task(_qc_retention_loop())
     # Reap sessions left non-terminal by a crash/restart/DB-blip so no account stays
     # blocked (runs immediately on startup, then on an interval).
@@ -165,7 +187,13 @@ def get_store() -> Store:
 
 async def require_api_key(authorization: str | None = Header(default=None)) -> None:
     if not settings.api_key:
-        return  # dev mode, auth disabled (warned at startup)
+        if login_gate_enabled():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="RESET_API_KEY is required in EC2 mode",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return  # local mode, auth disabled (warned at startup)
     expected = f"Bearer {settings.api_key}"
     if not authorization or not hmac.compare_digest(authorization, expected):
         raise HTTPException(
@@ -270,7 +298,7 @@ async def _resolve_reset_account(
     rec = {
         "email": email,
         "persona": resolved,
-        "last_reset_persona": resolved,
+        "last_reset_persona": session_persona or "",
         "authorized": True,
         "status": "active",
     }
@@ -290,7 +318,8 @@ def _persona_key(value: str) -> str:
 
 
 async def _last_reset_persona(store: Store, email: str) -> str:
-    """Last known persona from Supabase gab_accounts (last_reset_persona, else persona)."""
+    """Persona last successfully seeded/reset. Not the assigned `persona` column
+    (that is set at registration and would make a never-seeded account look seeded)."""
     try:
         rec = await store.get_account(email)
     except Exception:
@@ -298,18 +327,18 @@ async def _last_reset_persona(store: Store, email: str) -> str:
         return ""
     if not rec:
         return ""
-    return str(rec.get("last_reset_persona") or rec.get("persona") or "").strip()
+    return str(rec.get("last_reset_persona") or "").strip()
 
 
 async def _decide_mode(store: Store, email: str, persona: str, explicit: str | None) -> str:
-    """Same persona as Supabase gab_accounts -> delta; different or unknown -> reseed."""
+    """New account → seed. Same last persona → delta. Different persona → reseed."""
     if explicit:
         return explicit
     if not settings.reset_auto_route:
         return settings.reset_mode
     last = await _last_reset_persona(store, email)
     if not last:
-        return "reseed"
+        return "seed"
     return "delta" if _persona_key(last) == _persona_key(persona) else "reseed"
 
 
@@ -330,17 +359,21 @@ async def _safe_update(store: Store, reset_session_id: str, fields: dict) -> Non
 
 
 async def _reap_stuck_sessions(store: Store) -> None:
-    """Mark queued/running rows older than the TTL as failed, so a crashed/lost task
-    or a DB-outage-stuck row can't block an account forever. Best-effort."""
+    """Fail only *running* sessions whose work started too long ago.
+
+    Queued rows are waiting for a concurrency slot (normal for a 50-account
+    Backend batch) and must not be reaped off created_at. A crashed worker is
+    still caught: running + started_at older than the TTL.
+    """
     if not settings.use_supabase:
         return  # local dev store has no shared rows to reap
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=settings.stuck_reset_ttl_s)).isoformat()
     try:
         await store.patch_table(
             settings.supabase_table,
-            {"status": "in.(queued,running)", "created_at": f"lt.{cutoff}"},
+            {"status": "eq.running", "started_at": f"lt.{cutoff}"},
             {"status": "failed", "completed_at": _now(),
-             "error": f"reaped: no terminal status within {settings.stuck_reset_ttl_s}s "
+             "error": f"reaped: running with no finish within {settings.stuck_reset_ttl_s}s "
                       "(task lost, process restart, or DB outage)"},
         )
     except Exception as exc:  # noqa: BLE001
@@ -377,8 +410,12 @@ async def _run_and_record(
     ok = False
     detail = None
     raw = None
+    rlog = RunLog(reset_session_id, email, persona=persona, mode=row_mode or mode)
+    rlog.start()
     try:
-        result = await asyncio.to_thread(engine.run_reset, email, persona, mode, services)
+        result = await asyncio.to_thread(
+            engine.run_reset, email, persona, mode, services, rlog.event, rlog.progress
+        )
         ok, detail, raw = result.success, result.detail, result.raw
         await _safe_update(
             store,
@@ -401,13 +438,16 @@ async def _run_and_record(
             except Exception:
                 log.warning("last_reset_persona update failed for %s", email)
         log.info("reset %s (%s) -> %s", reset_session_id, mode, "completed" if ok else "failed")
+        rlog.finish("completed" if ok else "failed", None if ok else detail)
     except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}"
         log.exception("reset %s crashed", reset_session_id)
+        rlog.finish("failed", detail)
         await _safe_update(
             store, reset_session_id, {"status": "failed", "completed_at": _now(), "error": detail}
         )
     finally:
+        rlog.close()
         # Surface skips/omits so QC can treat them as tickets. The engine reports
         # intentional omits (e.g. missing attachments) under "warnings"; a non-empty
         # list on an otherwise-ok run means "completed with skips" -> consider recover.
@@ -513,6 +553,8 @@ async def healthz() -> dict:
     return {
         "ok": True,
         "version": __version__,
+        "deploy_mode": current_deploy_mode(),
+        "login_gate": login_gate_enabled(),
         "store": "supabase" if settings.use_supabase else "local",
         "login_store": (
             f"supabase:{settings.freelancers_table}" if settings.use_supabase else "local"
@@ -546,8 +588,26 @@ async def ui_reset_status_page(reset_session_id: str) -> HTMLResponse:
 async def _require_freelancer_gate(
     store: Store, email: str | None = None, credential: str | None = None
 ) -> str:
-    """Login gate is off for now so reset can be tested. Re-enable later."""
-    return (email or "").strip().lower()
+    """EC2: only freelancers may open reset/status. Local: skip so you can test here."""
+    if not login_gate_enabled():
+        return (email or "").strip().lower()
+    proven = ""
+    if credential:
+        proven = (_verify_google_credential(credential) or "").strip().lower()
+    if not proven:
+        if resolve_google_client_id():
+            raise HTTPException(status_code=401, detail="sign in with Google to view this reset")
+        proven = (email or "").strip().lower()
+    if not proven or "@" not in proven:
+        raise HTTPException(status_code=401, detail="sign in to view this reset")
+    try:
+        row = await store.get_freelancer(proven)
+    except Exception:
+        log.exception("freelancer gate lookup failed")
+        raise HTTPException(status_code=503, detail="verification temporarily unavailable")
+    if not row or not row.get("active", True):
+        raise HTTPException(status_code=403, detail="this Google account is not on the freelancers list")
+    return proven
 
 
 def _bearer_ok(authorization: str | None) -> bool:
@@ -604,9 +664,9 @@ def _task_id_from_request(token: str | None, raw_task: str | None) -> str | None
             return links.verify(token)
         except links.TokenError as exc:
             raise HTTPException(status_code=403, detail=f"invalid or expired reset link: {exc}")
-    if links.enabled():
+    if require_signed_links():
         raise HTTPException(status_code=403, detail="a signed reset link is required")
-    return raw_task  # dev fallback only
+    return raw_task  # local fallback only
 
 
 def _resolve_from_request(
@@ -626,9 +686,9 @@ def _resolve_from_request(
         persona = (payload.get("per") or "").strip() or None
         sid = (payload.get("sid") or "").strip() or None
         return str(payload["tid"]), email, persona, sid
-    if links.enabled():
+    if require_signed_links():
         raise HTTPException(status_code=403, detail="a signed reset link is required")
-    return raw_task, None, None, None  # dev fallback only
+    return raw_task, None, None, None  # local fallback only
 
 
 async def _email_for_task(store: Store, task_allocation_id: str) -> str | None:
@@ -846,9 +906,11 @@ async def delete_freelancer(email: str, store: Store = Depends(get_store)) -> di
 
 @app.get("/ui/auth-config")
 async def ui_auth_config() -> dict:
-    """Public: tells the reset page whether Google sign-in is enabled and, if so,
-    which client id to use. Empty client id -> the page uses the email fallback."""
+    """Public: tells the reset page whether Google sign-in is required (EC2)
+    and which client id to use. Local mode leaves login_required false."""
     return {
+        "deploy_mode": current_deploy_mode(),
+        "login_required": login_gate_enabled(),
         "google_client_id": resolve_google_client_id(),
         "google_login_url": "/ui/google/start",
     }
@@ -1083,11 +1145,20 @@ async def ui_account_reset(
     background: BackgroundTasks,
     store: Store = Depends(get_store),
 ) -> ResetApiResponse:
-    """Same POST /api/environment/reset session. Login gate is off for now.
+    """Same POST /api/environment/reset session.
 
+    Local mode: no freelancer login required (so you can test here).
+    EC2 mode: caller must be on the freelancers list.
     The account that gets reset must be in gab_accounts. Response is the Cosmo
     contract: url, status, error, reset_session_id.
     """
+    if login_gate_enabled():
+        who = _login_email_from_request(req)
+        if not who:
+            raise HTTPException(status_code=401, detail="sign in with Google first")
+        row = await store.get_freelancer(who)
+        if not row or not row.get("active", True):
+            raise HTTPException(status_code=403, detail="this Google account is not on the freelancers list")
     reset_email = (req.reset_email or req.email or "").strip().lower()
     if not reset_email or "@" not in reset_email:
         raise HTTPException(status_code=400, detail="provide the gab_accounts email to reset")
@@ -1277,7 +1348,8 @@ async def get_upload(upload_session_id: str, store: Store = Depends(get_store)) 
 # guarded. An operator uploads client.json, pastes a CSV of email,persona, and #
 # for each row runs the SAME /upload flow (OAuth -> wipe -> engine seed ->      #
 # manifest) through the bounded pool -> safe for ~200-account batches. Separate #
-# from the deccan DWD seeder; no service-account/DWD path here.                 #
+# Drop a service-account key on /onboard for DWD, or a web client.json for     #
+# one-time OAuth (token saved). Same-persona Upload is a baseline delta.       #
 # --------------------------------------------------------------------------- #
 @app.get("/logins", response_class=HTMLResponse)
 async def ui_logins_page() -> HTMLResponse:
@@ -1339,10 +1411,10 @@ async def ui_authorize_workspace() -> HTMLResponse:
 
 @app.post("/ui/client")
 async def ui_client(file: UploadFile = File(...)) -> dict:
-    """Operator uploads the consumer OAuth *web* client (client.json)."""
+    """Drop a service-account key (DWD) or a consumer OAuth web client.json."""
     raw = await file.read()
     try:
-        status_info = upload.save_web_client(raw)
+        status_info = upload.save_client(raw)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, **(status_info or {})}
@@ -1394,22 +1466,54 @@ async def ui_upload_status(upload_session_id: str, store: Store = Depends(get_st
     }
 
 
+@app.get("/ui/upload/{upload_session_id}/progress")
+async def ui_upload_progress(upload_session_id: str, store: Store = Depends(get_store)) -> dict:
+    """Live Gmail/Drive/Calendar upload counts for onboard. No verification recount."""
+    record = await store.get(upload_session_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="unknown upload_session_id")
+    email = record.get("email") or ""
+    persona = record.get("persona") or record.get("last_reset_persona") or ""
+    progress = None
+    if email:
+        progress = await asyncio.to_thread(engine.read_progress, email, persona)
+    services = (progress or {}).get("services") or {}
+    return {
+        "upload_session_id": upload_session_id,
+        "status": record.get("status") or "unknown",
+        "error": record.get("error"),
+        "email": email,
+        "persona": persona,
+        "services": services,
+        "done": (progress or {}).get("done"),
+        "total": (progress or {}).get("total"),
+        "left": (progress or {}).get("left"),
+        "updated_at": (progress or {}).get("updated_at"),
+    }
+
+
 async def _seed_upload(
     store: Store,
     background: BackgroundTasks,
     email: str,
     persona: str,
     services: list[str] | None,
-) -> tuple[str, str]:
-    """First-time seed of an already-authorized account (engine ``seed``, no wipe).
+    mode: str | None = None,
+) -> tuple[str, str, str]:
+    """Bring an authorized account to the CSV persona baseline.
 
-    Recorded as mode='upload'. If last_reset_persona is already set, callers must
-    use the reset API instead. Returns (id, task_id).
+    Onboard may pass an explicit mode (reset / reseed / upload). Otherwise:
+    - never seeded        -> seed (full upload)
+    - same last persona   -> delta (remove extras, restore modified/missing)
+    - different persona   -> reseed (wipe + full upload)
     """
     email = email.lower()
-    last = await _last_reset_persona(store, email)
-    if last:
-        raise AlreadySeeded(email, last)
+    if mode:
+        engine_mode = ENGINE_FOR_ONBOARD[mode]
+        row_mode = mode
+    else:
+        engine_mode = await _decide_mode(store, email, persona, None)
+        row_mode = "upload" if engine_mode == "seed" else engine_mode
     reset_session_id = str(uuid.uuid4())
     task_allocation_id = f"upload-{uuid.uuid4()}"
     await store.create({
@@ -1421,37 +1525,53 @@ async def _seed_upload(
         "created_at": _now(),
         "started_at": None,
         "completed_at": None,
-        "mode": "upload",
+        "mode": row_mode,
         "error": None,
     })
     background.add_task(
         _bounded_run, store, reset_session_id, task_allocation_id,
-        email, persona, "seed", services, "upload",
+        email, persona, engine_mode, services, row_mode,
     )
-    return reset_session_id, task_allocation_id
+    return reset_session_id, task_allocation_id, row_mode
 
 
 @app.post("/ui/authorize")
 async def ui_authorize(req: UploadRequest, store: Store = Depends(get_store)) -> dict:
-    """Operator step 2: authorize ONE account (consent only). On success the
-    callback writes gab_accounts. No seeding here — that's the Bulk upload step."""
+    """Authorize one account. DWD impersonates immediately; otherwise one Google
+    consent and the refresh token is saved on this machine."""
+    email = req.email.lower()
+    if upload.account_uses_delegation(email):
+        try:
+            upload._db_hooks().on_authorize(email, req.persona)
+        except Exception:
+            log.warning("DWD on_authorize failed for %s", email, exc_info=True)
+        try:
+            await store.upsert_account(email, req.persona)
+            await store.patch_table(settings.accounts_table, {"email": f"eq.{email}"}, {"authorized": True})
+        except Exception:
+            log.warning("DWD gab_accounts write skipped for %s", email)
+        return {"email": email, "persona": req.persona, "auth_url": None, "delegated": True}
     try:
         auth_url = upload.build_auth_url(
-            req.email.lower(), req.persona, kind="authorize", return_to=req.return_to
+            email, req.persona, kind="authorize", return_to=req.return_to
         )
     except Exception as exc:
         log.exception("ui authorize init failed")
         raise HTTPException(status_code=502, detail="could not start Google authorization; please retry") from exc
-    return {"email": req.email.lower(), "persona": req.persona, "auth_url": auth_url}
+    return {"email": email, "persona": req.persona, "auth_url": auth_url, "delegated": False}
 
 
 @app.get("/ui/account")
 async def ui_account(email: str, store: Store = Depends(get_store)) -> dict:
-    """Authorize status for one account (drives the operator UI's 'authorized ✓')."""
+    """Authorize status: a usable token on this server, or DWD impersonation."""
     r = await _resolve_reset_account(store, email) or {}
+    delegated = upload.account_uses_delegation(email)
+    has_token = _seeder_token_exists(email)
     return {
         "email": email.lower(),
-        "authorized": bool(r.get("authorized")) or _seeder_token_exists(email),
+        "authorized": has_token or delegated,
+        "delegated": delegated,
+        "has_token": has_token,
         "persona": r.get("persona"),
         "last_reset_persona": r.get("last_reset_persona"),
     }
@@ -1459,40 +1579,34 @@ async def ui_account(email: str, store: Store = Depends(get_store)) -> dict:
 
 @app.post("/ui/seed")
 async def ui_seed(
-    req: UploadRequest,
+    req: OnboardSeedRequest,
     background: BackgroundTasks,
     store: Store = Depends(get_store),
 ) -> dict:
-    """Operator step 3 (per-account or via Bulk upload): push the first data into
-    an authorized account. Requires the account to be authorized already."""
+    """Onboard upload / reset / reseed. Omit mode to auto-route by last persona."""
     email = req.email.lower()
+    delegated = upload.account_uses_delegation(email)
+    if not delegated:
+        try:
+            acct = await store.query(
+                settings.accounts_table,
+                {"select": "authorized", "email": f"eq.{email}", "limit": "1"},
+            )
+        except Exception:
+            log.warning("authorized-state lookup failed for %s", email, exc_info=True)
+            acct = []
+        if not (acct and acct[0].get("authorized")) and not _seeder_token_exists(email):
+            raise HTTPException(status_code=400, detail="account not authorized yet")
     try:
-        acct = await store.query(
-            settings.accounts_table,
-            {"select": "authorized", "email": f"eq.{email}", "limit": "1"},
+        rsid, tid, op_mode = await _seed_upload(
+            store, background, email, req.persona, req.services, req.mode
         )
-    except Exception:
-        # Don't mask a store outage as "not authorized" silently — log it.
-        log.warning("authorized-state lookup failed for %s", email, exc_info=True)
-        acct = []
-    if not acct or not acct[0].get("authorized"):
-        raise HTTPException(status_code=400, detail="account not authorized yet")
-    try:
-        rsid, tid = await _seed_upload(store, background, email, req.persona, req.services)
-    except AlreadySeeded as exc:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"account already seeded as {exc.last_persona}; "
-                "use POST /api/environment/reset"
-            ),
-        ) from exc
     except Exception as exc:
         if "409" in str(exc) or "duplicate" in str(exc).lower() or "conflict" in str(exc).lower():
             raise HTTPException(status_code=409, detail="an operation is already running for this account") from exc
         log.exception("ui seed failed")
         raise HTTPException(status_code=502, detail="seeding could not start; please retry") from exc
-    return {"reset_session_id": rsid, "task_allocation_id": tid, "status": "in_progress"}
+    return {"reset_session_id": rsid, "task_allocation_id": tid, "status": "in_progress", "mode": op_mode}
 
 
 @app.post("/ui/recover")
@@ -1600,9 +1714,12 @@ async def get_reset(
     email: str | None = None,
     credential: str | None = None,
 ):
-    # Browser link (Accept: text/html) -> status page. JSON is open while login is off.
+    # Browser link (Accept: text/html) -> status page. JSON is open in local mode;
+    # EC2 requires the freelancer gate (same as /ui/reset/{id}).
     if accept and "text/html" in accept.lower():
         return RedirectResponse(url=f"/reset/status/{reset_session_id}", status_code=303)
+    if login_gate_enabled() and not _bearer_ok(authorization):
+        await _require_freelancer_gate(store, email, credential)
     record = await store.get(reset_session_id)
     if not record:
         raise HTTPException(status_code=404, detail="unknown reset_session_id")

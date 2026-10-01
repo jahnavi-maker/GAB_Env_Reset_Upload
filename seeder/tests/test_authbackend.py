@@ -10,6 +10,7 @@ from materialize.authbackend import (
     AuthError,
     ConsumerOAuthBackend,
     WorkspaceDelegationBackend,
+    backend_for,
     discover_sa_key,
     resolve_auth_mode,
     reset_backend,
@@ -95,6 +96,10 @@ class AutoDetectTests(unittest.TestCase):
                 self.assertEqual(resolve_auth_mode(), "workspace_delegation")
             finally:
                 ab.SA_KEY_PATH = original
+
+    def test_backend_for_gmail_is_oauth(self):
+        os.environ.pop("ENV_LOADER_AUTH_BACKEND", None)
+        self.assertEqual(backend_for("someone@gmail.com").name, "consumer_oauth")
 
     def test_save_service_account_key_switches_backend(self):
         with tempfile.TemporaryDirectory() as td:

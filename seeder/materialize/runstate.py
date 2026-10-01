@@ -15,7 +15,7 @@ from materialize.auth import safe_email
 from materialize.json_util import inspect_and_normalize
 
 ROOT = Path(__file__).resolve().parent.parent
-RUNS = ROOT / "runs"
+RUNS = Path(os.environ.get("GAB_RUNS_DIR") or (ROOT / "runs")).expanduser().resolve()
 ENV_ROOT = Path(
     os.environ.get("GAB_PERSONA_ROOT") or (ROOT / ".." / "PKJA_UltraEvals_Environments_")
 ).expanduser().resolve()

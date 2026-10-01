@@ -12,8 +12,16 @@ echo "==> Installing system packages"
 sudo apt-get update
 sudo apt-get install -y python3-venv python3-pip git nginx rsync
 
-echo "==> Persistent data dirs (tokens, manifests, QC logs)"
-mkdir -p "$STATE"/tokens "$STATE"/state "$STATE"/qc_logs
+echo "==> Persistent data dirs (tokens, manifests, QC logs, run logs)"
+mkdir -p "$STATE"/tokens "$STATE"/state "$STATE"/qc_logs "$STATE"/logs
+
+ENV_FILE=$CODE/.env
+if [ -f "$ENV_FILE" ]; then
+  grep -q '^GAB_LOGS_DIR=' "$ENV_FILE" || echo "GAB_LOGS_DIR=$STATE/logs" >> "$ENV_FILE"
+  grep -q '^LOG_RETENTION_DAYS=' "$ENV_FILE" || echo "LOG_RETENTION_DAYS=5" >> "$ENV_FILE"
+  grep -q '^GAB_STATE_DIR=' "$ENV_FILE" || echo "GAB_STATE_DIR=$STATE" >> "$ENV_FILE"
+  echo "==> Ensured $ENV_FILE has GAB_LOGS_DIR + LOG_RETENTION_DAYS"
+fi
 
 echo "==> Building API venv"
 python3 -m venv "$CODE/api/.venv"
@@ -34,7 +42,7 @@ echo
 echo "==> DONE with software install. Next, do these (see deploy/ files):"
 echo "  1. Put the engine config at $USER_HOME/.config/gab-seeder/config.json (server paths)"
 echo "  2. Copy credentials.json + gab-sa.json into $CODE/seeder/"
-echo "  3. Create $CODE/.env from deploy/.env.ec2.example (fill real values)"
+echo "  3. Create $CODE/.env from deploy/.env.ec2.example (GAB_DEPLOY_MODE=ec2; fill real values)"
 echo "  4. sudo cp deploy/gab-api.service /etc/systemd/system/ && sudo systemctl enable --now gab-api"
 echo "  5. sudo cp deploy/nginx-gab.conf /etc/nginx/sites-available/gab (edit DOMAIN) && enable + reload"
 echo "  6. sudo certbot --nginx -d <YOUR_DOMAIN>"

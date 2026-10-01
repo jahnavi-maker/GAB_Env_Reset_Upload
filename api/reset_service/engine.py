@@ -16,13 +16,17 @@ import copy
 import os
 import json
 import logging
+import re
 import subprocess
+import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from .config import settings
+from .runlog import read_account_progress, service_state
 
 log = logging.getLogger("reset_service.engine")
 
@@ -101,10 +105,38 @@ def _engine_env() -> dict[str, str]:
     return env
 
 
-def _run_cli(args: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        args, capture_output=True, text=True, timeout=settings.reset_timeout_s, env=_engine_env()
+def _run_cli(
+    args: list[str],
+    log_fn: Callable[[str], None] | None = None,
+) -> subprocess.CompletedProcess:
+    if log_fn is None:
+        return subprocess.run(
+            args, capture_output=True, text=True, timeout=settings.reset_timeout_s, env=_engine_env()
+        )
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=_engine_env(),
     )
+    chunks: list[str] = []
+    deadline = time.monotonic() + settings.reset_timeout_s
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            chunks.append(line)
+            text = line.rstrip()
+            if text:
+                log_fn(text)
+            if time.monotonic() > deadline:
+                proc.kill()
+                raise subprocess.TimeoutExpired(args, settings.reset_timeout_s)
+        proc.wait(timeout=max(1.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise
+    return subprocess.CompletedProcess(args, proc.returncode or 0, "".join(chunks), "")
 
 
 def _base_args(sub: str, config_path: Path, persona: str, services: str | None) -> list[str]:
@@ -265,6 +297,100 @@ def _run_reseed(cfg_path: Path, persona: str, svc: str | None, email: str):
     return proc, None
 
 
+def _ensure_seeder_path() -> str:
+    seeder = str(Path(settings.seeder_dir).expanduser().resolve())
+    if seeder not in sys.path:
+        sys.path.insert(0, seeder)
+    return seeder
+
+
+def _acct_run_id(email: str, folder: str) -> str:
+    safe = re.sub(r"[^a-z0-9]+", "_", f"{email}__{folder}".lower()).strip("_")
+    return f"acct-{safe}"
+
+
+def _svc_progress(sc: dict) -> dict:
+    """Turn raw per-service job-status counts into a display payload."""
+    total = sum(int(v) for v in sc.values())
+    done = int(sc.get("SUCCESS") or 0)
+    failed = int(sc.get("PERMANENT_FAILURE") or 0)
+    inflight = int(sc.get("PROCESSING") or 0) + int(sc.get("RETRY") or 0)
+    pending = int(sc.get("PENDING") or 0)
+    left = max(0, total - done - failed)
+    if total == 0:
+        state = "pending"
+    elif failed and left <= 0:
+        state = "failed"
+    elif left <= 0:
+        state = "completed"
+    elif inflight or done or failed:
+        state = "in_progress"
+    else:
+        state = "pending" if pending else "in_progress"
+    return {
+        "total": total,
+        "done": done,
+        "failed": failed,
+        "retrying": int(sc.get("RETRY") or 0),
+        "left": left,
+        "state": state,
+    }
+
+
+def _progress_from_sqlite(email: str, persona: str) -> dict | None:
+    """Live counts from the seeder job store, when that file exists."""
+    try:
+        _ensure_seeder_path()
+        from materialize.runstate import RUNS  # type: ignore
+    except Exception:
+        return None
+    folder = _persona_dir(persona)
+    sqlite_path = RUNS / _acct_run_id(email, folder) / "provision.sqlite"
+    if not sqlite_path.exists():
+        return None
+    import sqlite3
+
+    try:
+        con = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                "SELECT service, status, COUNT(*) AS n FROM jobs GROUP BY service, status"
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    agg: dict = {}
+    for r in rows:
+        agg.setdefault(r["service"], {})[r["status"]] = int(r["n"])
+    services = {name: _svc_progress(agg[name]) for name in ("gmail", "calendar", "drive") if name in agg}
+    return {"services": services} if services else None
+
+
+def read_progress(email: str, persona: str) -> dict | None:
+    """Live Gmail/Drive/Calendar counts for onboard. Upload progress only — no verify."""
+    snap = read_account_progress(email)
+    if snap and snap.get("services"):
+        services = {}
+        for name, row in (snap.get("services") or {}).items():
+            if not isinstance(row, dict):
+                continue
+            item = dict(row)
+            item.setdefault("state", service_state(item))
+            services[name] = item
+        if services:
+            return {
+                "services": services,
+                "done": snap.get("done"),
+                "total": snap.get("total"),
+                "left": snap.get("left"),
+                "elapsed_s": snap.get("elapsed_s"),
+                "updated_at": snap.get("updated_at"),
+            }
+    return _progress_from_sqlite(email, persona)
+
+
 def _persona_dir(persona: str) -> str:
     """Match a request persona to a folder under GAB_PERSONA_ROOT."""
     import sys
@@ -282,7 +408,14 @@ def _persona_dir(persona: str) -> str:
     return persona
 
 
-def _run_seeder_reset(email: str, persona: str, mode: str, services: str | None) -> ResetResult:
+def _run_seeder_reset(
+    email: str,
+    persona: str,
+    mode: str,
+    services: str | None,
+    log_fn: Callable[[str], None] | None = None,
+    progress_fn: Callable[[dict], None] | None = None,
+) -> ResetResult:
     """Run the seeder provision pipeline (same as the :8765 Push button)."""
     import sys
 
@@ -290,7 +423,7 @@ def _run_seeder_reset(email: str, persona: str, mode: str, services: str | None)
     if seeder not in sys.path:
         sys.path.insert(0, seeder)
     try:
-        from materialize.authbackend import get_backend  # type: ignore
+        from materialize.authbackend import backend_for  # type: ignore
         from materialize.provision.route import apply_mode  # type: ignore
         from materialize.runstate import ENV_ROOT, persona_file  # type: ignore
         from materialize.runner import run_populate  # type: ignore
@@ -299,15 +432,29 @@ def _run_seeder_reset(email: str, persona: str, mode: str, services: str | None)
 
     folder = _persona_dir(persona)
     picked = {s.strip() for s in (services or "drive,gmail,calendar").split(",") if s.strip()}
-    flags = apply_mode(mode if mode in ("seed", "delta", "reseed") else "delta")
+    # Seeder delta restores missing/changed items but does not delete extras.
+    # Same-persona baseline reset must remove leftovers, so wipe then restore.
+    if mode in ("delta", "reconcile"):
+        flags = apply_mode("reseed")
+        flags["mode"] = "delta"
+    else:
+        flags = apply_mode(mode if mode in ("seed", "reseed") else "seed")
     try:
-        creds = get_backend().credentials_for(email)
+        creds = backend_for(email).credentials_for(email)
     except Exception as exc:
         return ResetResult(False, f"no saved Google token for {email}: {exc}", mode)
 
     github = ENV_ROOT / folder / "services" / "github"
     github_dir = github if github.is_dir() else None
     log.info("seeder reset start email=%s persona=%s mode=%s github=%s", email, folder, mode, github_dir)
+    if log_fn:
+        log_fn(f"seeder start email={email} persona={folder} mode={mode} github={github_dir}")
+
+    def _seeder_log(message: str) -> None:
+        log.info("%s", message)
+        if log_fn:
+            log_fn(message)
+
     try:
         result = run_populate(
             creds,
@@ -322,9 +469,11 @@ def _run_seeder_reset(email: str, persona: str, mode: str, services: str | None)
             do_github=False,
             do_github_zip=bool(github_dir),
             wipe=bool(flags.get("wipe")),
-            log=lambda m: log.info("%s", m),
+            log=_seeder_log,
             target_email=email,
             mode=str(flags.get("mode") or mode),
+            run_id=_acct_run_id(email, folder),
+            on_progress=progress_fn,
         )
     except Exception as exc:
         log.exception("seeder reset failed for %s", email)
@@ -340,6 +489,8 @@ def run_reset(
     persona: str,
     mode: str | None = None,
     services: list[str] | None = None,
+    log_fn: Callable[[str], None] | None = None,
+    progress_fn: Callable[[dict], None] | None = None,
 ) -> ResetResult:
     mode = (mode or settings.reset_mode).strip()
     try:
@@ -347,15 +498,34 @@ def run_reset(
     except ValueError as exc:
         return ResetResult(False, str(exc), mode)
 
+    if log_fn:
+        log_fn(f"engine start email={email} persona={persona} mode={mode} services={svc or 'all'}")
+
     if settings.simulate:
         time.sleep(1.0)
         log.info("SIMULATE reset ok email=%s persona=%s mode=%s services=%s", email, persona, mode, svc or "all")
+        if progress_fn:
+            progress_fn({
+                "done": 1,
+                "total": 1,
+                "left": 0,
+                "success": 1,
+                "failed": 0,
+                "elapsed_s": 1.0,
+                "services": {
+                    "drive": {"done": 1, "total": 1, "left": 0, "failed": 0},
+                    "gmail": {"done": 1, "total": 1, "left": 0, "failed": 0},
+                    "calendar": {"done": 1, "total": 1, "left": 0, "failed": 0},
+                },
+            })
+        if log_fn:
+            log_fn("simulated reset completed")
         return ResetResult(True, "simulated reset", mode, returncode=0)
 
     if not settings.gab_config:
         # Local seeder path: reuse the same pipeline as the :8765 UI when the
         # engine zip/config has not been set up yet.
-        return _run_seeder_reset(email, persona, mode, svc)
+        return _run_seeder_reset(email, persona, mode, svc, log_fn, progress_fn)
 
     # Build the per-request config up front. A missing/malformed engine config (or a
     # persona absent from it) must return a clean message, not leak a raw traceback.

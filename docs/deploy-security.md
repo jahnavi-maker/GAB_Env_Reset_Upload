@@ -1,7 +1,11 @@
 # Deploy security — two settings to apply on EC2
 
-These are **deployment settings only**. No application code changes; the flow is
-unchanged. They close the two remaining items from the security audit.
+Set `GAB_DEPLOY_MODE=ec2` in the host `.env` (see `deploy/.env.ec2.example`).
+Local testing keeps `GAB_DEPLOY_MODE=local` so the freelancer login gate and
+signed-link requirement stay off.
+
+These are **deployment settings**. They close the two remaining items from the
+security audit.
 
 ---
 

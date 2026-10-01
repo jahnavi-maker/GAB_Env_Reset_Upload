@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,7 +75,8 @@ class AccountResult:
 def _store_path(run_id: str | None) -> Path:
     if run_id:
         return RUNS / str(run_id) / "provision.sqlite"
-    return Path.cwd() / "provision.sqlite"
+    # Never share cwd/provision.sqlite across concurrent accounts (SQLite lock).
+    return RUNS / f"anon-{uuid.uuid4().hex[:12]}" / "provision.sqlite"
 
 
 class Pipeline:
@@ -108,6 +110,7 @@ class Pipeline:
         self._logs = {w.email: (w.log or log) for w in works}
         self._attachments: dict[str, dict[str, bytes]] = {}
         self._checksums: FairQueue = FairQueue()
+        self.on_progress: Callable[[dict[str, Any]], None] | None = None
 
     def _alog(self, email: str, message: str) -> None:
         (self._logs.get(email) or self.log)(message)
@@ -297,8 +300,14 @@ class Pipeline:
         from materialize.jobs import set_progress
 
         payload = self._progress_payload()
+        payload["elapsed_s"] = time.monotonic() - self.metrics._started
         for job_id in self.progress_ids:
             set_progress(job_id, payload)
+        if self.on_progress:
+            try:
+                self.on_progress(payload)
+            except Exception:
+                pass
         return payload
 
     def _progress(self) -> None:
@@ -414,12 +423,14 @@ def provision_accounts(
     run_id: str | None,
     log: Callable[[str], None],
     config: ProvisionConfig | None = None,
-    verify: bool = True,
+    verify: bool = False,
     progress_job_ids: list[str] | None = None,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     if not works:
         raise PlanError("no accounts to provision")
     pipeline = Pipeline(works, run_id=run_id, log=log, config=config)
+    pipeline.on_progress = on_progress
     pipeline.progress_ids.update(i for i in (progress_job_ids or []) if i)
     try:
         results = pipeline.run()

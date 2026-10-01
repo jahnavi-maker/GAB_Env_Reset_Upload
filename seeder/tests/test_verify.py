@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import unittest
+
+os.environ["GAB_SKIP_VERIFY"] = "0"
 
 from materialize.verify import verify_seed
 
@@ -228,6 +231,12 @@ class VerifyCountingTests(unittest.TestCase):
         self.assertEqual(result["modules"]["drive"]["ineligible"], 3)
         self.assertEqual(result["modules"]["drive"]["tone"], "ok")
 
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_skip_flag_makes_no_google_calls(self):
+        os.environ["GAB_SKIP_VERIFY"] = "1"
+        try:
+            result = _run(_calendar(0), _gmail(0), _drive([]), expect_cal=9, expect_mail=9, expect_drive=9)
+            self.assertTrue(result.get("skipped"))
+            self.assertEqual(result["overall"], "ok")
+            self.assertEqual(result["modules"], {})
+        finally:
+            os.environ["GAB_SKIP_VERIFY"] = "0"

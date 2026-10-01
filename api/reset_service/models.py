@@ -6,6 +6,25 @@ from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+# Onboard page only. Engine always sees seed | delta | reseed.
+ONBOARD_MODES = frozenset({"reset", "reseed", "upload"})
+ENGINE_FOR_ONBOARD = {
+    "reset": "delta",
+    "reseed": "reseed",
+    "upload": "seed",
+}
+
+
+def _optional_onboard_mode(v: str | None) -> str | None:
+    if v is None:
+        return None
+    key = str(v).strip().lower()
+    if not key:
+        return None
+    if key not in ONBOARD_MODES:
+        raise ValueError("mode must be reset, reseed, or upload")
+    return key
+
 
 class ResetRequest(BaseModel):
     """Body for POST /api/environment/reset: which account+persona to reset for a task."""
@@ -45,6 +64,19 @@ class UploadRequest(BaseModel):
         if "@" not in v or "." not in v.split("@")[-1]:
             raise ValueError("email must be a valid address")
         return v
+
+
+class OnboardSeedRequest(UploadRequest):
+    """POST /ui/seed from the onboard page. Optional mode skips persona auto-route."""
+    mode: Optional[str] = Field(
+        default=None,
+        description="Optional onboard-only. reset (delta) | reseed (wipe+upload) | upload. Omit to auto-route by last persona.",
+    )
+
+    @field_validator("mode")
+    @classmethod
+    def _known_mode(cls, v: str | None) -> str | None:
+        return _optional_onboard_mode(v)
 
 
 class TaskLookupRequest(BaseModel):

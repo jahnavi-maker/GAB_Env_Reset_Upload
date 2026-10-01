@@ -99,7 +99,7 @@
     <div id="lookupView">
       <div class="pad">
         <h1>Environment Reset</h1>
-        <p class="subtle">You are signed in. Enter the gab_accounts email to reset.</p>
+        <p class="subtle">Reset your assigned account to its baseline.</p>
       </div>
       <div class="divider"></div>
       <div class="pad">
@@ -108,14 +108,18 @@
           <div class="value empty" id="loginAs">—</div>
         </div>
         <div class="field">
-          <div class="label">Account to reset</div>
-          <input id="resetEmail" type="email" autocomplete="email" placeholder="seeded-account@gmail.com" />
+          <div class="label">Task</div>
+          <div class="value empty" id="taskId">—</div>
+        </div>
+        <div class="field">
+          <div class="label">Account</div>
+          <div class="value empty" id="email">—</div>
         </div>
         <div class="field">
           <div class="label">Persona</div>
-          <div class="value empty" id="persona">looked up from gab_accounts</div>
+          <div class="value empty" id="persona">—</div>
         </div>
-        <button id="resetBtn">Reset environment</button>
+        <button id="resetBtn" disabled>Reset environment</button>
         <div class="err-detail" id="lookupErr"></div>
       </div>
     </div>
@@ -164,15 +168,19 @@
   // ?task_allocation_id= / ?email= query (used only when the server has no secret).
   const hash = new URLSearchParams((location.hash || "").replace(/^#/, ""));
   const query = new URLSearchParams(location.search);
+  let storedToken = null;
+  try { storedToken = sessionStorage.getItem("gab_reset_t"); } catch(_){}
   const ctx = {
-    token: hash.get("t") || hash.get("token") || null,
+    token: hash.get("t") || hash.get("token") || storedToken || null,
     task_allocation_id: query.get("task_allocation_id") || query.get("task") || null,
     email: query.get("email") || null,
     loginEmail: null,
-    resetEmail: query.get("email") || null,
     persona: null,
     credential: null,
   };
+  if (ctx.token){
+    try { sessionStorage.setItem("gab_reset_t", ctx.token); } catch(_){}
+  }
 
   const STEPS = ["Authenticate","Inspect changes","Restore Drive","Restore Gmail","Restore Calendar","Verify baseline","Complete"];
   const $ = id => document.getElementById(id);
@@ -252,10 +260,30 @@
     if (disp==="completed" || disp==="failed"){ $("againBtn").classList.remove("hidden"); }
   }
 
-  function showRegisteredAccount(){
-    setVal($("loginAs"), ctx.loginEmail || ctx.email);
-    if (ctx.resetEmail && $("resetEmail")) $("resetEmail").value = ctx.resetEmail;
-    $("resetBtn").disabled = false;
+  async function loadTask(){
+    setVal($("loginAs"), ctx.loginEmail);
+    if (!ctx.token && !ctx.task_allocation_id && !ctx.email){
+      $("lookupErr").textContent = "No reset link. Open the link from Cosmo.";
+      return;
+    }
+    try {
+      const r = await fetch("/ui/task", {
+        method:"POST", headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ token: ctx.token, task_allocation_id: ctx.task_allocation_id, email: ctx.email }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
+      ctx.task_allocation_id = d.task_allocation_id || ctx.task_allocation_id;
+      ctx.email = d.email || ctx.email;
+      ctx.persona = d.persona || null;
+      setVal($("taskId"), ctx.task_allocation_id);
+      setVal($("email"), ctx.email);
+      setVal($("persona"), ctx.persona);
+      $("resetBtn").disabled = !ctx.email;
+      if (!ctx.email) $("lookupErr").textContent = "Could not find your account for this task.";
+    } catch(e){
+      $("lookupErr").textContent = e.message;
+    }
   }
 
   async function poll(id){
@@ -282,30 +310,19 @@
   }
 
   async function startReset(){
-    const target = (($("resetEmail") && $("resetEmail").value) || ctx.resetEmail || "").trim().toLowerCase();
-    if (!target || target.indexOf("@") < 0){
-      $("lookupErr").textContent = "Enter the gab_accounts email to reset.";
-      return;
-    }
-    ctx.resetEmail = target;
     $("resetBtn").disabled = true;
     showProgress();
     renderProgress("queued", null);
     try {
-      const r = await fetch("/ui/account/reset", {
+      const r = await fetch("/ui/task/reset", {
         method:"POST", headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({
-          credential: ctx.credential,
-          email: ctx.loginEmail,
-          reset_email: ($("resetEmail") && $("resetEmail").value) || ctx.resetEmail || ctx.email,
-        }),
+        body: JSON.stringify({ token: ctx.token, task_allocation_id: ctx.task_allocation_id, email: ctx.email }),
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
-      RESET_ID = d.reset_session_id || (d.url || "").split("/").pop();
-      ctx.email = ctx.resetEmail;
-      renderProgress(d.status || "in_progress", d.error);
-      poll(RESET_ID);
+      RESET_ID = d.reset_session_id;
+      renderProgress(d.status || "running", null);
+      poll(d.reset_session_id);
     } catch(e){
       renderProgress("failed", "Could not start reset: " + e.message);
     }
@@ -331,7 +348,7 @@
   function showTask(){
     $("loginView").classList.add("hidden");
     $("lookupView").classList.remove("hidden");
-    showRegisteredAccount();
+    loadTask();
   }
   async function postLogin(body){
     $("loginErr").textContent = "";
@@ -342,7 +359,6 @@
       const d = await r.json();
       if (r.ok && d.verified){
         ctx.loginEmail = d.email;
-        ctx.email = d.email;
         ctx.credential = body.credential || null;
         showTask();
         return true;
@@ -382,9 +398,23 @@
     if (code === "google") return "Google sign-in did not complete. Try again.";
     return "";
   }
-  (function initGate(){
-    // Sign-in is off for now — open the reset form directly.
-    showTask();
+  (async function initGate(){
+    let loginRequired = false;
+    let clientId = "";
+    try {
+      const r = await fetch("/ui/auth-config");
+      const d = await r.json();
+      loginRequired = !!d.login_required;
+      clientId = d.google_client_id || "";
+    } catch(e) {}
+    if (!loginRequired) { showTask(); return; }
+    $("lookupView").classList.add("hidden");
+    $("loginView").classList.remove("hidden");
+    if (clientId) setupGoogle(clientId);
+    const err = loginErrorMessage(query.get("login_error") || hash.get("login_error"));
+    if (err) $("loginErr").textContent = err;
+    const cred = hash.get("credential");
+    if (cred) await postLogin({ credential: cred });
   })();
 </script>
 </body>

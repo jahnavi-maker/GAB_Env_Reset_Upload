@@ -105,6 +105,7 @@ exercised end-to-end. Set `GAB_RESET_SIMULATE=0` for real runs.
 | `SUPABASE_URL`, `SUPABASE_KEY` | Supabase project + service-role key (server-side only). |
 | `SUPABASE_TABLE`, `SUPABASE_ACCOUNTS_TABLE` | `reset_sessions`, `gab_accounts`. |
 | `RESET_API_KEY` | Bearer secret for `/api/*`. |
+| `GAB_DEPLOY_MODE` | `local` (default, test here) or `ec2` (login gate + signed links + gab-state paths). |
 | `PUBLIC_BASE_URL` | Public origin; the OAuth redirect derives from it. |
 | `RESET_LINK_SECRET` | Signs freelancer reset links (unset = dev raw-id fallback). |
 | `GAB_SEED_BIN` | Path to the engine's `gab-seed` (in `engine/.venv`). |

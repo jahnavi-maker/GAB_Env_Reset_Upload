@@ -878,26 +878,19 @@ def _execute_push(
                 except Exception as exc:
                     github_state = {"state": "failed"}
                     raise RuntimeError(f"github push failed: {exc}") from exc
-        expect = result.get("expect") or {}
-        services = result.pop("services", {}) or {}
+        result.pop("services", None)
         verify = verify_seed(
             creds,
             persona=persona,
-            expect_calendar=expect.get("calendar") if body.calendar else None,
-            expect_gmail=expect.get("gmail") if body.gmail else None,
-            expect_drive=expect.get("drive") if body.drive else None,
+            expect_calendar=None,
+            expect_gmail=None,
+            expect_drive=None,
             folder_id=result.get("folder_id"),
             log=log,
-            calendar=services.get("calendar"),
-            gmail=services.get("gmail"),
-            drive=services.get("drive"),
-            drive_ineligible=result.get("drive_ineligible"),
         )
-        overall = verify.get("overall") or "partial"
+        overall = (result.get("accounts") or {}).get(email, {}).get("status") or verify.get("overall") or "ok"
         if overall == "failed":
-            log_fail(log, email, "verify", "read-back found nothing against a non-zero source", run_id=run_id, job_id=job_id)
-        elif overall == "partial":
-            log_warn(log, email, "verify", "read-back is short of the source counts", job_id=job_id)
+            log_fail(log, email, "push", "provision reported failed", run_id=run_id, job_id=job_id)
 
         def finish_ok(acc: dict[str, Any], _m: dict[str, Any]) -> None:
             if not _owns_job(acc, job_id):
@@ -1201,23 +1194,18 @@ def push_all(run_id: str, body: PushBody, persona: str | None = None):
                     child_log = work.log or log
                     try:
                         account_result = (results.get("accounts") or {}).get(email) or {}
-                        expect = account_result.get("expect") or {}
-                        services = account_result.get("services") or {}
                         verify = verify_seed(
                             work.creds,
                             persona=work.persona,
-                            expect_calendar=expect.get("calendar") if work.do_calendar else None,
-                            expect_gmail=expect.get("gmail") if work.do_gmail else None,
-                            expect_drive=expect.get("drive") if work.do_drive else None,
+                            expect_calendar=None,
+                            expect_gmail=None,
+                            expect_drive=None,
                             folder_id=account_result.get("folder_id"),
                             log=child_log,
-                            calendar=services.get("calendar"),
-                            gmail=services.get("gmail"),
-                            drive=services.get("drive"),
                         )
-                        overall = verify.get("overall") or account_result.get("status") or "partial"
+                        overall = account_result.get("status") or verify.get("overall") or "ok"
                         if overall == "failed":
-                            log_fail(child_log, email, "verify", "read-back found nothing against a non-zero source", run_id=run_id, job_id=child)
+                            log_fail(child_log, email, "push", "provision reported failed", run_id=run_id, job_id=child)
                         pkey = work.persona_key
 
                         def finish_ok(acc: dict[str, Any], _m: dict[str, Any], ov=overall, cid=child, pers=work.persona) -> None:

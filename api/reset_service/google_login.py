@@ -53,6 +53,9 @@ def safe_next(next_path: str | None) -> str:
 
 
 def _allow_http_loopback() -> None:
+    # EC2 is HTTPS-only (nginx/certbot). Local HTTP loopback still needs this flag.
+    if settings.is_ec2:
+        return
     if settings.public_base_url.startswith("http://"):
         os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
 

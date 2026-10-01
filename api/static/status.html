@@ -282,9 +282,23 @@
     if (code === "google") return "Google sign-in did not complete. Try again.";
     return "";
   }
-  (function initGate(){
-    // Sign-in is off for now — show reset progress immediately.
-    showProgress();
+  (async function initGate(){
+    let loginRequired = false;
+    let clientId = "";
+    try {
+      const r = await fetch("/ui/auth-config");
+      const d = await r.json();
+      loginRequired = !!d.login_required;
+      clientId = d.google_client_id || "";
+    } catch(e) {}
+    if (!loginRequired) { showProgress(); return; }
+    $("progressView").classList.add("hidden");
+    $("loginView").classList.remove("hidden");
+    if (clientId) setupGoogle(clientId);
+    const err = loginErrorMessage(query.get("login_error") || hash.get("login_error"));
+    if (err) $("loginErr").textContent = err;
+    const cred = hash.get("credential");
+    if (cred) { await postLogin({ credential: cred }); return; }
   })();
 </script>
 </body>

@@ -215,9 +215,7 @@ class SupabaseStore(Store):
         }
         if password is not None:
             rec["password"] = password
-        # Same-persona reset is delta only when last_reset_persona is set.
-        if not (existing or {}).get("last_reset_persona"):
-            rec["last_reset_persona"] = (existing or {}).get("last_reset_persona") or persona
+        # last_reset_persona is set only after a successful seed/reset, not at register.
         r = await self._client.post(
             self._acct_url(),
             json=rec,
@@ -462,8 +460,7 @@ class LocalJsonStore(Store):
             rec["persona"] = persona
             if password is not None:
                 rec["password"] = password
-            if not rec.get("last_reset_persona"):
-                rec["last_reset_persona"] = persona
+            # last_reset_persona stays empty until a real seed/reset completes.
             rec["updated_at"] = _now_iso()
             data[key] = rec
             self._write_acct(data)

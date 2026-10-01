@@ -37,7 +37,7 @@ SCOPES = [
 ]
 
 ROOT = Path(__file__).resolve().parent.parent
-TOKENS_DIR = ROOT / "tokens"
+TOKENS_DIR = Path(os.environ.get("GAB_TOKEN_DIR") or (ROOT / "tokens")).expanduser().resolve()
 CREDENTIALS_PATH = ROOT / "credentials.json"
 BASE_URL = os.environ.get("ENV_LOADER_BASE_URL", "http://127.0.0.1:8765").rstrip("/")
 HTTP_TIMEOUT = 60

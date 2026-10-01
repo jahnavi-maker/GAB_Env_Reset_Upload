@@ -14,6 +14,8 @@ from materialize.fs_cache import cache_file_entries, read_cached_bytes
 
 SEED_FOLDER = "GAB_UltraEvals"
 SEED_PROP = "gabSeeded"
+_WIPE_PAGE = 1000
+_WIPE_BATCH = 100
 
 
 def _retry(fn, log: Callable[[str], None], tries: int = 6):
@@ -59,11 +61,66 @@ def find_seed_folder(drive, persona: str, log: Callable[[str], None]) -> str | N
     return files[0]["id"] if files else None
 
 
+def _trash_one(drive, file_id: str, log: Callable[[str], None]) -> bool:
+    try:
+        _retry(
+            lambda: drive.files().update(fileId=file_id, body={"trashed": True}).execute(),
+            log,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _trash_batch(drive, ids: list[str], log: Callable[[str], None]) -> int:
+    """Trash up to 100 Drive ids in one HTTP batch. Falls back to one-by-one."""
+    if not ids:
+        return 0
+    if not hasattr(drive, "new_batch_http_request"):
+        return sum(1 for fid in ids if _trash_one(drive, fid, log))
+
+    def run() -> int:
+        done = 0
+        errors: list[BaseException] = []
+
+        def cb(_request_id, _response, exception):
+            nonlocal done
+            if exception is None:
+                done += 1
+            else:
+                errors.append(exception)
+
+        batch = drive.new_batch_http_request(callback=cb)
+        for i, fid in enumerate(ids):
+            batch.add(
+                drive.files().update(fileId=fid, body={"trashed": True}),
+                request_id=str(i),
+            )
+        batch.execute()
+        if errors and done == 0:
+            raise errors[0]
+        return done
+
+    try:
+        return _retry(run, log)
+    except Exception as exc:
+        log(f"Drive wipe batch failed ({exc}); falling back one-by-one")
+        return sum(1 for fid in ids if _trash_one(drive, fid, log))
+
+
+def _trash_ids(drive, ids: list[str], log: Callable[[str], None]) -> int:
+    trashed = 0
+    for start in range(0, len(ids), _WIPE_BATCH):
+        trashed += _trash_batch(drive, ids[start : start + _WIPE_BATCH], log)
+    return trashed
+
+
 def wipe_seed_folder(drive, persona: str, log: Callable[[str], None]) -> int:
     """FULL wipe: trash ALL files/folders owned by the account (no marker match).
 
     Loop-until-empty: trashing a folder does not flip its children's `trashed`
     flag, so we re-list `trashed = false` owned items until none remain.
+    Files are trashed in HTTP batches of 100 (was one API call per file).
     """
     trashed = 0
     while True:
@@ -73,7 +130,7 @@ def wipe_seed_folder(drive, persona: str, log: Callable[[str], None]) -> int:
                 q="'me' in owners and trashed = false",
                 spaces="drive",
                 fields="files(id, name)",
-                pageSize=200,
+                pageSize=_WIPE_PAGE,
             )
             .execute(),
             log,
@@ -81,17 +138,9 @@ def wipe_seed_folder(drive, persona: str, log: Callable[[str], None]) -> int:
         files = resp.get("files") or []
         if not files:
             break
-        progressed = False
-        for f in files:
-            try:
-                _retry(
-                    lambda fid=f["id"]: drive.files().update(fileId=fid, body={"trashed": True}).execute(),
-                    log,
-                )
-                trashed += 1
-                progressed = True
-            except Exception:
-                pass  # skip undeletable items so the loop can't spin forever
+        ids = [str(f["id"]) for f in files if f.get("id")]
+        progressed = _trash_ids(drive, ids, log)
+        trashed += progressed
         log(f"Trashed {trashed} Drive items so far (full wipe)")
         if not progressed:
             break

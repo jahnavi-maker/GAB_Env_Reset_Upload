@@ -158,6 +158,114 @@ class LoginTableTest(unittest.TestCase):
         self.assertIn("ui-two@x.com", emails)
 
 
+class OnboardSeedRouteTest(unittest.TestCase):
+    """/ui/seed: new → upload, same persona → delta, switch → reseed."""
+
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+
+    def _authorize(self, email: str, persona: str, last: str | None = None) -> None:
+        import asyncio
+
+        from reset_service.app import get_store
+        from reset_service.config import settings
+
+        self.client.post("/api/accounts", json={"email": email, "persona": persona}, headers=AUTH)
+        store = get_store()
+
+        async def go() -> None:
+            fields: dict = {"authorized": True}
+            if last is not None:
+                fields["last_reset_persona"] = last
+            await store.patch_table(settings.accounts_table, {"email": f"eq.{email}"}, fields)
+
+        asyncio.run(go())
+
+    def test_new_account_is_upload(self) -> None:
+        email = "onboard-new@gmail.com"
+        self._authorize(email, "Student")
+        r = self.client.post("/ui/seed", json={"email": email, "persona": "Student"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["mode"], "upload")
+
+    def test_same_persona_is_delta(self) -> None:
+        email = "onboard-same@gmail.com"
+        self._authorize(email, "Student", last="Student")
+        r = self.client.post("/ui/seed", json={"email": email, "persona": "Student"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["mode"], "delta")
+
+    def test_persona_switch_is_reseed(self) -> None:
+        email = "onboard-switch@gmail.com"
+        self._authorize(email, "Student", last="Student")
+        r = self.client.post(
+            "/ui/seed", json={"email": email, "persona": "Backend_software_engineer"}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["mode"], "reseed")
+
+    def test_explicit_reset_is_delta_even_when_new(self) -> None:
+        email = "onboard-reset@gmail.com"
+        self._authorize(email, "Student")
+        r = self.client.post(
+            "/ui/seed", json={"email": email, "persona": "Student", "mode": "reset"}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["mode"], "reset")
+
+    def test_explicit_upload_skips_persona_route(self) -> None:
+        email = "onboard-upload@gmail.com"
+        self._authorize(email, "Student", last="Student")
+        r = self.client.post(
+            "/ui/seed", json={"email": email, "persona": "Student", "mode": "upload"}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["mode"], "upload")
+
+    def test_explicit_reseed_skips_persona_route(self) -> None:
+        email = "onboard-reseed@gmail.com"
+        self._authorize(email, "Student")
+        r = self.client.post(
+            "/ui/seed", json={"email": email, "persona": "Student", "mode": "reseed"}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["mode"], "reseed")
+
+    def test_unknown_mode_is_422(self) -> None:
+        email = "onboard-badmode@gmail.com"
+        self._authorize(email, "Student")
+        r = self.client.post(
+            "/ui/seed", json={"email": email, "persona": "Student", "mode": "wipe"}
+        )
+        self.assertEqual(r.status_code, 422)
+
+    def test_progress_is_upload_counts_without_verify(self) -> None:
+        email = "onboard-progress@gmail.com"
+        self._authorize(email, "Student")
+        r = self.client.post("/ui/seed", json={"email": email, "persona": "Student"})
+        self.assertEqual(r.status_code, 200, r.text)
+        sid = r.json()["reset_session_id"]
+        p = self.client.get(f"/ui/upload/{sid}/progress")
+        self.assertEqual(p.status_code, 200, p.text)
+        body = p.json()
+        self.assertNotIn("verify", body)
+        self.assertIn("services", body)
+        services = body["services"]
+        self.assertTrue(services)
+        self.assertIn("drive", services)
+        self.assertIn("gmail", services)
+        self.assertIn("calendar", services)
+        self.assertEqual(services["drive"]["done"], 1)
+        self.assertEqual(services["drive"]["total"], 1)
+
+    def test_onboard_page_has_live_status_not_verify(self) -> None:
+        r = self.client.get("/onboard")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("serviceBlock", r.text)
+        self.assertNotIn("verified ", r.text)
+        self.assertNotIn("/verify", r.text)
+
+
 class AccountApiTest(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(app)
@@ -227,12 +335,22 @@ class SplitLoginStoreTest(unittest.IsolatedAsyncioTestCase):
 
 
 class DecideModeTest(unittest.IsolatedAsyncioTestCase):
-    async def test_same_supabase_persona_is_delta(self) -> None:
+    async def test_never_seeded_is_seed(self) -> None:
         from reset_service.app import _decide_mode
 
         class _Store:
             async def get_account(self, email):
                 return {"email": email, "persona": "Backend_software_engineer", "last_reset_persona": None}
+
+        mode = await _decide_mode(_Store(), "test02gemini@gmail.com", "backend_software_engineer", None)
+        self.assertEqual(mode, "seed")
+
+    async def test_same_supabase_persona_is_delta(self) -> None:
+        from reset_service.app import _decide_mode
+
+        class _Store:
+            async def get_account(self, email):
+                return {"email": email, "persona": "Backend_software_engineer", "last_reset_persona": "Backend_software_engineer"}
 
         mode = await _decide_mode(_Store(), "test02gemini@gmail.com", "backend_software_engineer", None)
         self.assertEqual(mode, "delta")
@@ -247,7 +365,7 @@ class DecideModeTest(unittest.IsolatedAsyncioTestCase):
         mode = await _decide_mode(_Store(), "a@b.com", "Backend_software_engineer", None)
         self.assertEqual(mode, "reseed")
 
-    async def test_missing_supabase_row_is_reseed(self) -> None:
+    async def test_missing_supabase_row_is_seed(self) -> None:
         from reset_service.app import _decide_mode
 
         class _Store:
@@ -255,7 +373,7 @@ class DecideModeTest(unittest.IsolatedAsyncioTestCase):
                 return None
 
         mode = await _decide_mode(_Store(), "ghost@b.com", "Student", None)
-        self.assertEqual(mode, "reseed")
+        self.assertEqual(mode, "seed")
 
 
 if __name__ == "__main__":
