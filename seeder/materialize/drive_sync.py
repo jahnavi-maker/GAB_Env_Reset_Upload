@@ -66,6 +66,8 @@ def wipe_seed_folder(
     *,
     creds: Any = None,
     workers: int = 10,
+    limiter: Any = None,
+    account_id: str = "",
 ) -> int:
     """FULL wipe: trash ALL files/folders owned by the account (no marker match).
 
@@ -75,9 +77,13 @@ def wipe_seed_folder(
     With ``creds`` the per-batch deletes run across ``workers`` threads — each thread gets
     its OWN Drive service (googleapiclient/httplib2 is not thread-safe), exactly like the
     upload worker pool. This turns a ~9000-file wipe from a single-threaded ~1/s crawl into
-    a parallel job (the dominant cost of reseeding a large existing account). Without
-    ``creds`` it falls back to the safe sequential path, so existing callers are unchanged.
-    ``_retry`` still backs off per delete, so a 429 burst self-regulates.
+    a parallel job (the dominant cost of reseeding a large existing account).
+
+    When ``limiter`` (the pipeline's adaptive ServiceLimiters) is given, each delete acquires
+    a drive token first and records its outcome — so the parallel deletes are RATE-CONTROLLED
+    by the same adaptive throttle as uploads (fast when Google is happy, backs off on 429s)
+    instead of blasting uncontrolled. Without ``creds`` it falls back to the safe sequential
+    path, so existing callers are unchanged.
     """
     import threading
     from concurrent.futures import ThreadPoolExecutor
@@ -97,12 +103,19 @@ def wipe_seed_folder(
 
     def _trash(f: dict) -> tuple[str, str | None]:
         fid = f["id"]
+        if limiter is not None:
+            limiter.acquire("drive", account_id)  # adaptive rate control -> no 429 storm
         try:
             _retry(lambda: _svc().files().update(fileId=fid, body={"trashed": True}).execute(), log)
+            if limiter is not None:
+                limiter.record("drive", ok=True, rate_limited=False)
             return fid, None
         except Exception as exc:  # noqa: BLE001
             # Skip undeletable items so the loop can't spin forever, but RECORD which ones
             # survived — a silently-skipped file leaves the next eval a dirty environment.
+            if limiter is not None:
+                status = getattr(getattr(exc, "resp", None), "status", None)
+                limiter.record("drive", ok=False, rate_limited=status in (403, 429))
             return fid, f"{f.get('name', '?')}: {type(exc).__name__}: {exc}"
 
     trashed = 0

@@ -75,12 +75,14 @@ class JobExecutor:
         store: JobStore,
         log: Callable[[str], None],
         attachment_index: Callable[[str], dict[str, bytes]],
+        limiters: Any = None,
     ):
         self.creds_for = creds_for
         self.builder = builder
         self.store = store
         self.log = log
         self.attachment_index = attachment_index
+        self.limiters = limiters  # pipeline ServiceLimiters -> rate-controls the parallel wipe
         self._label_cache: dict[str, str] = {}
         self._label_lock = threading.Lock()
         self._folder_cache: dict[str, dict[str, str]] = {}
@@ -137,10 +139,13 @@ class JobExecutor:
     def _drive(self, job: Job, creds) -> dict[str, Any]:
         drive = service_for(job.account_id, "drive", "v3", creds)
         if job.action == "wipe":
-            # Pass creds so the wipe deletes across a thread pool (per-thread Drive services)
-            # instead of one-by-one — the single-threaded wipe of a ~9000-file account was
-            # the dominant cost of a reseed.
-            n = wipe_seed_folder(drive, job.environment_id, self.log, creds=creds, workers=10)
+            # Parallel wipe (per-thread Drive services) instead of one-by-one — the single-
+            # threaded wipe of a ~9000-file account was the dominant cost of a reseed. The
+            # limiter rate-controls the deletes so the parallelism can't cause a 429 storm.
+            n = wipe_seed_folder(
+                drive, job.environment_id, self.log,
+                creds=creds, workers=10, limiter=self.limiters, account_id=job.account_id,
+            )
             return {"id": "wiped", "trashed": n}
         if job.action == "create_folder":
             parent = parent_folder_id(self.store, job, job.payload)

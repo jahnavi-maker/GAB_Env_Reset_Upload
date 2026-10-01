@@ -271,6 +271,7 @@ class Pipeline:
             store=self.store,
             log=self.log,
             attachment_index=lambda env: self._attachments.get(env, {}),
+            limiters=self.limiters,  # rate-controls the parallel drive wipe
         )
         queue = self.queues[service]
         while not self.stop.is_set():

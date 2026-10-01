@@ -154,6 +154,22 @@ class _TSFakeDrive:
             return len(self._files)
 
 
+class _FakeLimiter:
+    """Counts acquire/record so we can prove the parallel wipe is rate-controlled."""
+    def __init__(self):
+        self.acquires = 0
+        self.records = 0
+        self._lock = threading.Lock()
+
+    def acquire(self, service, account=""):
+        with self._lock:
+            self.acquires += 1
+
+    def record(self, service, *, ok, rate_limited):
+        with self._lock:
+            self.records += 1
+
+
 class DriveWipeParallelTests(unittest.TestCase):
     def test_parallel_wipe_trashes_all_files(self):
         import materialize.drive_sync as ds
@@ -164,6 +180,19 @@ class DriveWipeParallelTests(unittest.TestCase):
             logs: list[str] = []
             trashed = ds.wipe_seed_folder(drive, "Student", logs.append, creds=object(), workers=8)
         self.assertEqual(trashed, 60)        # all trashed via the worker pool
+        self.assertEqual(drive.remaining(), 0)
+
+    def test_parallel_wipe_is_rate_limited(self):
+        # every delete must acquire + record on the limiter, so parallelism stays throttled.
+        import materialize.drive_sync as ds
+        files = [{"id": f"f{i}", "name": f"n{i}.txt"} for i in range(40)]
+        drive = _TSFakeDrive(files)
+        lim = _FakeLimiter()
+        with patch("materialize.auth.build_service", lambda *a, **k: drive):
+            ds.wipe_seed_folder(drive, "Student", lambda _m: None,
+                                creds=object(), workers=8, limiter=lim, account_id="a@ex.com")
+        self.assertEqual(lim.acquires, 40)   # one token per delete
+        self.assertEqual(lim.records, 40)    # outcome recorded per delete (adaptive)
         self.assertEqual(drive.remaining(), 0)
 
 
