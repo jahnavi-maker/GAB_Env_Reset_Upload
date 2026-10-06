@@ -35,13 +35,33 @@ from materialize.auth import (
 
 PENDING_PATH = TOKENS_DIR / "_oauth_pending.json"
 SA_KEY_PATH = ROOT / "gab-sa.json"
+TEAMDECCAN_SA_KEY_PATH = ROOT / "teamdeccan-seeding.json"
+TEAMDECCAN_CLIENT_PATH = ROOT / "teamdeccan-client.json"
 CONSUMER_DOMAINS = {"gmail.com", "googlemail.com", "google.com"}
-# DWD tokens fail if we ask for openid / userinfo.email and Admin only authorized the APIs.
-DWD_SCOPES = [
+# DWD scope sets must match each domain's Admin delegation entry exactly.
+DWD_SCOPES_TEAMDECCAN = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/drive",
 ]
+DWD_SCOPES_DECCAN = [
+    "https://mail.google.com/",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/calendar",
+]
+# Default for tests / legacy imports.
+DWD_SCOPES = DWD_SCOPES_TEAMDECCAN
+
+
+def dwd_scopes_for_key(key_path: str | Path) -> list[str]:
+    try:
+        data = json.loads(Path(key_path).read_text(encoding="utf-8-sig"))
+        sa_email = (data.get("client_email") or "").lower()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return list(DWD_SCOPES_DECCAN)
+    if "teamdeccan-seeding" in sa_email:
+        return list(DWD_SCOPES_TEAMDECCAN)
+    return list(DWD_SCOPES_DECCAN)
 
 
 def is_service_account_info(data: Any) -> bool:
@@ -63,10 +83,27 @@ def _looks_like_sa_file(path: Path) -> bool:
     return is_service_account_info(data)
 
 
+def discover_sa_key_for_email(email: str) -> str:
+    """Pick the service-account key for Workspace impersonation by mailbox domain."""
+    env = (os.environ.get("ENV_LOADER_SA_KEY") or "").strip()
+    if env:
+        return env
+    dom = _email_domain(email)
+    if dom == "teamdeccan.us" and _looks_like_sa_file(TEAMDECCAN_SA_KEY_PATH):
+        return str(TEAMDECCAN_SA_KEY_PATH)
+    if dom == "deccanexperts.us" and _looks_like_sa_file(SA_KEY_PATH):
+        return str(SA_KEY_PATH)
+    return discover_sa_key()
+
+
 def discover_sa_key() -> str:
     env = (os.environ.get("ENV_LOADER_SA_KEY") or "").strip()
     if env:
         return env
+    if _looks_like_sa_file(SA_KEY_PATH):
+        return str(SA_KEY_PATH)
+    if _looks_like_sa_file(TEAMDECCAN_SA_KEY_PATH):
+        return str(TEAMDECCAN_SA_KEY_PATH)
     candidates = [SA_KEY_PATH, Path.home() / "Downloads" / "gab-sa.json"]
     for folder in (ROOT, Path.home() / "Downloads"):
         try:
@@ -108,6 +145,27 @@ def sa_key_available() -> bool:
     return bool(discover_sa_key())
 
 
+def sa_key_available_for(email: str) -> bool:
+    return bool(discover_sa_key_for_email(email))
+
+
+def oauth_credentials_path_for_email(email: str) -> Path:
+    """Default OAuth client JSON per Workspace domain (when not using DWD)."""
+    if _email_domain(email) == "teamdeccan.us" and TEAMDECCAN_CLIENT_PATH.is_file():
+        return TEAMDECCAN_CLIENT_PATH
+    return CREDENTIALS_PATH
+
+
+def teamdeccan_oauth_configured() -> bool:
+    if not TEAMDECCAN_CLIENT_PATH.is_file():
+        return False
+    try:
+        data = json.loads(TEAMDECCAN_CLIENT_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(data.get("web"), dict)
+
+
 def delegation_domain_ok(email: str) -> bool:
     """Consumer Gmail is never DWD. Other domains are allowed unless restricted."""
     dom = _email_domain(email)
@@ -118,14 +176,15 @@ def delegation_domain_ok(email: str) -> bool:
 
 
 def backend_for(email: str) -> AuthBackend:
-    """Per-account backend: saved token or gmail.com → OAuth; Workspace + SA key → DWD."""
-    if _email_domain(email) in CONSUMER_DOMAINS:
+    """Workspace (@teamdeccan.us, @deccanexperts.us, …): DWD when a domain SA key exists."""
+    dom = _email_domain(email)
+    if dom in CONSUMER_DOMAINS:
         return ConsumerOAuthBackend()
+    if sa_key_available_for(email) and delegation_domain_ok(email):
+        return WorkspaceDelegationBackend(discover_sa_key_for_email(email))
     if has_saved_token(email):
-        return ConsumerOAuthBackend()
-    if sa_key_available() and delegation_domain_ok(email):
-        return WorkspaceDelegationBackend()
-    return ConsumerOAuthBackend()
+        return ConsumerOAuthBackend(oauth_credentials_path_for_email(email))
+    return ConsumerOAuthBackend(oauth_credentials_path_for_email(email))
 
 
 def resolve_auth_mode() -> str:
@@ -197,9 +256,19 @@ class ConsumerOAuthBackend:
     name = "consumer_oauth"
     interactive = True
 
-    def __init__(self) -> None:
+    def __init__(self, credentials_path: Path | str | None = None) -> None:
+        self.credentials_path = Path(credentials_path) if credentials_path else CREDENTIALS_PATH
         self._pending: dict[str, dict[str, Any]] = {}
         self._pending_lock = threading.RLock()
+
+    def _web_client_ready(self) -> bool:
+        if not self.credentials_path.is_file():
+            return False
+        try:
+            data = json.loads(self.credentials_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        return isinstance(data.get("web"), dict)
 
     def client_status(self) -> dict[str, Any]:
         return credentials_status()
@@ -310,14 +379,13 @@ class ConsumerOAuthBackend:
         }
 
     def begin(self, run_id: str, email: str, redirect_uri: str | None = None) -> dict | None:
-        status = credentials_status()
-        if not status.get("present") or status.get("kind") != "web":
+        if not self._web_client_ready():
             raise AuthError(
-                "Upload a Web OAuth client JSON first. Redirect URI must be "
-                f"{BASE_URL}/oauth/callback"
+                f"OAuth client missing or invalid at {self.credentials_path}. "
+                f"Redirect URI must include {BASE_URL}/oauth/callback"
             )
         callback = redirect_uri or f"{BASE_URL}/oauth/callback"
-        flow = make_flow(callback)
+        flow = make_flow(callback, self.credentials_path)
         state = secrets.token_urlsafe(24)
         url, _ = flow.authorization_url(
             access_type="offline",
@@ -380,7 +448,10 @@ class ConsumerOAuthBackend:
         qs = urlencode({"run": run_id, "account": expected})
         if error or not code:
             return {"path": f"/?{qs}&auth=error"}
-        flow = make_flow(pending.get("redirect_uri") or f"{BASE_URL}/oauth/callback")
+        flow = make_flow(
+            pending.get("redirect_uri") or f"{BASE_URL}/oauth/callback",
+            self.credentials_path,
+        )
         flow.code_verifier = pending.get("code_verifier")
         try:
             flow.fetch_token(code=code)
@@ -430,9 +501,9 @@ class WorkspaceDelegationBackend:
     name = "workspace_delegation"
     interactive = False
 
-    def __init__(self) -> None:
+    def __init__(self, key_path: str | None = None) -> None:
         env_key = (os.environ.get("ENV_LOADER_SA_KEY") or "").strip()
-        self.key_path = env_key or discover_sa_key()
+        self.key_path = key_path or env_key or discover_sa_key()
         self.domain = workspace_domain()
 
     def client_status(self) -> dict[str, Any]:
@@ -463,7 +534,9 @@ class WorkspaceDelegationBackend:
                 "backend": self.name,
             }
         try:
-            service_account.Credentials.from_service_account_file(self.key_path, scopes=DWD_SCOPES)
+            service_account.Credentials.from_service_account_file(
+                self.key_path, scopes=dwd_scopes_for_key(self.key_path)
+            )
         except Exception as exc:
             return {
                 "state": "none",
@@ -490,7 +563,8 @@ class WorkspaceDelegationBackend:
             raise AuthError(f"{email} is outside Workspace domain {self.domain}")
         if not self.key_path or not Path(self.key_path).exists():
             raise AuthError("Service-account key is missing. Upload the gab-seed JSON key.")
-        base = service_account.Credentials.from_service_account_file(self.key_path, scopes=DWD_SCOPES)
+        scopes = dwd_scopes_for_key(self.key_path)
+        base = service_account.Credentials.from_service_account_file(self.key_path, scopes=scopes)
         return base.with_subject(email)
 
     def _client_id(self) -> str:
@@ -512,10 +586,8 @@ class WorkspaceDelegationBackend:
                 "Google refused domain-wide delegation "
                 f"(unauthorized_client). In admin.google.com → Security → API controls → "
                 f"Domain-wide delegation, the Client ID must be {cid or '(open the JSON: client_id)'} "
-                "and the scopes must include exactly: "
-                "https://www.googleapis.com/auth/gmail.modify,"
-                "https://www.googleapis.com/auth/calendar,"
-                "https://www.googleapis.com/auth/drive. "
+                "and the scopes must match Admin (deccanexperts: https://mail.google.com/; "
+                "teamdeccan: gmail.modify, calendar, drive). "
                 "Also on the gab-seed service account in Cloud Console, turn on "
                 "Enable Google Workspace Domain-wide Delegation. "
                 f"Google said: {exc}"

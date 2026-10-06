@@ -261,7 +261,13 @@
   async function refreshAuth(i){
     const row=rows[i]; if(!row.valid) return;
     try { const r=await fetch("/ui/account?email="+encodeURIComponent(row.email)); const d=await r.json();
-      if (d.authorized && !row.authorized){ row.authorized=true; if(row.status==="idle"||row.status==="authorizing") row.status="authorized"; renderRows(); } }
+      const nowAuth = !!d.authorized;
+      if (nowAuth !== row.authorized) {
+        row.authorized = nowAuth;
+        if (nowAuth && (row.status==="idle"||row.status==="authorizing")) row.status="authorized";
+        else if (!nowAuth && row.status==="authorized") row.status="idle";
+        renderRows();
+      } }
     catch(e){}
   }
   async function startAuthorize(i){

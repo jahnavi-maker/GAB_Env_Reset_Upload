@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -263,6 +264,38 @@ def _seeder_token_exists(email: str) -> bool:
         return token_path(email).exists()
     except Exception:
         return False
+
+
+_token_usable_cache: dict[str, tuple[bool, float]] = {}
+_TOKEN_USABLE_CACHE_TTL_S = 60.0
+
+
+def _invalidate_token_usable_cache(email: str) -> None:
+    _token_usable_cache.pop((email or "").strip().lower(), None)
+
+
+def _seeder_token_usable(email: str) -> bool:
+    """True if a saved OAuth token exists and is valid (refresh if expired)."""
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        return False
+    now = time.time()
+    cached = _token_usable_cache.get(email)
+    if cached and cached[1] > now:
+        return cached[0]
+    usable = False
+    try:
+        seeder = str(Path(settings.seeder_dir).expanduser().resolve())
+        if seeder not in sys.path:
+            sys.path.insert(0, seeder)
+        from materialize.auth import load_creds_result  # type: ignore
+
+        creds, err = load_creds_result(email)
+        usable = creds is not None and err is None
+    except Exception:
+        usable = False
+    _token_usable_cache[email] = (usable, now + _TOKEN_USABLE_CACHE_TTL_S)
+    return usable
 
 
 async def _persona_from_sessions(store: Store, email: str) -> str:
@@ -1298,6 +1331,7 @@ async def oauth_callback(
         return RedirectResponse(f"{dest}?authorized=error", status_code=303)
 
     email = ctx["email"]
+    _invalidate_token_usable_cache(email)
     persona = ctx["persona"]
     kind = ctx.get("kind") or "authorize"
     usid = ctx.get("upload_session_id")
@@ -1567,11 +1601,13 @@ async def ui_account(email: str, store: Store = Depends(get_store)) -> dict:
     r = await _resolve_reset_account(store, email) or {}
     delegated = upload.account_uses_delegation(email)
     has_token = _seeder_token_exists(email)
+    token_usable = delegated or _seeder_token_usable(email)
     return {
         "email": email.lower(),
-        "authorized": has_token or delegated,
+        "authorized": token_usable,
         "delegated": delegated,
         "has_token": has_token,
+        "token_usable": token_usable if not delegated else True,
         "persona": r.get("persona"),
         "last_reset_persona": r.get("last_reset_persona"),
     }
@@ -1586,17 +1622,8 @@ async def ui_seed(
     """Onboard upload / reset / reseed. Omit mode to auto-route by last persona."""
     email = req.email.lower()
     delegated = upload.account_uses_delegation(email)
-    if not delegated:
-        try:
-            acct = await store.query(
-                settings.accounts_table,
-                {"select": "authorized", "email": f"eq.{email}", "limit": "1"},
-            )
-        except Exception:
-            log.warning("authorized-state lookup failed for %s", email, exc_info=True)
-            acct = []
-        if not (acct and acct[0].get("authorized")) and not _seeder_token_exists(email):
-            raise HTTPException(status_code=400, detail="account not authorized yet")
+    if not delegated and not _seeder_token_usable(email):
+        raise HTTPException(status_code=400, detail="account not authorized yet")
     try:
         rsid, tid, op_mode = await _seed_upload(
             store, background, email, req.persona, req.services, req.mode
