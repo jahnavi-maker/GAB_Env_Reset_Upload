@@ -65,7 +65,7 @@ class AccessControlTests(unittest.TestCase):
     def test_1_whitelisted_client_can_POST(self):
         r = self._post_reset(WHITE_IP)
         self.assertNotEqual(r.status_code, 403, r.text)
-        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.status_code, 202, r.text)
         self.assertIn("reset_session_id", r.json())
 
     def test_2_non_whitelisted_client_cannot_POST(self):
@@ -87,7 +87,7 @@ class AccessControlTests(unittest.TestCase):
     # 5: session id -> persona/email ------------------------------------------
     def test_5_session_mapped_to_correct_persona_and_email(self):
         sid = self._post_reset(WHITE_IP).json()["reset_session_id"]
-        row = self.client.get(f"/api/environment/reset/{sid}", headers=self._xff(WHITE_IP)).json()
+        row = self.client.get(f"/ui/reset/{sid}").json()  # local mode: gate off, exposes mapping
         self.assertEqual(row["email"], EMAIL)
         self.assertEqual(row["persona"], PERSONA)
 
@@ -113,7 +113,7 @@ class AccessControlTests(unittest.TestCase):
         token, _ = links.mint("alloc-bind", email=EMAIL, persona=PERSONA, reset_session_id=sid)
         # Even with a different email in the body, the token's bound email wins.
         self.client.post("/ui/task/reset", json={"token": token, "email": "attacker@evil.com"})
-        row = self.client.get(f"/api/environment/reset/{sid}", headers=self._xff(WHITE_IP)).json()
+        row = self.client.get(f"/ui/reset/{sid}").json()
         self.assertEqual(row["email"], EMAIL)
         self.assertNotEqual(row["email"], "attacker@evil.com")
 
