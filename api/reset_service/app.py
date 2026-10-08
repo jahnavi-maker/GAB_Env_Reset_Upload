@@ -503,17 +503,21 @@ async def _run_and_record(
             engine.run_reset, email, persona, mode, services, reset_session_id
         )
         ok, detail, raw = result.success, result.detail, result.raw
-        terminal = {
-            "status": "completed" if ok else "failed",
-            "completed_at": _now(),
-            "mode": row_mode or result.mode,
-            "error": None if ok else _clarify_error(result.detail),
-        }
+        await _safe_update(
+            store,
+            reset_session_id,
+            {
+                "status": "completed" if ok else "failed",
+                "completed_at": _now(),
+                "mode": row_mode or result.mode,
+                "error": None if ok else _clarify_error(result.detail),
+            },
+        )
         if ok:
-            # Single-use: a successful reset immediately invalidates the session id
-            # even if its 10-minute window has not elapsed.
-            terminal["consumed_at"] = _now()
-        await _safe_update(store, reset_session_id, terminal)
+            # Single-use: a successful reset immediately invalidates the session id even
+            # if its 10-minute window has not elapsed. Separate best-effort write so an
+            # older DB without the consumed_at column can't fail the status update above.
+            await _safe_update(store, reset_session_id, {"consumed_at": _now()})
         if ok:
             # Record WHAT happened and WHEN atomically, only on a clean op: the persona
             # (drives routing), the operation mode (upload|reconcile|reseed|delta) and the
