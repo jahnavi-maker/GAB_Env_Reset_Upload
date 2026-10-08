@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import threading
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -16,6 +17,34 @@ from googleapiclient.errors import HttpError
 from materialize.fail import next_for
 
 GAB_LABEL = "GAB-SEED"
+_LABEL_ENSURE_LOCK = threading.Lock()
+
+
+def _label_name_conflict(exc: HttpError) -> bool:
+    status = getattr(exc.resp, "status", None)
+    if status == 409:
+        return True
+    msg = str(exc).lower()
+    return "label name exists" in msg or "conflicts" in msg
+
+
+def _find_label_id_by_name(gmail, log: Callable[[str], None]) -> str | None:
+    page = None
+    while True:
+        resp = _retry(
+            lambda: gmail.users()
+            .labels()
+            .list(userId="me", pageToken=page)
+            .execute(),
+            log,
+        )
+        for lab in resp.get("labels") or []:
+            if lab.get("name") == GAB_LABEL and lab.get("id"):
+                return str(lab["id"])
+        page = resp.get("nextPageToken")
+        if not page:
+            break
+    return None
 
 
 def _invalid_label_error(exc: HttpError) -> bool:
@@ -64,25 +93,37 @@ def _retry(fn, log: Callable[[str], None], tries: int = 6):
 
 
 def ensure_label(gmail, log: Callable[[str], None]) -> str:
-    existing = _retry(lambda: gmail.users().labels().list(userId="me").execute(), log)
-    for lab in existing.get("labels", []):
-        if lab.get("name") == GAB_LABEL:
-            return lab["id"]
-    created = _retry(
-        lambda: gmail.users()
-        .labels()
-        .create(
-            userId="me",
-            body={
-                "name": GAB_LABEL,
-                "labelListVisibility": "labelShow",
-                "messageListVisibility": "show",
-            },
-        )
-        .execute(),
-        log,
-    )
-    return created["id"]
+    """Return GAB-SEED label id; create if missing.
+
+    Parallel gmail workers can race on create → 409; treat that as success and re-list.
+    """
+    with _LABEL_ENSURE_LOCK:
+        found = _find_label_id_by_name(gmail, log)
+        if found:
+            return found
+        try:
+            created = _retry(
+                lambda: gmail.users()
+                .labels()
+                .create(
+                    userId="me",
+                    body={
+                        "name": GAB_LABEL,
+                        "labelListVisibility": "labelShow",
+                        "messageListVisibility": "show",
+                    },
+                )
+                .execute(),
+                log,
+            )
+            return str(created["id"])
+        except HttpError as exc:
+            if _label_name_conflict(exc):
+                found = _find_label_id_by_name(gmail, log)
+                if found:
+                    log(f"{GAB_LABEL} label already exists (409); using existing id")
+                    return found
+            raise
 
 
 def resolve_seed_label_id(
