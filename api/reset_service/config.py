@@ -138,6 +138,8 @@ class Settings:
     # rows are always kept. QC itself can no longer purge (review-only); this job and
     # the Bearer-protected /api/qc/{id}/confirm are the only ways a log is deleted.
     qc_log_retention_days: int = _int_env("QC_LOG_RETENTION_DAYS", 15)
+    # Readable per-run logs (runlog.py) are purged this many days after last write.
+    log_retention_days: int = _int_env("LOG_RETENTION_DAYS", 5)
     accounts_table: str = os.environ.get("SUPABASE_ACCOUNTS_TABLE", "gab_accounts")
     # Google sign-in allow-list for /reset. Not the accounts that get reset.
     # The sign-in allow-list. Same `freelancers` table as /ui/freelancer/verify
