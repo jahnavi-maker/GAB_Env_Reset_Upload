@@ -68,7 +68,9 @@ def ensure_label(gmail, log: Callable[[str], None]) -> str:
 def _invalid_label_error(exc: HttpError) -> bool:
     """True when Gmail rejected a call because the label id is stale/unknown."""
     status = getattr(exc.resp, "status", None)
-    if status not in (400, 404):
+    if status == 404:
+        return True
+    if status != 400:
         return False
     try:
         body = exc.error_details if hasattr(exc, "error_details") else []
@@ -79,7 +81,7 @@ def _invalid_label_error(exc: HttpError) -> bool:
         msg = str(exc).lower()
         return "invalid label" in msg or "label id" in msg
     except Exception:
-        return status == 400
+        return True
 
 
 def label_is_valid(gmail, label_id: str) -> bool:
