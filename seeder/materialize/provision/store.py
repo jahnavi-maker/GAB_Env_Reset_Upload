@@ -320,9 +320,11 @@ class JobStore:
     def reset_children_after_wipe(self, account_id: str, service: str) -> int:
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE jobs SET status=?, updated_at=?, google_object_id=NULL, claimed_at=NULL "
-                "WHERE account_id=? AND service=? AND action NOT IN ('wipe','materialize') AND status=?",
-                (PENDING, _now(), account_id, service, SUCCESS),
+                "UPDATE jobs SET status=?, updated_at=?, google_object_id=NULL, claimed_at=NULL, "
+                "error=NULL, retry_count=0 "
+                "WHERE account_id=? AND service=? AND action NOT IN ('wipe','materialize') "
+                "AND status IN (?, ?, ?)",
+                (PENDING, _now(), account_id, service, SUCCESS, PERMANENT_FAILURE, RETRY),
             )
             return int(cur.rowcount or 0)
 

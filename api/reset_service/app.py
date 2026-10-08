@@ -1622,8 +1622,17 @@ async def ui_seed(
     """Onboard upload / reset / reseed. Omit mode to auto-route by last persona."""
     email = req.email.lower()
     delegated = upload.account_uses_delegation(email)
-    if not delegated and not _seeder_token_usable(email):
-        raise HTTPException(status_code=400, detail="account not authorized yet")
+    if not delegated:
+        try:
+            acct = await store.query(
+                settings.accounts_table,
+                {"select": "authorized", "email": f"eq.{email}", "limit": "1"},
+            )
+        except Exception:
+            log.warning("authorized-state lookup failed for %s", email, exc_info=True)
+            acct = []
+        if not (acct and acct[0].get("authorized")) and not _seeder_token_exists(email):
+            raise HTTPException(status_code=400, detail="account not authorized yet")
     try:
         rsid, tid, op_mode = await _seed_upload(
             store, background, email, req.persona, req.services, req.mode

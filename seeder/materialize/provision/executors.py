@@ -23,10 +23,12 @@ from materialize.drive_sync import (
 )
 from materialize.fs_cache import ensure_persona_drive_cache, file_index_from_cache, read_cached_bytes
 from materialize.gmail_sync import (
+    GAB_LABEL,
     _normalize_msgid,
     ensure_label,
     insert_one_message,
     list_seeded_mail,
+    resolve_seed_label_id,
     trash_seeded_message,
     wipe_seeded_mail,
 )
@@ -82,6 +84,27 @@ class JobExecutor:
         self._folder_cache: dict[str, dict[str, str]] = {}
         self._cal_index: dict[str, tuple[dict, dict]] = {}
         self._mail_index: dict[str, dict[str, dict[str, str]]] = {}
+
+    _GMAIL_LABEL_SID = "gmail/label"
+
+    def _resolve_gmail_label_id(self, gmail, account_id: str) -> str:
+        with self._label_lock:
+            hint = self._label_cache.get(account_id)
+        if not hint:
+            hint = self.store.google_id(account_id, "gmail", self._GMAIL_LABEL_SID)
+        label_id = resolve_seed_label_id(gmail, self.log, hint)
+        stored = self.store.google_id(account_id, "gmail", self._GMAIL_LABEL_SID)
+        if label_id != stored:
+            row = self.store.get_by_key(account_id, "gmail", self._GMAIL_LABEL_SID)
+            if row:
+                self.store.persist_success(row.job_id, label_id)
+            elif label_id != hint:
+                self.log(f"Updated in-memory {GAB_LABEL} label id for {account_id}")
+        with self._label_lock:
+            self._label_cache[account_id] = label_id
+        if hint and label_id != hint:
+            self._mail_index.pop(account_id, None)
+        return label_id
 
     def execute(self, job: Job) -> dict[str, Any]:
         if job.service == "generate":
@@ -165,12 +188,7 @@ class JobExecutor:
                 self._label_cache[job.account_id] = label_id
             return {"id": label_id}
         if job.action == "insert_message":
-            with self._label_lock:
-                label_id = self._label_cache.get(job.account_id)
-            if not label_id:
-                label_id = self.store.google_id(job.account_id, "gmail", "gmail/label")
-            if not label_id:
-                label_id = ensure_label(gmail, self.log)
+            label_id = self._resolve_gmail_label_id(gmail, job.account_id)
             parent_id = str(job.payload.get("parent_id") or "")
             thread_id = None
             if parent_id:
@@ -180,8 +198,20 @@ class JobExecutor:
             if (job.extra or {}).get("mode") == DELTA and not job.extra.get("replace_attachments"):
                 already = self._mail_index.get(job.account_id)
                 if already is None:
-                    already = list_seeded_mail(gmail, label_id, self.log)
+                    account_id = job.account_id
+
+                    def _refresh_label() -> str:
+                        return self._resolve_gmail_label_id(gmail, account_id)
+
+                    already = list_seeded_mail(
+                        gmail,
+                        label_id,
+                        self.log,
+                        refresh_label=_refresh_label,
+                    )
                     self._mail_index[job.account_id] = already
+                    with self._label_lock:
+                        label_id = self._label_cache.get(job.account_id, label_id)
                 eid = str(item.get("email_id") or "")
                 hit = already.get(eid) or already.get(_normalize_msgid(eid))
                 if hit:
