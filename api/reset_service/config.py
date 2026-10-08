@@ -67,6 +67,29 @@ def _flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def normalize_deploy_mode(raw: str | None) -> str:
+    """``local`` (laptop) or ``ec2`` (hosted). Aliases: prod/production -> ec2."""
+    v = (raw or "local").strip().lower()
+    if v in {"ec2", "prod", "production"}:
+        return "ec2"
+    return "local"
+
+
+def current_deploy_mode() -> str:
+    """Live mode. Reads the env so tests (and a restart after .env edit) pick it up."""
+    return normalize_deploy_mode(os.environ.get("GAB_DEPLOY_MODE"))
+
+
+def login_gate_enabled() -> bool:
+    """EC2 requires a freelancer Google sign-in on /reset and status pages."""
+    return current_deploy_mode() == "ec2"
+
+
+def require_signed_links() -> bool:
+    """EC2 always requires a signed reset link; local does only when a secret is set."""
+    return current_deploy_mode() == "ec2" or bool(os.environ.get("RESET_LINK_SECRET", "").strip())
+
+
 @dataclass(frozen=True)
 class Settings:
     # --- API auth -----------------------------------------------------------

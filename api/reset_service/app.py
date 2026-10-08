@@ -39,7 +39,12 @@ from .accounts import (
     public_account,
     resolve_google_client_id,
 )
-from .config import settings
+from .config import (
+    current_deploy_mode,
+    login_gate_enabled,
+    require_signed_links,
+    settings,
+)
 from .db import Store, make_store
 from . import links
 from .models import (
@@ -615,6 +620,8 @@ async def healthz() -> dict:
     return {
         "ok": True,
         "version": __version__,
+        "deploy_mode": current_deploy_mode(),
+        "login_gate": login_gate_enabled(),
         "store": "supabase" if settings.use_supabase else "local",
         "login_store": (
             f"supabase:{settings.freelancers_table}" if settings.use_supabase else "local"
@@ -648,8 +655,26 @@ async def ui_reset_status_page(reset_session_id: str) -> HTMLResponse:
 async def _require_freelancer_gate(
     store: Store, email: str | None = None, credential: str | None = None
 ) -> str:
-    """Login gate is off for now so reset can be tested. Re-enable later."""
-    return (email or "").strip().lower()
+    """EC2: only freelancers may open reset/status. Local: skip so you can test here."""
+    if not login_gate_enabled():
+        return (email or "").strip().lower()
+    proven = ""
+    if credential:
+        proven = (_verify_google_credential(credential) or "").strip().lower()
+    if not proven:
+        if resolve_google_client_id():
+            raise HTTPException(status_code=401, detail="sign in with Google to view this reset")
+        proven = (email or "").strip().lower()
+    if not proven or "@" not in proven:
+        raise HTTPException(status_code=401, detail="sign in to view this reset")
+    try:
+        row = await store.get_freelancer(proven)
+    except Exception:
+        log.exception("freelancer gate lookup failed")
+        raise HTTPException(status_code=503, detail="verification temporarily unavailable")
+    if not row or not row.get("active", True):
+        raise HTTPException(status_code=403, detail="this Google account is not on the freelancers list")
+    return proven
 
 
 def _bearer_ok(authorization: str | None) -> bool:
@@ -706,7 +731,7 @@ def _task_id_from_request(token: str | None, raw_task: str | None) -> str | None
             return links.verify(token)
         except links.TokenError as exc:
             raise HTTPException(status_code=403, detail=f"invalid or expired reset link: {exc}")
-    if links.enabled():
+    if require_signed_links():
         raise HTTPException(status_code=403, detail="a signed reset link is required")
     return raw_task  # dev fallback only
 
@@ -728,7 +753,7 @@ def _resolve_from_request(
         persona = (payload.get("per") or "").strip() or None
         sid = (payload.get("sid") or "").strip() or None
         return str(payload["tid"]), email, persona, sid
-    if links.enabled():
+    if require_signed_links():
         raise HTTPException(status_code=403, detail="a signed reset link is required")
     return raw_task, None, None, None  # dev fallback only
 
@@ -949,9 +974,11 @@ async def delete_freelancer(email: str, store: Store = Depends(get_store)) -> di
 
 @app.get("/ui/auth-config")
 async def ui_auth_config() -> dict:
-    """Public: tells the reset page whether Google sign-in is enabled and, if so,
-    which client id to use. Empty client id -> the page uses the email fallback."""
+    """Public: tells the reset page whether Google sign-in is required (EC2) and,
+    if so, which client id to use. Local mode leaves login_required false."""
     return {
+        "deploy_mode": current_deploy_mode(),
+        "login_required": login_gate_enabled(),
         "google_client_id": resolve_google_client_id(),
         "google_login_url": "/ui/google/start",
     }
