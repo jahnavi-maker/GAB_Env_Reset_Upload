@@ -45,6 +45,7 @@ from .config import (
     require_signed_links,
     settings,
 )
+from .runlog import RunLog, purge_old_logs
 from .db import Store, make_store
 from . import links
 from .models import (
@@ -115,6 +116,10 @@ async def _qc_retention_loop() -> None:
             await asyncio.to_thread(_purge_expired_qc_logs)
         except Exception:  # noqa: BLE001 - background task must never crash the app
             log.exception("qc-log retention pass failed")
+        try:
+            await asyncio.to_thread(purge_old_logs, days=settings.log_retention_days)
+        except Exception:  # noqa: BLE001 - background task must never crash the app
+            log.exception("run-log retention pass failed")
         await asyncio.sleep(86400)  # daily
 
 
@@ -452,6 +457,8 @@ async def _run_and_record(
     # Best-effort so a DB blip on the "running" write can't crash the task (which would
     # leave the row 'queued' forever and block the account). The reaper backstops it.
     await _safe_update(store, reset_session_id, {"status": "running", "started_at": started})
+    rlog = RunLog(reset_session_id, email, persona=persona, mode=row_mode or mode)
+    rlog.start()
     ok = False
     detail = None
     raw = None
@@ -499,6 +506,12 @@ async def _run_and_record(
             store, reset_session_id, {"status": "failed", "completed_at": _now(), "error": _clarify_error(detail)}
         )
     finally:
+        # Readable per-run log (runlog.py): record the terminal outcome and flush.
+        try:
+            rlog.finish("completed" if ok else "failed", None if ok else detail)
+            rlog.close()
+        except Exception:
+            log.warning("run-log finalize failed for %s", reset_session_id, exc_info=True)
         # Surface skips/omits so QC can treat them as tickets. The engine reports
         # intentional omits (e.g. missing attachments) under "warnings"; a non-empty
         # list on an otherwise-ok run means "completed with skips" -> consider recover.
