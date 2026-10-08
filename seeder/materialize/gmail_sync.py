@@ -65,6 +65,44 @@ def ensure_label(gmail, log: Callable[[str], None]) -> str:
     return created["id"]
 
 
+def _invalid_label_error(exc: HttpError) -> bool:
+    """True when Gmail rejected a call because the label id is stale/unknown."""
+    status = getattr(exc.resp, "status", None)
+    if status not in (400, 404):
+        return False
+    try:
+        body = exc.error_details if hasattr(exc, "error_details") else []
+        if isinstance(body, list):
+            for item in body:
+                if isinstance(item, dict) and str(item.get("reason", "")).lower() == "invalid":
+                    return True
+        msg = str(exc).lower()
+        return "invalid label" in msg or "label id" in msg
+    except Exception:
+        return status == 400
+
+
+def label_is_valid(gmail, label_id: str) -> bool:
+    if not label_id:
+        return False
+    try:
+        gmail.users().labels().get(userId="me", id=label_id).execute()
+        return True
+    except HttpError as exc:
+        if _invalid_label_error(exc):
+            return False
+        raise
+
+
+def resolve_seed_label_id(gmail, log: Callable[[str], None], hint: str | None = None) -> str:
+    """Return a live Gmail label id for GAB-SEED, refreshing when ``hint`` is stale."""
+    if hint and label_is_valid(gmail, hint):
+        return hint
+    if hint:
+        log(f"Stored {GAB_LABEL} label id is invalid; resolving by name")
+    return ensure_label(gmail, log)
+
+
 def _normalize_msgid(value: str) -> str:
     raw = (value or "").strip().strip("<>")
     if raw.endswith("@gab.ultraevals.local"):
@@ -72,8 +110,31 @@ def _normalize_msgid(value: str) -> str:
     return raw.lower()
 
 
-def list_seeded_mail(gmail, label_id: str, log: Callable[[str], None]) -> dict[str, dict[str, str]]:
-    """email_id / Message-ID → {id, threadId} for GAB-SEED messages already in the mailbox."""
+def list_seeded_mail(
+    gmail,
+    label_id: str,
+    log: Callable[[str], None],
+    *,
+    refresh_label: Callable[[], str] | None = None,
+) -> dict[str, dict[str, str]]:
+    """email_id / Message-ID → {id, threadId} for GAB-SEED messages already in the mailbox.
+
+    If the stored ``label_id`` is stale and ``refresh_label`` is supplied, resolve a
+    fresh id and retry once instead of failing the reset with an invalid-label error."""
+    try:
+        return _list_seeded_mail_pages(gmail, label_id, log)
+    except HttpError as exc:
+        if refresh_label and _invalid_label_error(exc):
+            fresh = refresh_label()
+            if fresh != label_id:
+                log(f"Retrying seeded-mail list with refreshed {GAB_LABEL} label id")
+                return _list_seeded_mail_pages(gmail, fresh, log)
+        raise
+
+
+def _list_seeded_mail_pages(
+    gmail, label_id: str, log: Callable[[str], None]
+) -> dict[str, dict[str, str]]:
     found: dict[str, dict[str, str]] = {}
     page = None
     ids: list[str] = []

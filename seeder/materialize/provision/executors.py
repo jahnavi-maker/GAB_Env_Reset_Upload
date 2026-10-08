@@ -290,7 +290,10 @@ class JobExecutor:
             if (job.extra or {}).get("mode") == DELTA and not job.extra.get("replace_attachments"):
                 already = self._mail_index.get(job.account_id)
                 if already is None:
-                    already = list_seeded_mail(gmail, label_id, self.log)
+                    already = list_seeded_mail(
+                        gmail, label_id, self.log,
+                        refresh_label=lambda: ensure_label(gmail, self.log),
+                    )
                     self._mail_index[job.account_id] = already
                 eid = str(item.get("email_id") or "")
                 hit = already.get(eid) or already.get(_normalize_msgid(eid))
