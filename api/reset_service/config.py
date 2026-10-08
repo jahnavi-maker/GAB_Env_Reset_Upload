@@ -163,8 +163,26 @@ class Settings:
     # refused, so a freelancer cannot edit the URL to reset another account.
     # Leave empty ONLY in dev (falls back to the legacy raw-id path, with a warning).
     reset_link_secret: str = os.environ.get("RESET_LINK_SECRET", "")
-    # How long a freelancer link stays valid (default 7 days).
-    reset_link_ttl_s: int = _int_env("RESET_LINK_TTL_S", 7 * 24 * 3600)
+    # How long a freelancer reset link / session stays valid before it must be
+    # re-minted. Short-lived + single-use: the freelancer must sign in and finish
+    # within this window (default 10 minutes).
+    reset_link_ttl_s: int = _int_env("RESET_LINK_TTL_S", 600)
+    reset_session_ttl_s: int = _int_env("RESET_SESSION_TTL_S", 600)
+
+    # --- Client IP allow-list for the platform (Bearer) reset APIs ----------
+    # Only whitelisted client servers may call POST/GET /api/environment/* and
+    # /api/reset-link. Enforcement is OFF by default so the list can be populated
+    # first; set CLIENT_WHITELIST_ENABLED=1 to start rejecting non-whitelisted IPs.
+    client_whitelist_enabled: bool = _flag("CLIENT_WHITELIST_ENABLED")
+    client_whitelist_table: str = os.environ.get("SUPABASE_CLIENT_WHITELIST_TABLE", "client_whitelist")
+    # Always-allowed IPs/CIDRs/hostnames independent of the DB (comma-separated).
+    # Loopback (same-origin UI + health checks) and the primary client cosmo are
+    # always allowed; hostnames are DNS-resolved at check time.
+    client_whitelist_allow: str = os.environ.get(
+        "CLIENT_WHITELIST_ALLOW", "127.0.0.1,::1,cosmo.deccanexperts.ai"
+    )
+    # Behind nginx+ALB, so the real client IP is the left-most X-Forwarded-For hop.
+    trust_forwarded_for: bool = _flag("TRUST_FORWARDED_FOR", True)
 
     # When set, do NOT call Google at all — simulate a short successful reset.
     # Lets the whole API + Supabase path be tested without credentials.

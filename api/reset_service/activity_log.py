@@ -147,6 +147,31 @@ def record(
         log.info("[%s] %s %s mode=%s", tag, email or "—", status, mode or "—")
 
 
+def request(
+    *,
+    ip: str | None,
+    method: str,
+    path: str,
+    result: str,                 # 'ok' | 'rejected_ip' | 'expired' | 'used' | 'error'
+    http_status: int | None = None,
+    email: str | None = None,
+    persona: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Request-level audit for the reset APIs: client IP, endpoint, and outcome.
+    Rejected (non-whitelisted) requests are logged so unauthorized access is visible."""
+    rec = {"event": "request", "ip": ip or None, "method": method, "path": path,
+           "http_status": http_status, "result": result, "email": email,
+           "persona": persona, "session_id": session_id}
+    _emit(rec)
+    if result.startswith("rejected"):
+        with _counter_lock:
+            _counters["errors"] = _counters.get("errors", 0) + 1
+        log.warning("[REQ] REJECTED %s %s ip=%s :: %s", method, path, ip or "—", result)
+    else:
+        log.info("[REQ] %s %s ip=%s -> %s %s", method, path, ip or "—", http_status or "—", result)
+
+
 def authorize(email: str | None, persona: str | None = None, *,
               status: str = "completed", triggered_by: str | None = None, error: str | None = None) -> None:
     """Log an account authorize (OAuth consent completing on /onboard)."""

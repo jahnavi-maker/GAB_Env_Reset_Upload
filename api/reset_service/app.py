@@ -30,7 +30,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPExcepti
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from . import __version__, activity_log, engine, google_login, upload
+from . import __version__, access, activity_log, engine, google_login, upload
 from .accounts import (
     CSV_FORMAT,
     LOGIN_CSV_FORMAT,
@@ -157,6 +157,42 @@ if _cors_origins:
         allow_headers=["*"],
         allow_credentials=False,
     )
+
+
+@app.middleware("http")
+async def _access_control(request, call_next):
+    """IP allow-list for the platform reset APIs + request-level audit logging.
+
+    - Platform (Bearer) endpoints under /api/environment/* and /api/reset-link may
+      only be called from a whitelisted client IP (when CLIENT_WHITELIST_ENABLED).
+    - Every reset-flow request (platform + freelancer) is audit-logged with its IP,
+      method, path, session id and result — rejections included.
+    The freelancer reset page itself is NOT IP-gated (opened from the freelancer's own
+    browser); it is protected by the short-lived single-use signed token + sign-in gate.
+    """
+    path = request.url.path
+    ip = access.client_ip(request)
+    if access.is_protected(path) and settings.client_whitelist_enabled:
+        store = _ensure_store(app)
+        cidrs = await access.allowed_cidrs(store)
+        if not access.ip_allowed(ip, cidrs, access.static_allow()):
+            activity_log.request(ip=ip, method=request.method, path=path,
+                                 result="rejected_ip", http_status=403,
+                                 session_id=access.session_id_from_path(path))
+            return JSONResponse(status_code=403, content={"detail": "client not allowed"})
+    response = await call_next(request)
+    if access.is_audited(path):
+        try:
+            activity_log.request(
+                ip=ip, method=request.method, path=path,
+                http_status=response.status_code,
+                result="ok" if response.status_code < 400 else "error",
+                email=request.query_params.get("email") or None,
+                session_id=access.session_id_from_path(path),
+            )
+        except Exception:
+            log.debug("request audit log failed", exc_info=True)
+    return response
 
 
 @app.exception_handler(Exception)
@@ -467,16 +503,17 @@ async def _run_and_record(
             engine.run_reset, email, persona, mode, services, reset_session_id
         )
         ok, detail, raw = result.success, result.detail, result.raw
-        await _safe_update(
-            store,
-            reset_session_id,
-            {
-                "status": "completed" if ok else "failed",
-                "completed_at": _now(),
-                "mode": row_mode or result.mode,
-                "error": None if ok else _clarify_error(result.detail),
-            },
-        )
+        terminal = {
+            "status": "completed" if ok else "failed",
+            "completed_at": _now(),
+            "mode": row_mode or result.mode,
+            "error": None if ok else _clarify_error(result.detail),
+        }
+        if ok:
+            # Single-use: a successful reset immediately invalidates the session id
+            # even if its 10-minute window has not elapsed.
+            terminal["consumed_at"] = _now()
+        await _safe_update(store, reset_session_id, terminal)
         if ok:
             # Record WHAT happened and WHEN atomically, only on a clean op: the persona
             # (drives routing), the operation mode (upload|reconcile|reseed|delta) and the
@@ -566,6 +603,7 @@ async def _launch_reset(
     services: list[str] | None = None,
     reset_session_id: str | None = None,
     triggered_by: str | None = None,
+    single_use: bool = False,
 ) -> tuple[str, str]:
     """Create a queued session, dispatch to the bounded pool. Returns (id, op_mode).
 
@@ -588,14 +626,18 @@ async def _launch_reset(
     op_mode = await _decide_mode(store, email, persona, mode)
     pinned = str(reset_session_id) if reset_session_id else None
     if pinned:
-        # If the pre-generated id was already used (e.g. a retry on an old link), fall
-        # back to a fresh id so the reset still runs instead of colliding on the PK.
         try:
-            if await store.get(pinned):
-                log.info("pinned reset id %s already used; issuing a fresh id", pinned)
-                pinned = None
+            existing = await store.get(pinned)
         except Exception:  # noqa: BLE001 - a lookup hiccup must not block the reset
-            pass
+            existing = None
+        if existing:
+            if single_use:
+                # Signed-token session ids are single-use: once the id exists (the link
+                # was already used), the same link cannot start another reset.
+                raise HTTPException(status_code=409, detail="this reset link has already been used")
+            # Non-token retry (e.g. operator re-run): fall back to a fresh id.
+            log.info("pinned reset id %s already used; issuing a fresh id", pinned)
+            pinned = None
     reset_session_id = pinned or str(uuid.uuid4())
     record = {
         "reset_session_id": reset_session_id,
@@ -888,7 +930,7 @@ async def ui_task_reset(
     try:
         reset_session_id, op_mode = await _launch_reset(
             store, background, email, persona, task_allocation_id, None, None,
-            reset_session_id=tok_sid, triggered_by="freelancer",
+            reset_session_id=tok_sid, triggered_by="freelancer", single_use=True,
         )
     except ActiveResetConflict:
         raise HTTPException(status_code=409, detail="a reset is already running for this account")

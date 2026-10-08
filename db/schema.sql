@@ -47,8 +47,11 @@ create table if not exists reset_sessions (
     error              text,
     created_at         timestamptz not null default now(),
     started_at         timestamptz,
-    completed_at       timestamptz
+    completed_at       timestamptz,
+    consumed_at        timestamptz                             -- set once the session is used (single-use)
 );
+-- Older DBs: add the single-use column if missing.
+alter table reset_sessions add column if not exists consumed_at timestamptz;
 create index if not exists idx_reset_sessions_email  on reset_sessions (email);
 create index if not exists idx_reset_sessions_task   on reset_sessions (task_allocation_id);
 create index if not exists idx_reset_sessions_status on reset_sessions (status);
@@ -57,6 +60,28 @@ create index if not exists idx_reset_sessions_status on reset_sessions (status);
 create unique index if not exists uniq_active_reset_per_email
     on reset_sessions (email)
     where status in ('queued', 'running');
+
+-- ---------------------------------------------------------------------------
+-- client_whitelist : IP/CIDR allow-list for the platform (Bearer) reset APIs.
+-- An entry authorizes a client server to call POST/GET /api/environment/* and
+-- /api/reset-link. cosmo.deccanexperts.ai's egress IP(s) go here; add test IPs
+-- as needed. Enforcement is gated by CLIENT_WHITELIST_ENABLED so the list can be
+-- populated before it starts rejecting. Validated at the API layer (middleware).
+-- ---------------------------------------------------------------------------
+create table if not exists client_whitelist (
+    id         bigint generated always as identity primary key,
+    cidr       text        not null,                 -- an IPv4/IPv6 address or CIDR, e.g. 203.0.113.7 or 10.0.0.0/8
+    label      text,                                 -- human note, e.g. 'cosmo-prod' or 'qa-laptop'
+    active     boolean     not null default true,
+    created_at timestamptz not null default now()
+);
+create unique index if not exists uniq_client_whitelist_cidr on client_whitelist (cidr);
+
+-- Primary client. 'cidr' accepts a hostname too (DNS-resolved at check time); if
+-- cosmo's egress IP differs from its DNS record, add that exact IP as another row.
+insert into client_whitelist (cidr, label)
+    values ('cosmo.deccanexperts.ai', 'cosmo-prod')
+    on conflict (cidr) do nothing;
 
 -- ---------------------------------------------------------------------------
 -- freelancers : the allow-list of people permitted to open the reset page.

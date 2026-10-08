@@ -74,6 +74,18 @@ class Store:
     async def delete_login(self, email: str) -> None:
         raise NotImplementedError
 
+    # --- client IP/CIDR allow-list (platform reset APIs) ---------------------
+    async def list_whitelist(self) -> list[dict[str, Any]]:
+        return []
+
+    async def upsert_whitelist(
+        self, cidr: str, label: str | None = None, active: bool = True
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def delete_whitelist(self, cidr: str) -> None:
+        raise NotImplementedError
+
     async def aclose(self) -> None:
         pass
 
@@ -200,6 +212,37 @@ class SupabaseStore(Store):
         r = await self._client.delete(self._fl_url(), params={"email": f"eq.{_norm_email(email)}"})
         r.raise_for_status()
 
+    def _wl_url(self) -> str:
+        return f"{settings.supabase_url.rstrip('/')}/rest/v1/{settings.client_whitelist_table}"
+
+    async def list_whitelist(self) -> list[dict[str, Any]]:
+        try:
+            r = await self._client.get(self._wl_url(), params={"select": "cidr,label,active"})
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            log.warning("client whitelist lookup failed", exc_info=True)
+            return []
+
+    async def upsert_whitelist(
+        self, cidr: str, label: str | None = None, active: bool = True
+    ) -> dict[str, Any]:
+        rec: dict[str, Any] = {"cidr": cidr.strip(), "active": active}
+        if label is not None:
+            rec["label"] = label
+        r = await self._client.post(
+            self._wl_url(),
+            json=rec,
+            headers={"Prefer": "resolution=merge-duplicates,return=representation"},
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else rec
+
+    async def delete_whitelist(self, cidr: str) -> None:
+        r = await self._client.delete(self._wl_url(), params={"cidr": f"eq.{cidr.strip()}"})
+        r.raise_for_status()
+
     def _acct_url(self) -> str:
         return f"{settings.supabase_url.rstrip('/')}/rest/v1/{settings.accounts_table}"
 
@@ -311,6 +354,17 @@ class SplitLoginStore(Store):
     async def delete_freelancer(self, email: str) -> None:
         await self._logins.delete_freelancer(email)
 
+    async def list_whitelist(self) -> list[dict[str, Any]]:
+        return await self._primary.list_whitelist()
+
+    async def upsert_whitelist(
+        self, cidr: str, label: str | None = None, active: bool = True
+    ) -> dict[str, Any]:
+        return await self._primary.upsert_whitelist(cidr, label, active)
+
+    async def delete_whitelist(self, cidr: str) -> None:
+        await self._primary.delete_whitelist(cidr)
+
     async def upsert_account(
         self, email: str, persona: str, password: str | None = None
     ) -> dict[str, Any]:
@@ -348,6 +402,7 @@ class LocalJsonStore(Store):
         self._fl_path = self._path.with_name(self._path.stem + ".freelancers.json")
         self._acct_path = self._path.with_name(self._path.stem + ".accounts.json")
         self._login_path = self._path.with_name(self._path.stem + ".logins.json")
+        self._wl_path = self._path.with_name(self._path.stem + ".whitelist.json")
         self._lock = asyncio.Lock()
         if not self._path.exists():
             self._path.write_text("{}", encoding="utf-8")
@@ -440,6 +495,39 @@ class LocalJsonStore(Store):
             data = self._read_fl()
             if data.pop(_norm_email(email), None) is not None:
                 self._write_fl(data)
+
+    def _read_wl(self) -> dict[str, Any]:
+        try:
+            return json.loads(self._wl_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _write_wl(self, data: dict[str, Any]) -> None:
+        self._wl_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+
+    async def list_whitelist(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            return list(self._read_wl().values())
+
+    async def upsert_whitelist(
+        self, cidr: str, label: str | None = None, active: bool = True
+    ) -> dict[str, Any]:
+        async with self._lock:
+            data = self._read_wl()
+            key = cidr.strip()
+            rec = data.get(key) or {"cidr": key, "created_at": _now_iso()}
+            rec["active"] = active
+            if label is not None:
+                rec["label"] = label
+            data[key] = rec
+            self._write_wl(data)
+        return rec
+
+    async def delete_whitelist(self, cidr: str) -> None:
+        async with self._lock:
+            data = self._read_wl()
+            if data.pop(cidr.strip(), None) is not None:
+                self._write_wl(data)
 
     def _read_acct(self) -> dict[str, Any]:
         try:
