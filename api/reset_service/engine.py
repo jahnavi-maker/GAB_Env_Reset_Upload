@@ -380,7 +380,13 @@ def _account_has_content(creds, *, log) -> bool:
 
 
 def _run_seeder_reset(
-    email: str, persona: str, mode: str, services: str | None, progress_id: str | None = None,
+    email: str,
+    persona: str,
+    mode: str,
+    services: str | None,
+    progress_id: str | None = None,
+    *,
+    skip_surface_cleanup: bool = False,
 ) -> ResetResult:
     """Run the seeder provision pipeline (same as the :8765 Push button).
 
@@ -404,6 +410,34 @@ def _run_seeder_reset(
         creds = backend_for(email).credentials_for(email)
     except Exception as exc:
         return ResetResult(False, f"no saved Google token for {email}: {exc}", mode)
+
+    if mode == "delta" and not skip_surface_cleanup:
+        from materialize.auth import build_service  # type: ignore
+
+        base = _baseline_ids(email, folder)
+        picked_svcs = tuple(
+            s for s in ("drive", "gmail", "calendar")
+            if s in picked
+        )
+        manifest_untrusted = (
+            not (base["gmail"] or base["calendar"] or base["drive"])
+            or _manifest_incomplete(email, folder, picked_svcs)
+            or _manifest_has_legacy_wrapper(email, folder)
+        )
+        if not manifest_untrusted and picked_svcs:
+            gmail_svc = build_service("gmail", "v1", creds)
+            cal_svc = build_service("calendar", "v3", creds)
+            drive_svc = build_service("drive", "v3", creds)
+            _baseline_surface_cleanup(
+                email,
+                folder,
+                picked_svcs,
+                gmail_svc,
+                cal_svc,
+                drive_svc,
+                manifest_untrusted=False,
+            )
+            _reconcile_apply_drift_reset(email, folder, picked_svcs, gmail_svc, cal_svc, drive_svc)
 
     # First-upload good practice (clean baseline): a plain "seed" does NOT wipe, so an
     # account that already has content (leftover Gemini/agent artifacts, a prior manual
@@ -489,19 +523,15 @@ def _run_seeder_reset(
 
 def _reset_is_clean(status: str | None, verify: dict | None) -> bool:
     """A reset is clean iff the pipeline applied every planned baseline item
-    (status == "ok": no PERMANENT_FAILURE jobs) AND verification didn't find a whole
-    module empty when it should have content (verify overall == "failed").
+    (status == "ok": no PERMANENT_FAILURE jobs).
 
-    - status "partial"/"failed"/None -> NOT clean (items are genuinely missing).
-    - verify overall "failed" (a module is empty) -> NOT clean even if status == "ok",
-      because an object was recorded SUCCESS but isn't actually live.
-    - verify None (inconclusive after retries) -> fall back to status alone; a good
-      reset is not blocked just because the read-back couldn't run.
-    - verify "partial"/short counts -> clean-per-status; on a delta a short/over count
-      can be legitimate agent drift that reconcile (not this seed path) owns.
+    Verify read-back can report overall "partial" or module tone "warn" when Drive/Gmail
+    counts drift from agent activity; reconcile is responsible for trimming that drift.
+    Only verify overall "failed" (e.g. empty surface) marks the reset not clean.
     """
-    verify_failed = bool(verify) and verify.get("overall") == "failed"
-    return status == "ok" and not verify_failed
+    if verify and verify.get("overall") == "failed":
+        return False
+    return status == "ok"
 
 
 def _degraded_reason(status: str | None, acct: dict, verify: dict | None) -> str:
@@ -519,10 +549,14 @@ def _degraded_reason(status: str | None, acct: dict, verify: dict | None) -> str
             parts.append(f"error: {acct['error']}")
     elif status is None:
         parts.append("account produced no pipeline result")
-    if verify and verify.get("overall") == "failed":
-        empties = [k for k, m in (verify.get("modules") or {}).items()
-                   if isinstance(m, dict) and m.get("tone") == "err"]
-        parts.append("verify: empty " + ", ".join(sorted(empties)) if empties else "verify failed")
+    if verify:
+        if verify.get("overall") in ("failed", "partial"):
+            parts.append(f"verify: {verify.get('overall')}")
+        else:
+            warns = [k for k, m in (verify.get("modules") or {}).items()
+                     if isinstance(m, dict) and m.get("tone") in ("warn", "err")]
+            if warns:
+                parts.append("verify: mismatch " + ", ".join(sorted(warns)))
     return "; ".join(parts) or f"status {status}"
 
 
@@ -916,24 +950,172 @@ def _reconcile_drift(email: str, folder: str, picked_svcs: tuple[str, ...], gmai
     return drift
 
 
-def _owned_drive_files(drive) -> list:
-    """(id, parent) for every file/folder the account OWNS (skips 'shared with me' and
-    trashed). One listing; parent chain is used to decide 'under the seed folder'."""
-    out: list = []
+def _normalize_drive_rel(path: str) -> str:
+    return str(path or "").replace("\\", "/").strip().lstrip("/")
+
+
+def _expected_drive_paths(persona_folder: str) -> tuple[set[str], set[str]]:
+    """Logical file paths and required folder prefixes from filesystem/data.json."""
+    from materialize.json_util import inspect_and_normalize  # type: ignore
+    from materialize.runstate import persona_file  # type: ignore
+
+    src = persona_file(persona_folder, "filesystem")
+    if not src:
+        return set(), set()
+    inspected = inspect_and_normalize(src, expected="filesystem")
+    if not inspected.get("ok"):
+        return set(), set()
+    files: set[str] = set()
+    folders: set[str] = set()
+    for index, item in enumerate(inspected.get("data", {}).get("files") or []):
+        if not isinstance(item, dict):
+            continue
+        rel = _normalize_drive_rel(
+            str(item.get("path") or item.get("filename") or f"file-{index}")
+        )
+        if not rel:
+            continue
+        files.add(rel)
+        parts = rel.split("/")
+        for i in range(1, len(parts)):
+            folders.add("/".join(parts[:i]))
+    return files, folders
+
+
+def _drive_owned_index(drive) -> dict[str, dict]:
+    """One Drive list: id -> {name, parent, mime}. Reused for orphan + path passes."""
+    index: dict[str, dict] = {}
     tok = None
     while True:
         resp = drive.files().list(
             q="'me' in owners and trashed=false",
-            fields="nextPageToken, files(id,parents)",
-            pageSize=1000, pageToken=tok, spaces="drive",
+            fields="nextPageToken, files(id,name,parents,mimeType)",
+            pageSize=1000,
+            pageToken=tok,
+            spaces="drive",
         ).execute()
-        for f in resp.get("files", []) or []:
-            if f.get("id"):
-                out.append((f["id"], (f.get("parents") or [None])[0]))
+        for f in resp.get("files") or []:
+            fid = f.get("id")
+            if not fid:
+                continue
+            parents = f.get("parents") or []
+            index[fid] = {
+                "name": str(f.get("name") or ""),
+                "parent": parents[0] if parents else None,
+                "mime": f.get("mimeType") or "",
+            }
         tok = resp.get("nextPageToken")
         if not tok:
             break
-    return out
+    return index
+
+
+def _drive_relpath(fid: str, index: dict[str, dict]) -> str:
+    parts: list[str] = []
+    cur: str | None = fid
+    seen: set[str] = set()
+    while cur and cur in index and cur not in seen:
+        seen.add(cur)
+        parts.append(index[cur]["name"])
+        cur = index[cur].get("parent")
+        if cur and cur not in index:
+            break
+    return _normalize_drive_rel("/".join(reversed(parts)))
+
+
+def _drive_my_drive_top_level(index: dict[str, dict]) -> list[str]:
+    """Owned items whose parent is outside the owned index (= direct My Drive children)."""
+    return [
+        fid
+        for fid, meta in index.items()
+        if meta.get("parent") is None or meta.get("parent") not in index
+    ]
+
+
+def _drive_index_walk_generated(
+    index: dict[str, dict],
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Walk My Drive like verify._count_drive: root children, skip Github + github zip.
+
+    Returns (relative_path -> [file_ids], folder_relative_path -> folder_id).
+    """
+    folder_mime = "application/vnd.google-apps.folder"
+    children: dict[str, list[str]] = {}
+    for fid, meta in index.items():
+        parent = meta.get("parent")
+        if parent:
+            children.setdefault(parent, []).append(fid)
+
+    path_to_file_ids: dict[str, list[str]] = {}
+    folder_paths: dict[str, str] = {}
+    stack: list[tuple[str, str]] = []
+
+    for fid in _drive_my_drive_top_level(index):
+        meta = index[fid]
+        name = str(meta.get("name") or "")
+        if meta.get("mime") == folder_mime:
+            if name == "Github":
+                continue
+            rel = _normalize_drive_rel(name)
+            folder_paths[rel] = fid
+            stack.append((fid, rel))
+        elif name == "github-repo-snapshot.zip":
+            continue
+        else:
+            path_to_file_ids.setdefault(_normalize_drive_rel(name), []).append(fid)
+
+    while stack:
+        folder_id, prefix = stack.pop()
+        for cid in children.get(folder_id, []):
+            meta = index[cid]
+            name = str(meta.get("name") or "")
+            rel = _normalize_drive_rel(f"{prefix}/{name}" if prefix else name)
+            if meta.get("mime") == folder_mime:
+                if name == "Github":
+                    continue
+                folder_paths[rel] = cid
+                stack.append((cid, rel))
+            elif name == "github-repo-snapshot.zip":
+                continue
+            else:
+                path_to_file_ids.setdefault(rel, []).append(cid)
+
+    return path_to_file_ids, folder_paths
+
+
+def _drive_path_manifest_extras(
+    persona_folder: str, baseline_ids: set, index: dict[str, dict],
+) -> set[str]:
+    """Files/folders under My Drive not in data.json (matches verify root walk).
+
+    Duplicate uploads at the same manifest path: keep one id (prefer manifest), trash rest.
+    """
+    expected_files, expected_folders = _expected_drive_paths(persona_folder)
+    if not expected_files and not expected_folders:
+        return set()
+    path_to_file_ids, folder_paths = _drive_index_walk_generated(index)
+    extras: set[str] = set()
+
+    for path, ids in path_to_file_ids.items():
+        if path not in expected_files:
+            extras.update(ids)
+            continue
+        if len(ids) > 1:
+            keep = next((i for i in ids if i in baseline_ids), ids[0])
+            extras.update(i for i in ids if i != keep)
+
+    for path, fid in folder_paths.items():
+        if path not in expected_folders:
+            extras.add(fid)
+
+    return extras
+
+
+def _owned_drive_files(drive) -> list:
+    """(id, parent) for every file/folder the account OWNS (skips 'shared with me' and
+    trashed). One listing; parent chain is used to decide 'under the seed folder'."""
+    index = _drive_owned_index(drive)
+    return [(fid, meta.get("parent")) for fid, meta in index.items()]
 
 
 def _live_drive_ids(drive) -> set:
@@ -941,7 +1123,7 @@ def _live_drive_ids(drive) -> set:
     return {fid for fid, _ in _owned_drive_files(drive)}
 
 
-def _drive_orphans(drive, baseline_ids: set) -> set:
+def _drive_orphans(drive, baseline_ids: set, index: dict[str, dict] | None = None) -> set:
     """Owned Drive ids that are agent-created = not recorded in the manifest AND not a
     descendant of any manifest-recorded folder.
 
@@ -950,10 +1132,10 @@ def _drive_orphans(drive, baseline_ids: set) -> set:
     names → synthetic_id collisions), so we ALSO keep anything whose parent chain reaches
     a recorded folder. That closes those gaps without the fragility of a single seed-root.
     Never seeded (empty baseline) → everything owned is an orphan (→ full nuke + reseed)."""
-    files = _owned_drive_files(drive)
+    idx = index if index is not None else _drive_owned_index(drive)
     if not baseline_ids:
-        return {fid for fid, _ in files}
-    parent = {fid: p for fid, p in files}
+        return set(idx)
+    parent = {fid: meta.get("parent") for fid, meta in idx.items()}
 
     def kept(fid: str) -> bool:
         cur, seen = fid, set()
@@ -964,7 +1146,130 @@ def _drive_orphans(drive, baseline_ids: set) -> set:
             cur = parent.get(cur)
         return False
 
-    return {fid for fid, _ in files if not kept(fid)}
+    return {fid for fid in idx if not kept(fid)}
+
+
+def _reconcile_apply_drift_reset(
+    email: str, folder: str, picked_svcs: tuple[str, ...], gmail, cal, drive,
+) -> None:
+    """Reset only drifted baseline jobs to PENDING (bulk-diff); safe no-op if store missing."""
+    try:
+        from materialize.provision.store import JobStore  # type: ignore
+
+        sp = _acct_dir(email, folder) / "provision.sqlite"
+        if not sp.exists():
+            return
+        drift = _reconcile_drift(email, folder, picked_svcs, gmail, cal, drive)
+        drifted_ids: set = set()
+        for s in picked_svcs:
+            drifted_ids |= drift.get(s, set())
+        js = JobStore(sp)
+        try:
+            n = js.reset_to_pending(
+                services=picked_svcs,
+                actions=_BASELINE_ACTIONS,
+                synthetic_ids=drifted_ids,
+            )
+        finally:
+            js.close()
+        log.info(
+            "reconcile bulk-diff %s: drift gmail=%d calendar=%d drive=%d -> re-run %d items",
+            email,
+            len(drift.get("gmail", set())),
+            len(drift.get("calendar", set())),
+            len(drift.get("drive", set())),
+            n,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("reconcile bulk-diff failed for %s: %s; full re-verify fallback", email, exc)
+        try:
+            from materialize.provision.store import JobStore  # type: ignore
+
+            sp = _acct_dir(email, folder) / "provision.sqlite"
+            if sp.exists():
+                js = JobStore(sp)
+                try:
+                    js.reset_to_pending(services=picked_svcs, actions=_BASELINE_ACTIONS)
+                finally:
+                    js.close()
+        except Exception as exc2:  # noqa: BLE001
+            log.warning("reconcile full re-verify fallback also failed for %s: %s", email, exc2)
+
+
+def _baseline_surface_cleanup(
+    email: str,
+    folder: str,
+    picked_svcs: tuple[str, ...],
+    gmail,
+    cal,
+    drive,
+    *,
+    manifest_untrusted: bool,
+) -> dict[str, int]:
+    """Remove live Gmail/Calendar/Drive items not in the persona baseline (orphans + path pass)."""
+    base = _baseline_ids(email, folder)
+    drive_index: dict[str, dict] = {}
+    if "drive" in picked_svcs:
+        drive_index = _drive_owned_index(drive)
+
+    if manifest_untrusted:
+        g_orphans = _live_gmail_ids(gmail) if "gmail" in picked_svcs else set()
+        c_orphans = _live_calendar_ids(cal) if "calendar" in picked_svcs else set()
+        d_orphans = set(drive_index) if "drive" in picked_svcs else set()
+    else:
+        g_orphans = (
+            (_live_gmail_ids(gmail) - base["gmail"]) if "gmail" in picked_svcs else set()
+        )
+        c_orphans = (
+            (_live_calendar_ids(cal) - base["calendar"]) if "calendar" in picked_svcs else set()
+        )
+        d_orphans = (
+            _drive_orphans(drive, base["drive"], drive_index) if "drive" in picked_svcs else set()
+        )
+        if "drive" in picked_svcs:
+            path_extra = _drive_path_manifest_extras(folder, base["drive"], drive_index)
+            if path_extra:
+                sample = ", ".join(sorted(path_extra)[:10])
+                log.info(
+                    "reconcile %s AUDIT delete drive path-extras [%d]: %s%s",
+                    email,
+                    len(path_extra),
+                    sample,
+                    " …" if len(path_extra) > 10 else "",
+                )
+            d_orphans |= path_extra
+
+    for svc, ids in (("gmail", g_orphans), ("calendar", c_orphans), ("drive", d_orphans)):
+        if ids:
+            sample = ", ".join(list(ids)[:10])
+            log.info(
+                "reconcile %s AUDIT delete %s orphans [%d]: %s%s",
+                email,
+                svc,
+                len(ids),
+                sample,
+                " …" if len(ids) > 10 else "",
+            )
+    deleted = {
+        "gmail": _delete_gmail(gmail, g_orphans) if "gmail" in picked_svcs else 0,
+        "calendar": _delete_calendar_events(cal, c_orphans) if "calendar" in picked_svcs else 0,
+        "drive": _delete_drive(drive, d_orphans) if "drive" in picked_svcs else 0,
+    }
+    if "gmail" in picked_svcs:
+        try:
+            trashed_mail = _gmail_ids_by_query(gmail, "in:trash")
+            if trashed_mail:
+                _delete_gmail(gmail, trashed_mail)
+                deleted["gmail"] += len(trashed_mail)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("gmail empty-trash failed: %s", exc)
+    if "drive" in picked_svcs:
+        try:
+            drive.files().emptyTrash().execute()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("drive emptyTrash failed: %s", exc)
+    log.info("reconcile %s removed orphans=%s", email, deleted)
+    return deleted
 
 
 def reconcile_preview(email: str, persona: str) -> dict:
@@ -996,15 +1301,20 @@ def reconcile_preview(email: str, persona: str) -> dict:
             "orphan_ids": sorted(g_orphans)[:50],
         }
     }
-    # Drive: manifest ids + anything under a manifest-recorded folder (ancestry).
+    # Drive: id orphans + path extras (data.json is source of truth under seeded tree).
     drive = build_service("drive", "v3", creds)
-    d_all = _live_drive_ids(drive)
-    d_orphans = _drive_orphans(drive, base["drive"])
+    d_index = _drive_owned_index(drive)
+    d_all = set(d_index)
+    d_orphans = _drive_orphans(drive, base["drive"], d_index)
+    d_path_extra = _drive_path_manifest_extras(folder, base["drive"], d_index)
+    d_remove = d_orphans | d_path_extra
     services["drive"] = {
-        "baseline": len(d_all) - len(d_orphans),
+        "baseline": len(d_all) - len(d_remove),
         "live": len(d_all),
         "orphans": len(d_orphans),
-        "orphan_ids": sorted(d_orphans)[:50],
+        "path_extras": len(d_path_extra),
+        "would_remove": len(d_remove),
+        "orphan_ids": sorted(d_remove)[:50],
     }
     # Calendar: identity by manifest google_object_id (provably clean).
     cal_live = _live_calendar_ids(build_service("calendar", "v3", creds))
@@ -1139,98 +1449,23 @@ def _run_reconcile(
         log.warning("reconcile: manifest for %s is incomplete (interrupted/partial seed) "
                     "-> full nuke + reseed instead of an untrusted orphan diff", email)
 
-    if manifest_untrusted:
-        # No trustworthy baseline: nuke EVERYTHING live and let the forced reseed below
-        # rebuild a clean baseline + manifest from data.json. (For an empty manifest this
-        # is identical to the diff, since base is empty; for an incomplete one it avoids
-        # keeping the partially-recorded baseline that the reseed would wipe anyway.)
-        g_orphans = _live_gmail_ids(gmail)
-        c_orphans = _live_calendar_ids(cal)
-        d_orphans = {fid for fid, _ in _owned_drive_files(drive)}
-    else:
-        # All three surfaces identify the baseline by MANIFEST google_object_id (exact, no label):
-        # orphans = live items whose id isn't in the manifest (agent-added or stale re-seed dups).
-        # Drive additionally keeps anything under a manifest-recorded folder (github-repo ancestry).
-        g_orphans = _live_gmail_ids(gmail) - base["gmail"]
-        c_orphans = _live_calendar_ids(cal) - base["calendar"]
-        d_orphans = _drive_orphans(drive, base["drive"])
-    # Audit trail: record which agent-created items we are about to remove (capped sample),
-    # so a reset leaves proof of exactly what was cleaned per account.
-    for svc, ids in (("gmail", g_orphans), ("calendar", c_orphans), ("drive", d_orphans)):
-        if ids:
-            sample = ", ".join(list(ids)[:10])
-            log.info("reconcile %s AUDIT delete %s orphans [%d]: %s%s",
-                     email, svc, len(ids), sample, " …" if len(ids) > 10 else "")
-    deleted = {
-        "gmail": _delete_gmail(gmail, g_orphans),
-        "calendar": _delete_calendar_events(cal, c_orphans),
-        "drive": _delete_drive(drive, d_orphans),
-    }
-    # Empty any pre-existing Trash too (from earlier runs, or items a model trashed) so the
-    # account is truly pristine. The baseline is never in Trash, so this is safe.
-    try:
-        trashed_mail = _gmail_ids_by_query(gmail, "in:trash")
-        if trashed_mail:
-            _delete_gmail(gmail, trashed_mail)
-            deleted["gmail"] += len(trashed_mail)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("gmail empty-trash failed: %s", exc)
-    try:
-        drive.files().emptyTrash().execute()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("drive emptyTrash failed: %s", exc)
-    log.info("reconcile %s removed orphans=%s", email, deleted)
+    deleted = _baseline_surface_cleanup(
+        email, folder, picked_svcs, gmail, cal, drive, manifest_untrusted=manifest_untrusted,
+    )
 
-    # RE-VERIFY via BULK-DIFF: a delta normally skips jobs already SUCCESS, so it would NOT
-    # restore an item the agent deleted nor fix one it modified. Rather than flip EVERY
-    # baseline job to PENDING (which pushes all N items — often thousands of GitHub files —
-    # through the queue just to skip the unchanged ones), compute the drift in-process from
-    # bulk listings + the manifest's stored md5s, and reset ONLY the items that actually
-    # changed. Unchanged items never touch the queue. Falls back to a full re-verify if the
-    # diff can't be computed, so correctness is never traded for speed.
-    # (Only meaningful on the trusted-delta path; the reseed below wipes the store anyway.)
     if not manifest_untrusted:
-        try:
-            from materialize.provision.store import JobStore  # type: ignore
-
-            sp = _acct_dir(email, folder) / "provision.sqlite"
-            if sp.exists():
-                drift = _reconcile_drift(email, folder, picked_svcs, gmail, cal, drive)
-                drifted_ids: set = set()
-                for s in picked_svcs:
-                    drifted_ids |= drift.get(s, set())
-                js = JobStore(sp)
-                try:
-                    n = js.reset_to_pending(
-                        services=picked_svcs,
-                        actions=_BASELINE_ACTIONS,
-                        synthetic_ids=drifted_ids,
-                    )
-                finally:
-                    js.close()
-                log.info("reconcile bulk-diff %s: drift gmail=%d calendar=%d drive=%d -> re-run %d items",
-                         email, len(drift.get("gmail", set())), len(drift.get("calendar", set())),
-                         len(drift.get("drive", set())), n)
-        except Exception as exc:  # noqa: BLE001 - bulk-diff failed -> full re-verify (safe, slow)
-            log.warning("reconcile bulk-diff failed for %s: %s; full re-verify fallback", email, exc)
-            try:
-                from materialize.provision.store import JobStore  # type: ignore
-
-                sp = _acct_dir(email, folder) / "provision.sqlite"
-                if sp.exists():
-                    js = JobStore(sp)
-                    try:
-                        js.reset_to_pending(services=picked_svcs, actions=_BASELINE_ACTIONS)
-                    finally:
-                        js.close()
-            except Exception as exc2:  # noqa: BLE001
-                log.warning("reconcile full re-verify fallback also failed for %s: %s", email, exc2)
+        _reconcile_apply_drift_reset(email, folder, picked_svcs, gmail, cal, drive)
 
     # Restore the baseline. Untrusted manifest (empty or incomplete) -> full reseed (wipe
     # store + seed + rebuild a clean manifest); otherwise a delta that (after the reset
     # above) re-verifies and repairs every baseline item.
     restore = _run_seeder_reset(
-        email, persona, "reseed" if manifest_untrusted else "delta", services, progress_id
+        email,
+        persona,
+        "reseed" if manifest_untrusted else "delta",
+        services,
+        progress_id,
+        skip_surface_cleanup=True,
     )
     raw = restore.raw if isinstance(restore.raw, dict) else {}
     raw["reconcile_deleted"] = deleted

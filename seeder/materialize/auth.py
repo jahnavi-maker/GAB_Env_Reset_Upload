@@ -37,7 +37,7 @@ SCOPES = [
 ]
 
 ROOT = Path(__file__).resolve().parent.parent
-TOKENS_DIR = ROOT / "tokens"
+TOKENS_DIR = Path(os.environ.get("GAB_TOKEN_DIR") or (ROOT / "tokens")).expanduser().resolve()
 CREDENTIALS_PATH = ROOT / "credentials.json"
 BASE_URL = os.environ.get("ENV_LOADER_BASE_URL", "http://127.0.0.1:8765").rstrip("/")
 HTTP_TIMEOUT = 60
@@ -290,21 +290,22 @@ def discard_creds(account_email: str) -> None:
             old.unlink()
 
 
-def make_flow(redirect_uri: str) -> Flow:
-    if not CREDENTIALS_PATH.exists():
+def make_flow(redirect_uri: str, client_secrets_path: Path | None = None) -> Flow:
+    path = client_secrets_path or CREDENTIALS_PATH
+    if not path.exists():
         raise FileNotFoundError(
-            "Missing credentials.json. Create a Google Cloud OAuth Web client "
-            "and save it next to this app."
+            f"Missing OAuth client JSON at {path}. Create a Google Cloud OAuth Web client "
+            "and save it under seeder/."
         )
-    data = json.loads(CREDENTIALS_PATH.read_text())
+    data = json.loads(path.read_text())
     if "web" not in data:
         raise FileNotFoundError(
-            "credentials.json is not a Web OAuth client. "
+            f"{path.name} is not a Web OAuth client. "
             "Create a Web client with redirect "
             f"{BASE_URL}/oauth/callback and replace this file."
         )
     return Flow.from_client_secrets_file(
-        str(CREDENTIALS_PATH),
+        str(path),
         scopes=SCOPES,
         redirect_uri=redirect_uri,
     )

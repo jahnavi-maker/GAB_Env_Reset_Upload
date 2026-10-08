@@ -94,7 +94,7 @@ class Settings:
     # write blipped, or the process restarted) and is reaped -> 'failed', so the
     # one-active-per-email lock can't block an account forever. Must exceed the max
     # legit runtime (reset_timeout_s) + a buffer.
-    stuck_reset_ttl_s: int = _int_env("STUCK_RESET_TTL_S", _int_env("GAB_RESET_TIMEOUT_S", 5400) + 1800)
+    stuck_reset_ttl_s: int = _int_env("STUCK_RESET_TTL_S", 14400)  # 4h from started_at; queued never reaped
     reaper_interval_s: int = _int_env("REAPER_INTERVAL_S", 600)  # sweep every 10 min
 
     # --- Parallelism + routing + QC logging ---------------------------------

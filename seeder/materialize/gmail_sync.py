@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import socket
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -19,6 +18,36 @@ from materialize.fail import next_for
 GAB_LABEL = "GAB-SEED"
 
 
+def _invalid_label_error(exc: HttpError) -> bool:
+    status = getattr(exc.resp, "status", None)
+    if status == 404:
+        return True
+    if status != 400:
+        return False
+    try:
+        body = exc.error_details if hasattr(exc, "error_details") else []
+        if isinstance(body, list):
+            for item in body:
+                if isinstance(item, dict) and str(item.get("reason", "")).lower() == "invalid":
+                    return True
+        msg = str(exc).lower()
+        return "invalid label" in msg or "label id" in msg
+    except Exception:
+        return True
+
+
+def label_is_valid(gmail, label_id: str) -> bool:
+    if not label_id:
+        return False
+    try:
+        gmail.users().labels().get(userId="me", id=label_id).execute()
+        return True
+    except HttpError as exc:
+        if _invalid_label_error(exc):
+            return False
+        raise
+
+
 def _retry(fn, log: Callable[[str], None], tries: int = 6):
     delay = 1.0
     for i in range(tries):
@@ -28,15 +57,6 @@ def _retry(fn, log: Callable[[str], None], tries: int = 6):
             status = getattr(exc.resp, "status", None)
             if status in (403, 429, 500, 503) and i < tries - 1:
                 log(f"Gmail API {status}, retrying in {delay:.0f}s")
-                time.sleep(delay)
-                delay = min(delay * 2, 30)
-                continue
-            raise
-        except (socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
-            # Network stall (surfaced by the global socket timeout): retry like a transient
-            # 5xx instead of aborting — parity with the Drive/Calendar retries.
-            if i < tries - 1:
-                log(f"Gmail network stall ({type(exc).__name__}), retrying in {delay:.0f}s")
                 time.sleep(delay)
                 delay = min(delay * 2, 30)
                 continue
@@ -65,6 +85,19 @@ def ensure_label(gmail, log: Callable[[str], None]) -> str:
     return created["id"]
 
 
+def resolve_seed_label_id(
+    gmail,
+    log: Callable[[str], None],
+    hint: str | None = None,
+) -> str:
+    """Return a live Gmail label id for GAB-SEED, refreshing when ``hint`` is stale."""
+    if hint and label_is_valid(gmail, hint):
+        return hint
+    if hint:
+        log(f"Stored {GAB_LABEL} label id is invalid; resolving by name")
+    return ensure_label(gmail, log)
+
+
 def _normalize_msgid(value: str) -> str:
     raw = (value or "").strip().strip("<>")
     if raw.endswith("@gab.ultraevals.local"):
@@ -72,8 +105,30 @@ def _normalize_msgid(value: str) -> str:
     return raw.lower()
 
 
-def list_seeded_mail(gmail, label_id: str, log: Callable[[str], None]) -> dict[str, dict[str, str]]:
+def list_seeded_mail(
+    gmail,
+    label_id: str,
+    log: Callable[[str], None],
+    *,
+    refresh_label: Callable[[], str] | None = None,
+) -> dict[str, dict[str, str]]:
     """email_id / Message-ID → {id, threadId} for GAB-SEED messages already in the mailbox."""
+    try:
+        return _list_seeded_mail_pages(gmail, label_id, log)
+    except HttpError as exc:
+        if refresh_label and _invalid_label_error(exc):
+            fresh = refresh_label()
+            if fresh != label_id:
+                log(f"Retrying seeded-mail list with refreshed {GAB_LABEL} label id")
+                return _list_seeded_mail_pages(gmail, fresh, log)
+        raise
+
+
+def _list_seeded_mail_pages(
+    gmail,
+    label_id: str,
+    log: Callable[[str], None],
+) -> dict[str, dict[str, str]]:
     found: dict[str, dict[str, str]] = {}
     page = None
     ids: list[str] = []
@@ -117,27 +172,15 @@ def list_seeded_mail(gmail, label_id: str, log: Callable[[str], None]) -> dict[s
     return found
 
 
-def _is_scope_403(exc: HttpError) -> bool:
-    """A 403 caused by an insufficient OAuth scope (not a rate limit)."""
-    if getattr(exc.resp, "status", None) != 403:
-        return False
-    text = str(exc).lower()
-    return "insufficient" in text or "permission" in text or "accessnotconfigured" in text
-
-
 def wipe_seeded_mail(gmail, log: Callable[[str], None]) -> int:
-    """FULL wipe of ALL mail (no marker match). Loop-until-empty: wiped messages drop out
-    of a non-trash listing, so we re-list until none remain.
+    """FULL wipe: permanently delete ALL mail (no marker match).
 
-    Consumer accounts hold full https://mail.google.com/ scope, so we hard-delete via
-    batchDelete (1000/chunk). Workspace **delegation** accounts only have gmail.modify —
-    batchDelete 403s there — so we FALL BACK to moving mail to Trash (batchModify +TRASH,
-    allowed by gmail.modify). _count_gmail counts only non-trash GAB-SEED mail, so a reseed
-    still verifies clean; trashed mail auto-purges. Grant mail.google.com in the DWD config
-    for true hard-delete on delegated accounts.
+    The platform authorizes accounts with full https://mail.google.com/ scope
+    (see materialize/auth.py), so we hard-delete via batchDelete (1000/chunk)
+    rather than moving to Trash. Loop-until-empty: deleted messages drop out
+    of the listing, so we re-list until none remain.
     """
     deleted = 0
-    hard_delete = True
     while True:
         resp = _retry(
             lambda: gmail.users()
@@ -151,34 +194,16 @@ def wipe_seeded_mail(gmail, log: Callable[[str], None]) -> int:
             break
         for start in range(0, len(ids), 1000):
             chunk = ids[start : start + 1000]
-            if hard_delete:
-                try:
-                    gmail.users().messages().batchDelete(userId="me", body={"ids": chunk}).execute()
-                    deleted += len(chunk)
-                    continue
-                except HttpError as exc:
-                    if _is_scope_403(exc):
-                        log("Gmail batchDelete not permitted (gmail.modify scope) — moving mail to Trash instead")
-                        hard_delete = False
-                    elif getattr(exc.resp, "status", None) in (429, 500, 503):
-                        _retry(
-                            lambda c=chunk: gmail.users().messages()
-                            .batchDelete(userId="me", body={"ids": c}).execute(),
-                            log,
-                        )
-                        deleted += len(chunk)
-                        continue
-                    else:
-                        raise
-            # Trash fallback (gmail.modify): add the TRASH label in batch.
             _retry(
-                lambda c=chunk: gmail.users().messages()
-                .batchModify(userId="me", body={"ids": c, "addLabelIds": ["TRASH"]}).execute(),
+                lambda c=chunk: gmail.users()
+                .messages()
+                .batchDelete(userId="me", body={"ids": c})
+                .execute(),
                 log,
             )
             deleted += len(chunk)
-        log(f"Removed {deleted} messages so far (full wipe)")
-    log(f"Full Gmail wipe: {deleted} messages ({'deleted' if hard_delete else 'trashed'})")
+        log(f"Deleted {deleted} messages so far (full wipe)")
+    log(f"Full Gmail wipe: permanently deleted {deleted} messages")
     return deleted
 
 

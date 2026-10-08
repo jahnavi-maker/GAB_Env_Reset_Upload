@@ -8,29 +8,27 @@ from typing import Any
 
 from materialize.auth import build_service
 from materialize.calendar_sync import (
-    event_needs_update,
     insert_event,
     match_seeded_event,
     seeded_event_index,
-    update_event,
     wipe_seeded_events,
 )
 from materialize.drive_sync import (
     SEED_FOLDER,
     ensure_child_folder,
-    list_owned_files_index,
-    patch_file_metadata,
+    find_child_file,
     trash_file,
-    update_file_media,
     upload_bytes,
     wipe_seed_folder,
 )
 from materialize.fs_cache import ensure_persona_drive_cache, file_index_from_cache, read_cached_bytes
 from materialize.gmail_sync import (
+    GAB_LABEL,
     _normalize_msgid,
     ensure_label,
     insert_one_message,
     list_seeded_mail,
+    resolve_seed_label_id,
     trash_seeded_message,
     wipe_seeded_mail,
 )
@@ -86,33 +84,27 @@ class JobExecutor:
         self._folder_cache: dict[str, dict[str, str]] = {}
         self._cal_index: dict[str, tuple[dict, dict]] = {}
         self._mail_index: dict[str, dict[str, dict[str, str]]] = {}
-        # (account, parent_id) -> {name: (size, id, md5)} so a full reconcile lists each
-        # Drive folder once instead of one API call per file.
-        # One bulk Drive listing per account, reused by every drive delta job:
-        #   _owned_by_id: {file_id: meta}         -> identify a baseline file by its manifest id
-        #                                            even after an agent rename/move
-        #   _owned_by_loc: {(parent_id, name): meta} -> name/location lookup for the restore path
-        self._owned_by_id: dict[str, dict[str, dict]] = {}
-        self._owned_by_loc: dict[str, dict[tuple[str, str], dict]] = {}
-        self._owned_lock = threading.Lock()
 
-    def _drive_owned(self, drive, account_id: str) -> tuple[dict[str, dict], dict[tuple[str, str], dict]]:
-        """Lazily build (and cache) the account's owned-file indexes: by id and by (parent,name)."""
-        with self._owned_lock:
-            by_id = self._owned_by_id.get(account_id)
-            by_loc = self._owned_by_loc.get(account_id)
-        if by_id is None:
-            by_id = list_owned_files_index(drive, self.log)
-            by_loc = {}
-            for fid, meta in by_id.items():
-                if meta.get("is_folder"):
-                    continue  # by_loc is for file restore lookups; folders handled by id/name
-                for par in meta.get("parents") or ():
-                    by_loc[(str(par), meta["name"])] = {**meta, "id": fid}
-            with self._owned_lock:
-                self._owned_by_id[account_id] = by_id
-                self._owned_by_loc[account_id] = by_loc
-        return by_id, by_loc
+    _GMAIL_LABEL_SID = "gmail/label"
+
+    def _resolve_gmail_label_id(self, gmail, account_id: str) -> str:
+        with self._label_lock:
+            hint = self._label_cache.get(account_id)
+        if not hint:
+            hint = self.store.google_id(account_id, "gmail", self._GMAIL_LABEL_SID)
+        label_id = resolve_seed_label_id(gmail, self.log, hint)
+        stored = self.store.google_id(account_id, "gmail", self._GMAIL_LABEL_SID)
+        if label_id != stored:
+            row = self.store.get_by_key(account_id, "gmail", self._GMAIL_LABEL_SID)
+            if row:
+                self.store.persist_success(row.job_id, label_id)
+            elif label_id != hint:
+                self.log(f"Updated in-memory {GAB_LABEL} label id for {account_id}")
+        with self._label_lock:
+            self._label_cache[account_id] = label_id
+        if hint and label_id != hint:
+            self._mail_index.pop(account_id, None)
+        return label_id
 
     def execute(self, job: Job) -> dict[str, Any]:
         if job.service == "generate":
@@ -137,31 +129,11 @@ class JobExecutor:
     def _drive(self, job: Job, creds) -> dict[str, Any]:
         drive = service_for(job.account_id, "drive", "v3", creds)
         if job.action == "wipe":
-            # Pass creds so the wipe deletes across a thread pool (per-thread Drive services)
-            # instead of one-by-one — the single-threaded wipe of a ~9000-file account was
-            # the dominant cost of a reseed.
-            n = wipe_seed_folder(drive, job.environment_id, self.log, creds=creds, workers=10)
+            n = wipe_seed_folder(drive, job.environment_id, self.log)
             return {"id": "wiped", "trashed": n}
         if job.action == "create_folder":
             parent = parent_folder_id(self.store, job, job.payload)
             name = str(job.payload.get("name") or job.source_path or "folder")
-            if (job.extra or {}).get("mode") == DELTA:
-                # If the seeded folder still exists by its manifest id, repair an agent
-                # rename/move in place (keeps the id, so child files stay linked) instead of
-                # creating a duplicate empty folder.
-                by_id, _ = self._drive_owned(drive, job.account_id)
-                gid = str(job.google_object_id or "")
-                live = by_id.get(gid) if gid else None
-                if live and live.get("is_folder"):
-                    if live["name"] != name or parent not in (live.get("parents") or ()):
-                        remove = [p for p in (live.get("parents") or ()) if p != parent] or None
-                        patch_file_metadata(
-                            drive, gid, self.log,
-                            name=name if live["name"] != name else None,
-                            add_parent=parent if parent not in (live.get("parents") or ()) else None,
-                            remove_parents=remove,
-                        )
-                    return {"id": gid}
             cache = self._folder_cache.setdefault(job.account_id, {})
             folder_id = ensure_child_folder(drive, name, parent, self.log, cache)
             return {"id": folder_id}
@@ -174,57 +146,12 @@ class JobExecutor:
             else:
                 raw = read_cached_bytes(job.environment_id, job.payload.get("rel") or job.source_path)
             if (job.extra or {}).get("mode") == DELTA:
-                by_id, by_loc = self._drive_owned(drive, job.account_id)
-                want_md5 = hashlib.md5(raw).hexdigest()
-                gid = str(job.google_object_id or "")
-                live = by_id.get(gid) if gid else None
-                if live:
-                    # The seeded file still exists (by its manifest id) — the agent may have
-                    # RENAMED, MOVED, or edited its CONTENT. Repair each in place (same id).
-                    changed = False
-                    if live["name"] != name or parent not in (live.get("parents") or ()):
-                        remove = [p for p in (live.get("parents") or ()) if p != parent] or None
-                        patch_file_metadata(
-                            drive, gid, self.log,
-                            name=name if live["name"] != name else None,
-                            add_parent=parent if parent not in (live.get("parents") or ()) else None,
-                            remove_parents=remove,
-                        )
-                        changed = True
-                    if live.get("md5"):
-                        # Binary seed (always has an md5): compare content, overwrite on drift.
-                        if live["md5"] != want_md5:
-                            update_file_media(drive, gid, raw, mime, self.log)
-                            changed = True
-                    else:
-                        # No md5 => the file is now a Google-native/converted type, so its bytes
-                        # can't be verified. Seeds are uploaded binaries, so a md5-less live file
-                        # means the content drifted (e.g. converted to a Doc). Restore the seeded
-                        # bytes in place; if Drive refuses an in-place media update on a native
-                        # file, fall back to trash + re-upload (persist_success records the new id).
-                        try:
-                            update_file_media(drive, gid, raw, mime, self.log)
-                            changed = True
-                        except Exception as exc:  # noqa: BLE001
-                            self.log(f"native-file restore in place failed for {gid} ({name}): "
-                                     f"{exc}; re-uploading")
-                            try:
-                                trash_file(drive, gid, self.log)
-                            except Exception as exc2:  # noqa: BLE001
-                                self.log(f"could not trash drifted native file {gid}: {exc2}")
-                            new_id = upload_bytes(drive, parent, name, raw, mime, self.log)
-                            return {"id": new_id, "bytes": len(raw), "updated": True}
-                    return {"id": gid, "bytes": len(raw), "updated": changed, "skipped": not changed}
-                # Not found by id -> the agent DELETED it (or it predates id capture). Avoid a
-                # duplicate: reuse a correct same-name file in the target folder if one exists,
-                # else re-upload to restore it.
-                loc = by_loc.get((parent, name))
-                if loc:
-                    live_md5 = loc.get("md5") or ""
-                    if loc.get("size") == len(raw) and (live_md5 == want_md5 if live_md5 else True):
-                        return {"id": loc["id"], "bytes": len(raw), "skipped": True}
+                have = find_child_file(drive, parent, name, self.log)
+                if have and have[0] == len(raw):
+                    return {"id": have[1], "bytes": len(raw), "skipped": True}
+                if have and have[1]:
                     try:
-                        trash_file(drive, loc["id"], self.log)
+                        trash_file(drive, have[1], self.log)
                     except Exception as exc:
                         self.log(f"Could not replace Drive {name}: {exc}")
             file_id = upload_bytes(drive, parent, name, raw, mime, self.log)
@@ -245,15 +172,6 @@ class JobExecutor:
                 by_key, by_gab = index
                 match = match_seeded_event(job.payload.get("item") or {"event_id": job.payload.get("event_id")}, by_key, by_gab)
                 if match and match.get("id"):
-                    # The event still exists — but the agent may have changed its time/title/
-                    # description/location. Overwrite it back to the seeded body on drift.
-                    body = job.payload["body"]
-                    if event_needs_update(body, match):
-                        try:
-                            update_event(calendar, str(match["id"]), body, self.log)
-                            return {"id": str(match["id"]), "updated": True}
-                        except Exception as exc:
-                            self.log(f"Could not reset drifted event {match['id']}: {exc}")
                     return {"id": str(match["id"]), "skipped": True}
             event_id = insert_event(calendar, job.payload["body"], self.log)
             return {"id": event_id}
@@ -270,12 +188,7 @@ class JobExecutor:
                 self._label_cache[job.account_id] = label_id
             return {"id": label_id}
         if job.action == "insert_message":
-            with self._label_lock:
-                label_id = self._label_cache.get(job.account_id)
-            if not label_id:
-                label_id = self.store.google_id(job.account_id, "gmail", "gmail/label")
-            if not label_id:
-                label_id = ensure_label(gmail, self.log)
+            label_id = self._resolve_gmail_label_id(gmail, job.account_id)
             parent_id = str(job.payload.get("parent_id") or "")
             thread_id = None
             if parent_id:
@@ -285,8 +198,20 @@ class JobExecutor:
             if (job.extra or {}).get("mode") == DELTA and not job.extra.get("replace_attachments"):
                 already = self._mail_index.get(job.account_id)
                 if already is None:
-                    already = list_seeded_mail(gmail, label_id, self.log)
+                    account_id = job.account_id
+
+                    def _refresh_label() -> str:
+                        return self._resolve_gmail_label_id(gmail, account_id)
+
+                    already = list_seeded_mail(
+                        gmail,
+                        label_id,
+                        self.log,
+                        refresh_label=_refresh_label,
+                    )
                     self._mail_index[job.account_id] = already
+                    with self._label_lock:
+                        label_id = self._label_cache.get(job.account_id, label_id)
                 eid = str(item.get("email_id") or "")
                 hit = already.get(eid) or already.get(_normalize_msgid(eid))
                 if hit:
@@ -323,8 +248,6 @@ def checksum_of(job: Job, builder: EnvironmentBuilder) -> str | None:
             raw = Path(job.payload.get("abs") or job.source_path).read_bytes()
         else:
             raw = read_cached_bytes(job.environment_id, job.payload.get("rel") or job.source_path)
-        # md5, to MATCH Drive's md5Checksum — lets reconcile detect content drift by comparing
-        # the stored checksum to the live md5 with NO byte re-read (the bulk-diff fast path).
-        return hashlib.md5(raw).hexdigest()
+        return hashlib.sha256(raw).hexdigest()
     except Exception:
         return None
