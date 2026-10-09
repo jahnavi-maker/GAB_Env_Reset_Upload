@@ -144,10 +144,20 @@ class JobStore:
                 current = self._row(existing)
                 if current.status == SUCCESS:
                     return current
+                # Re-planning a non-success job: honor the planner's FRESH verdict rather
+                # than preserving the stored status. The planner re-emits every valid item
+                # as PENDING and only genuine data errors (malformed / missing fields /
+                # duplicates) as PERMANENT_FAILURE. So a job left PERMANENT_FAILURE by a
+                # since-fixed runtime bug (e.g. a bad API call) is re-planned as PENDING and
+                # gets another attempt on the next reset — instead of staying failed forever
+                # and needing a manual store wipe. A real data error is re-flagged
+                # PERMANENT_FAILURE and stays permanent. Retry bookkeeping is reset so the
+                # fresh attempt gets a full set of retries.
                 self._conn.execute(
                     """
                     UPDATE jobs SET payload=?, depends_on=?, extra=?, source_path=?,
-                    source_type=?, action=?, updated_at=?
+                    source_type=?, action=?, status=?, error=?, retry_count=0,
+                    claimed_at=NULL, updated_at=?
                     WHERE job_id=?
                     """,
                     (
@@ -157,6 +167,8 @@ class JobStore:
                         job.source_path,
                         job.source_type,
                         job.action,
+                        job.status,
+                        job.error,
                         now,
                         current.job_id,
                     ),
