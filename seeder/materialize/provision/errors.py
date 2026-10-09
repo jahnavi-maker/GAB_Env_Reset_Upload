@@ -45,6 +45,17 @@ def classify_error(exc: BaseException) -> str:
             return TRANSIENT
         if status == 403 and any(token in text for token in _TRANSIENT_REASONS):
             return TRANSIENT
+        # A stale/duplicate GAB-SEED label surfaces as 400 "invalid label" (the stored id
+        # is gone after a wipe) or 409 "label name exists / conflicts" (a concurrent
+        # create). These are recoverable by re-resolving the label, not permanent data
+        # errors, so retry the item instead of failing it permanently.
+        if status in (400, 409) and (
+            "invalid label" in text
+            or "label name exists" in text
+            or "label id" in text
+            or "conflicts" in text
+        ):
+            return TRANSIENT
         return PERMANENT
     name = type(exc).__name__.lower()
     message = str(exc).lower()
