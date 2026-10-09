@@ -311,6 +311,14 @@ class JobExecutor:
             index = dict(self.attachment_index(job.environment_id) or {})
             if wanted:
                 index.update(file_index_from_cache(job.environment_id, wanted))
+            def _refresh_seed_label() -> str:
+                # Stale label id (wiped account) -> re-resolve GAB-SEED and update the
+                # per-account cache so the next message uses the fresh id directly.
+                new_id = ensure_label(gmail, self.log)
+                with self._label_lock:
+                    self._label_cache[job.account_id] = new_id
+                return new_id
+
             result = insert_one_message(
                 gmail,
                 item,
@@ -318,6 +326,7 @@ class JobExecutor:
                 self.log,
                 label_id=label_id,
                 thread_id=thread_id,
+                refresh_label=_refresh_seed_label,
             )
             return {"id": result["id"], "threadId": result["threadId"]}
         raise RuntimeError(f"unknown gmail action {job.action}")

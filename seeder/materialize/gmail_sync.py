@@ -93,10 +93,15 @@ def ensure_label(gmail, log: Callable[[str], None]) -> str:
             return str(created["id"])
         except HttpError as exc:
             if _label_name_conflict(exc):
-                found = _find_label_id_by_name(gmail, log)
-                if found:
-                    log(f"{GAB_LABEL} label already exists (409); using existing id")
-                    return found
+                # The label exists (concurrent create / prior run) but a just-created
+                # label is not always immediately listable, so re-list a few times
+                # before giving up instead of failing the whole reset on a 409.
+                for attempt in range(4):
+                    found = _find_label_id_by_name(gmail, log)
+                    if found:
+                        log(f"{GAB_LABEL} label already exists (409); using existing id")
+                        return found
+                    time.sleep(0.5 * (attempt + 1))
             raise
 
 
@@ -388,8 +393,14 @@ def insert_one_message(
     *,
     label_id: str,
     thread_id: str | None = None,
+    refresh_label: Callable[[], str] | None = None,
 ) -> dict[str, str]:
-    """Insert one mailbox message. Returns {id, threadId}."""
+    """Insert one mailbox message. Returns {id, threadId}.
+
+    After a wipe the stored/cached GAB-SEED label id goes stale and the insert fails
+    with 400/404 "Invalid label". When ``refresh_label`` is given we re-resolve the
+    label once and retry, so one stale id doesn't fail every message for the account.
+    """
     raw, _internal_ms, omitted = _build_raw(item, file_index)
     eid = item.get("email_id") or ""
     if omitted:
@@ -398,23 +409,35 @@ def insert_one_message(
             + ", ".join(omitted)
         )
     folder = str(item.get("folder") or "INBOX").upper()
-    labels = [label_id]
-    if folder == "SENT":
-        labels.append("SENT")
-    else:
-        labels.append("INBOX")
-    if folder != "SENT" and not item.get("is_read", True):
-        labels.append("UNREAD")
-    body: dict[str, Any] = {"raw": raw, "labelIds": labels}
-    if thread_id:
-        body["threadId"] = thread_id
-    result = _retry(
-        lambda b=body: gmail.users()
-        .messages()
-        .insert(userId="me", body=b, internalDateSource="dateHeader")
-        .execute(),
-        log,
-    )
+
+    def _labels(seed_id: str) -> list[str]:
+        labels = [seed_id]
+        labels.append("SENT" if folder == "SENT" else "INBOX")
+        if folder != "SENT" and not item.get("is_read", True):
+            labels.append("UNREAD")
+        return labels
+
+    def _insert(seed_id: str):
+        body: dict[str, Any] = {"raw": raw, "labelIds": _labels(seed_id)}
+        if thread_id:
+            body["threadId"] = thread_id
+        return _retry(
+            lambda b=body: gmail.users()
+            .messages()
+            .insert(userId="me", body=b, internalDateSource="dateHeader")
+            .execute(),
+            log,
+        )
+
+    try:
+        result = _insert(label_id)
+    except HttpError as exc:
+        if refresh_label is not None and _invalid_label_error(exc):
+            status = getattr(exc.resp, "status", None)
+            log(f"Email {eid}: seed label stale ({status} Invalid label); refreshing and retrying")
+            result = _insert(refresh_label())
+        else:
+            raise
     return {
         "id": result["id"],
         "threadId": result.get("threadId") or result["id"],
