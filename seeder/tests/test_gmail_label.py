@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 from googleapiclient.errors import HttpError
 
 from materialize.gmail_sync import (
+    _find_label_id_by_name,
     ensure_label,
     insert_one_message,
     label_is_valid,
@@ -79,6 +80,19 @@ class GmailLabelResolveTests(unittest.TestCase):
                     gmail, {"email_id": "e1", "folder": "INBOX"}, {}, log,
                     label_id="Label_stale",
                 )
+
+    def test_find_label_absent_returns_none_without_list_next(self):
+        """gmail.users.labels.list is not paginated: the resource has no list_next, so
+        calling it raises AttributeError. Regression for the 'Resource has no attribute
+        list_next' crash that failed every wiped account (user441 fail=171)."""
+        gmail = MagicMock()
+        labels = gmail.users.return_value.labels.return_value
+        labels.list.return_value.execute.return_value = {
+            "labels": [{"name": "INBOX", "id": "i"}]  # GAB-SEED absent
+        }
+        log = MagicMock()
+        self.assertIsNone(_find_label_id_by_name(gmail, log))
+        labels.list_next.assert_not_called()
 
     def test_ensure_label_409_relists_and_finds_existing(self):
         """Create -> 409 'Label name exists' must re-list and use the existing id,

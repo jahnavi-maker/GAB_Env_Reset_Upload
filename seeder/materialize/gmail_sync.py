@@ -55,15 +55,16 @@ def _label_name_conflict(exc: HttpError) -> bool:
 
 
 def _find_label_id_by_name(gmail, log: Callable[[str], None]) -> str | None:
-    """Find GAB-SEED by name. Uses list_next — cached gmail.v1 discovery has no pageToken param."""
-    labels_api = gmail.users().labels()
-    req = labels_api.list(userId="me")
-    while req is not None:
-        resp = _retry(req.execute, log)
-        for lab in resp.get("labels") or []:
-            if lab.get("name") == GAB_LABEL and lab.get("id"):
-                return str(lab["id"])
-        req = labels_api.list_next(req, resp)
+    """Find GAB-SEED by name. gmail.users.labels.list is NOT paginated (it returns
+    every label in one response and has no pageToken), so there is no list_next on the
+    resource — calling it raises AttributeError. Read the single response directly."""
+    resp = _retry(
+        lambda: gmail.users().labels().list(userId="me").execute(),
+        log,
+    )
+    for lab in resp.get("labels") or []:
+        if lab.get("name") == GAB_LABEL and lab.get("id"):
+            return str(lab["id"])
     return None
 
 
