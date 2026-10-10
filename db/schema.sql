@@ -20,9 +20,16 @@ create table if not exists gab_accounts (
     last_reset_mode     text,          -- last op applied: upload | reconcile | reseed | delta
     last_reset_id       uuid,
     last_reset_at       timestamptz,
+    -- Server-side persona correction. When set, the reset uses THIS persona and ignores
+    -- the persona carried in Cosmo's signed link — so a mis-assigned account (Cosmo's
+    -- link still carries the wrong persona) can be corrected on our side without waiting
+    -- for the platform to update its allocation. NULL = behave normally (link wins).
+    persona_override    text,
     created_at          timestamptz not null default now(),
     updated_at          timestamptz not null default now()
 );
+-- Older DBs: add the override column if missing.
+alter table gab_accounts add column if not exists persona_override text;
 create index if not exists idx_gab_accounts_persona    on gab_accounts (persona);
 create index if not exists idx_gab_accounts_authorized on gab_accounts (authorized);
 

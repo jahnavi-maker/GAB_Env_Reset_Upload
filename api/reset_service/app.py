@@ -626,6 +626,19 @@ async def _launch_reset(
             status_code=404,
             detail="this Google account has not been uploaded yet — authorize it on /onboard first",
         )
+    # Server-side persona correction wins over everything, including the persona carried
+    # in Cosmo's signed link (passed in as `persona`). This lets us fix a mis-assigned
+    # account — whose link still mints the wrong persona — without a platform change, so a
+    # freelancer reset no longer reverts the account to the stale persona. NULL override =
+    # normal behaviour (link persona, then last_reset_persona, then the assigned target).
+    override = (account.get("persona_override") or "").strip()
+    if override:
+        if persona and persona != override:
+            log.info(
+                "persona_override active for %s: using %r instead of requested %r",
+                email, override, persona,
+            )
+        persona = override
     persona = persona or account.get("last_reset_persona") or account.get("persona")
     op_mode = await _decide_mode(store, email, persona, mode)
     pinned = str(reset_session_id) if reset_session_id else None
