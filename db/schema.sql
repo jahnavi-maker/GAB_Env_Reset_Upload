@@ -109,6 +109,30 @@ drop trigger if exists trg_freelancers_updated on freelancers;
 create trigger trg_freelancers_updated before update on freelancers
     for each row execute function set_updated_at();
 
+-- Normalize the email on EVERY write (trim surrounding whitespace/newlines + lowercase).
+-- The app's _norm_email already does this for API writes, but a CSV import or a direct
+-- insert bypasses the app — a stray trailing newline there ("user@x.org\n") makes the
+-- exact-match login gate fail with "account not allowed to sign in". This trigger closes
+-- that gap at the DB so it can't recur regardless of how a row is inserted.
+create or replace function normalize_freelancer_email() returns trigger as $$
+begin
+    new.email = lower(btrim(new.email, E' \t\n\r\f\v'));
+    return new;
+end;
+$$ language plpgsql;
+drop trigger if exists trg_freelancers_normalize_email on freelancers;
+create trigger trg_freelancers_normalize_email before insert or update on freelancers
+    for each row execute function normalize_freelancer_email();
+
+-- One-time cleanup of any pre-existing rows with stray whitespace (safe to re-run).
+-- Drops a dirty row only when a clean duplicate already exists, then trims the rest.
+delete from freelancers f
+    where f.email <> lower(btrim(f.email, E' \t\n\r\f\v'))
+      and exists (select 1 from freelancers g
+                  where g.email = lower(btrim(f.email, E' \t\n\r\f\v')));
+update freelancers set email = lower(btrim(email, E' \t\n\r\f\v'))
+    where email <> lower(btrim(email, E' \t\n\r\f\v'));
+
 -- ---------------------------------------------------------------------------
 -- gab_logins : REMOVED. The sign-in allow-list is the `freelancers` table above.
 -- The app reads/writes it via SUPABASE_LOGINS_TABLE (default "freelancers"), so
