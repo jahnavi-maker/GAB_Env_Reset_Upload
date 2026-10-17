@@ -130,6 +130,10 @@ async def lifespan(app: FastAPI):
     if not settings.api_key:
         log.warning("RESET_API_KEY not set -> API authentication is DISABLED (dev only)")
     retention_task = asyncio.create_task(_qc_retention_loop())
+    # Self-heal: re-drive any reseed/upload left queued/running by a crash/restart, so a
+    # batch continues on its own instead of needing a manual re-upload. Runs once, now —
+    # before the reaper's TTL would fail recent rows. Capped per-session to avoid loops.
+    resume_task = asyncio.create_task(_resume_inflight_sessions(store))
     # Reap sessions left non-terminal by a crash/restart/DB-blip so no account stays
     # blocked (runs immediately on startup, then on an interval).
     reaper_task = asyncio.create_task(_reaper_loop(store))
@@ -137,6 +141,7 @@ async def lifespan(app: FastAPI):
     summary_task = asyncio.create_task(_activity_summary_loop())
     yield
     retention_task.cancel()
+    resume_task.cancel()
     reaper_task.cancel()
     summary_task.cancel()
     store = getattr(app.state, "store", None)
@@ -477,6 +482,80 @@ async def _reap_stuck_sessions(store: Store) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("stuck-session reaper failed: %s", exc)
+
+
+# reset_sessions.mode (the row's recorded op) -> engine mode for a re-launch.
+_ROW_TO_ENGINE_MODE = {"upload": "seed", "reseed": "reseed", "reconcile": "reconcile", "delta": "delta"}
+
+try:
+    MAX_RESUME_ATTEMPTS = max(1, int(os.environ.get("MAX_RESUME_ATTEMPTS", "3")))
+except ValueError:
+    MAX_RESUME_ATTEMPTS = 3
+
+
+async def _resume_inflight_sessions(store: Store) -> None:
+    """Re-drive sessions left queued/running by a crash/restart, so a batch self-heals
+    instead of needing a manual re-upload.
+
+    FastAPI background tasks die with the process, so an OOM/restart leaves in-flight
+    reseed rows orphaned with nothing to continue them. This runs ONCE on startup, when
+    nothing is running in-process yet — so every queued/running row is, by definition,
+    orphaned and safe to re-launch. Reseeds are idempotent (wipe+seed), so re-running
+    converges to the same baseline. A per-session ``resume_count`` caps retries so a
+    persistent failure/OOM can't infinite-loop: after MAX_RESUME_ATTEMPTS the row is
+    marked failed for manual attention instead. Best-effort throughout — it must never
+    stop the app from starting. Each re-launch goes through the normal bounded pool
+    (_sem_for), so concurrency/rate limits and duplicate-prevention still apply.
+    """
+    if not settings.use_supabase:
+        return  # local dev store has no shared rows to resume
+    try:
+        rows = await store.query(
+            settings.supabase_table,
+            {"status": "in.(queued,running)", "select": "*", "order": "created_at.desc"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("auto-resume scan failed: %s", exc)
+        return
+    # One in-flight op per email — keep the newest, so we never launch two for one account.
+    seen: set[str] = set()
+    picked: list[dict[str, Any]] = []
+    for r in rows or []:
+        em = (r.get("email") or "").strip().lower()
+        if not em or em in seen:
+            continue
+        seen.add(em)
+        picked.append(r)
+    resumed = 0
+    for r in picked:
+        sid = r.get("reset_session_id")
+        email = (r.get("email") or "").strip().lower()
+        persona = (r.get("persona") or "").strip()
+        if not sid or not email or not persona:
+            continue
+        row_mode = (r.get("mode") or "reseed").lower()
+        engine_mode = _ROW_TO_ENGINE_MODE.get(row_mode, "reseed")
+        count = int(r.get("resume_count") or 0)
+        if count >= MAX_RESUME_ATTEMPTS:
+            await _safe_update(store, sid, {
+                "status": "failed", "completed_at": _now(),
+                "error": (f"auto-resume gave up after {count} attempts "
+                          "(persistent failure or OOM) — re-run this account manually"),
+            })
+            continue
+        # Re-arm the row (always), then bump the attempt counter (best-effort — the
+        # resume_count column may not exist on an un-migrated DB; resume still works).
+        await _safe_update(store, sid, {
+            "status": "queued", "started_at": None, "completed_at": None, "error": None,
+        })
+        await _safe_update(store, sid, {"resume_count": count + 1})
+        tid = r.get("task_allocation_id") or f"resume-{sid}"
+        asyncio.create_task(
+            _bounded_run(store, sid, tid, email, persona, engine_mode, None, row_mode, "resume")
+        )
+        resumed += 1
+    if resumed:
+        log.info("auto-resume: re-launched %d orphaned in-flight session(s) on startup", resumed)
 
 
 async def _reaper_loop(store: Store) -> None:
