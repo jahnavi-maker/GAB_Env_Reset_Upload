@@ -118,7 +118,7 @@
     "Educator_and_instructional_designer","Ghostwriter_and_nonfiction_author","Household_manager_and_parent",
     "Independent_consultant","Independent_financial_planner","Indie_game_designer","Legal_and_contracts_analyst",
     "Life_Sciences_Researcher","Luxury_travel_advisor","Residential_real_estate_agent","Solo_operator_and_owner",
-    "Startup_founder","Student","Travel_and_trip_planner"];
+    "Startup_founder","Student","Travel_and_trip_planner","Property_manager"];
   const norm = s => (s||"").toLowerCase().replace(/[^a-z0-9]+/g,"");
   const KEYMAP = Object.fromEntries(KNOWN.map(k => [norm(k), k]));
   const resolvePersona = raw => KEYMAP[norm(raw)] || null;
