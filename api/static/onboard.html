@@ -308,7 +308,7 @@
       // admin SA key is loaded — so gate on THIS row's `delegated`, not a global flag.
       if (!row.delegated){
         const authBtn=document.createElement("button"); authBtn.className="ghost mini";
-        authBtn.textContent = row.authorized ? "Re-authorize" : "Authorize";
+        authBtn.textContent = (row.authorized || row.tokenState==="expired") ? "Re-authorize" : "Authorize";
         authBtn.disabled = !clientReady || !row.valid;
         authBtn.onclick=()=>startAuthorize(i); box.appendChild(authBtn);
         if (row.authUrl && row.status==="authorizing"){ const a=document.createElement("a"); a.href=row.authUrl; a.target="_blank"; a.className="authlink"; a.textContent="open consent ↗"; box.appendChild(a); }
@@ -368,6 +368,8 @@
   }
   function statusLabel(row){
     if(!row.valid) return "unknown persona";
+    // A dead/revoked token before any operation starts -> needs re-auth (not "authorized ✓").
+    if(row.tokenState==="expired" && ["idle","authorized"].includes(row.status)) return "⚠️ expired — reauthorize";
     if(row.status==="idle") return row.authorized ? "authorized ✓" : "ready";
     if(row.status==="authorizing") return '<span class="spin"></span> awaiting consent';
     if(row.status==="authorized") return "authorized ✓";
@@ -389,8 +391,11 @@
       // Per-account delegation: Workspace accounts (delegated) hide the Authorize button;
       // consumer gmail.com accounts stay individually authorized even with an SA key loaded.
       if (row.delegated !== !!d.delegated){ row.delegated = !!d.delegated; renderRows(); }
+      // token_state: valid | expired | missing | unknown | delegated. Drives the expired
+      // badge + "Re-authorize" button so a dead token no longer shows "authorized ✓".
+      const prevTS = row.tokenState; row.tokenState = d.token_state || (d.authorized ? "valid" : "missing");
       if (d.authorized){
-        let changed=false;
+        let changed = (row.tokenState !== prevTS);
         if(!row.authorized){ row.authorized=true; changed=true; }
         // Reconcile a stale "awaiting consent" even when we already knew the account was
         // authorized (e.g. Re-authorize on an already-authorized account) so the row
@@ -402,6 +407,14 @@
         else if(row.status==="failed" && /re-authorize|expired|sign-in|invalid_grant/i.test(row.error||"")){
           row.status="authorized"; row.error=null; changed=true;
         }
+        if(changed) renderRows();
+      } else {
+        // Not usable on the server: an expired/revoked token or never authorized. The
+        // backend only reports !authorized when it is CERTAIN (a transient refresh error
+        // returns token_state "unknown" and still authorized=true), so it is safe to flip
+        // the row so Bulk upload skips it and the operator sees it needs re-auth.
+        let changed = (row.tokenState !== prevTS);
+        if(row.authorized){ row.authorized=false; changed=true; }
         if(changed) renderRows();
       } }
     catch(e){}
@@ -503,7 +516,24 @@
 
   $("authAll").addEventListener("click", authorizeAllSequential);
   $("authStop").addEventListener("click", ()=>{ authState.abort=true; setProg("Stopping…"); });
-  $("bulkUpload").addEventListener("click", ()=>{ rows.forEach((row,i)=>{ if(row.authorized&&["idle","authorized","failed","completed"].includes(row.status)) startSeed(i); }); });
+  // Bulk upload: start a seed for every account that is authorized AND not already done or
+  // in flight. Skipping "completed" stops re-seeding finished accounts on a repeat click
+  // (the churn that slowed real batches); skipping running/queued/authorizing avoids
+  // duplicate submissions; skipping unauthorized (incl. expired) keeps dead-token accounts
+  // out of the batch. Independent accounts still all start together. startSeed() flips each
+  // row to "running" synchronously, so a second click finds nothing left to start.
+  $("bulkUpload").addEventListener("click", ()=>{
+    let started=0, done=0, active=0, unauth=0;
+    rows.forEach((row,i)=>{
+      if(!row.valid) return;
+      if(!row.authorized){ unauth++; return; }
+      if(["running","queued","authorizing"].includes(row.status)){ active++; return; }
+      if(row.status==="completed"){ done++; return; }
+      startSeed(i); started++;
+    });
+    setProg(`Bulk upload: started ${started} · ${done} already done · ${active} in progress · ${unauth} need re-auth`);
+    setTimeout(()=>setProg(""), 6000);
+  });
   $("recoverAll").addEventListener("click", ()=>{ rows.forEach((row,i)=>{ if(row.valid&&["completed","failed"].includes(row.status)) startRecover(i); }); });
   $("refreshAll").addEventListener("click", ()=>{ rows.forEach((r,i)=>{ refreshAuth(i); if(r.uid) pollSeed(i); }); });
   $("hardReset").addEventListener("click", hardReset);
