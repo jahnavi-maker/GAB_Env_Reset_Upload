@@ -1769,6 +1769,53 @@ async def ui_upload_progress(upload_session_id: str, store: Store = Depends(get_
     }
 
 
+@app.get("/ui/row-status")
+async def ui_row_status(email: str, persona: str = "", store: Store = Depends(get_store)) -> dict:
+    """Server-truth status + live progress for ONE account, looked up by EMAIL — not by a
+    session id the browser is holding. The onboard page calls this on refresh to re-sync
+    each already-loaded row to the REAL current run, even after a crash/restart/auto-resume
+    gave the account a new session id (the browser's old id would otherwise show a stale
+    'failed'/frozen status). Read-only: it never loads, clears, or changes the persisted CSV
+    or the Hard-reset flow — it only reports the latest session + per-service progress.
+    """
+    email = (email or "").strip().lower()
+    latest = None
+    try:
+        rows = await store.query(
+            settings.supabase_table,
+            {"email": f"eq.{email}", "select": "*", "order": "created_at.desc", "limit": "50"},
+        )
+        cand = [r for r in (rows or []) if (r.get("email") or "").lower() == email]
+        cand.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+        latest = cand[0] if cand else None
+    except Exception:
+        latest = None
+    persona = persona or (latest or {}).get("persona") or ""
+    progress = None
+    if email and persona:
+        try:
+            progress = await asyncio.to_thread(engine.read_progress, email, persona)
+        except Exception:  # noqa: BLE001 - progress is best-effort; status still returns
+            progress = None
+    return {
+        "email": email,
+        "persona": persona,
+        "session": (
+            {
+                "reset_session_id": latest.get("reset_session_id"),
+                "status": latest.get("status"),
+                "error": latest.get("error"),
+                "mode": latest.get("mode"),
+            }
+            if latest
+            else None
+        ),
+        "services": (progress or {}).get("services") or {},
+        "github": (progress or {}).get("github"),
+        "verify": (progress or {}).get("verify"),
+    }
+
+
 @app.post("/ui/upload/{upload_session_id}/verify")
 async def ui_upload_verify(upload_session_id: str, store: Store = Depends(get_store)) -> dict:
     """Re-run verification for a finished upload and persist the refreshed counts."""

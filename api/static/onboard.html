@@ -168,9 +168,10 @@
       renderRows();
       rows.forEach((row,i)=> {
         refreshAuth(i);  // re-sync authorized state from the server
-        // Resume live seed polling after a reload so an in-flight upload keeps
-        // updating instead of freezing on "seeding…" until a manual Refresh.
-        if (row.uid && !["completed","failed"].includes(row.status)) pollSeed(i);
+        // Re-sync the REAL run status + progress from the server (by email) and resume live
+        // polling — so a refresh reflects the true current run even if it was re-created /
+        // auto-resumed with a new session id, instead of freezing on a stale status.
+        syncRow(i);
       });
       return true;
     } catch(e){ return false; }
@@ -419,6 +420,31 @@
       } }
     catch(e){}
   }
+  // Re-sync a row's REAL status + progress from the server BY EMAIL (not the browser's
+  // stored session id), so a refresh reflects the true current run even after a crash /
+  // restart / auto-resume reassigned the account a new session id — the old id would show a
+  // stale "failed"/frozen status. Status-only: it never loads, clears, or rewrites the
+  // persisted CSV rows, and the Hard-reset flow is untouched.
+  async function syncRow(i){
+    const row=rows[i]; if(!row || !row.email) return;
+    try {
+      const r=await fetch("/ui/row-status?email="+encodeURIComponent(row.email)+"&persona="+encodeURIComponent(row.persona||""));
+      if(!r.ok) return;
+      const d=await r.json(); const s=d.session; let changed=false;
+      if(s && s.reset_session_id){
+        if(row.uid!==s.reset_session_id){ row.uid=s.reset_session_id; row.sid=s.reset_session_id; changed=true; }
+        const map={completed:"completed", failed:"failed", running:"running", queued:"running"};
+        const ns=map[s.status];
+        if(ns && row.status!==ns){ row.status=ns; changed=true; }
+        if(s.status==="failed"){ if(row.error!==s.error){ row.error=s.error||row.error; changed=true; } }
+        else if(row.error){ row.error=null; changed=true; }   // an active/clean run -> drop a stale error
+      }
+      if(d.services && Object.keys(d.services).length){ row.progress=d.services; changed=true; }
+      if(d.verify){ row.verify=d.verify; changed=true; }
+      if(changed){ renderRows(); persistRows(); }
+      if(row.uid && s && ["running","queued"].includes(s.status)) pollSeed(i);  // resume live updates
+    } catch(e){}
+  }
   // Per-account authorize: open Google consent in a NEW tab, then poll until the server
   // reports the account authorized. The main tab keeps all its rows (localStorage).
   async function startAuthorize(i){
@@ -535,7 +561,7 @@
     setTimeout(()=>setProg(""), 6000);
   });
   $("recoverAll").addEventListener("click", ()=>{ rows.forEach((row,i)=>{ if(row.valid&&["completed","failed"].includes(row.status)) startRecover(i); }); });
-  $("refreshAll").addEventListener("click", ()=>{ rows.forEach((r,i)=>{ refreshAuth(i); if(r.uid) pollSeed(i); }); });
+  $("refreshAll").addEventListener("click", ()=>{ rows.forEach((r,i)=>{ refreshAuth(i); syncRow(i); }); });
   $("hardReset").addEventListener("click", hardReset);
 
   // ---- boot ----
