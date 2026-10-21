@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -129,6 +130,10 @@ async def lifespan(app: FastAPI):
     if not settings.api_key:
         log.warning("RESET_API_KEY not set -> API authentication is DISABLED (dev only)")
     retention_task = asyncio.create_task(_qc_retention_loop())
+    # Self-heal: re-drive any reseed/upload left queued/running by a crash/restart, so a
+    # batch continues on its own instead of needing a manual re-upload. Runs once, now —
+    # before the reaper's TTL would fail recent rows. Capped per-session to avoid loops.
+    resume_task = asyncio.create_task(_resume_inflight_sessions(store))
     # Reap sessions left non-terminal by a crash/restart/DB-blip so no account stays
     # blocked (runs immediately on startup, then on an interval).
     reaper_task = asyncio.create_task(_reaper_loop(store))
@@ -136,6 +141,7 @@ async def lifespan(app: FastAPI):
     summary_task = asyncio.create_task(_activity_summary_loop())
     yield
     retention_task.cancel()
+    resume_task.cancel()
     reaper_task.cancel()
     summary_task.cancel()
     store = getattr(app.state, "store", None)
@@ -276,6 +282,18 @@ class AlreadySeeded(Exception):
         super().__init__(email)
 
 
+class DuplicateActive(Exception):
+    """Raised when an upload/seed/reseed is requested for an account that already
+    has an in-flight session (queued/running/awaiting_auth). Lets the UI say "already
+    running" instead of silently enqueuing the same work again. The DB partial-unique
+    index uniq_active_reset_per_email (queued|running) remains the race-safe backstop."""
+
+    def __init__(self, email: str, status: str | None = None) -> None:
+        self.email = email
+        self.status = status
+        super().__init__(email)
+
+
 def _seeder_token_exists(email: str) -> bool:
     """True if the seeder already saved a Google refresh token for this email."""
     email = (email or "").strip().lower()
@@ -290,6 +308,60 @@ def _seeder_token_exists(email: str) -> bool:
         return token_path(email).exists()
     except Exception:
         return False
+
+
+# Token-validity ("authorized" readiness) for the operator UI. Cached briefly so a
+# page load of 100 rows does not re-attempt a refresh for every row on every poll.
+_TOKEN_STATE_TTL = 45.0  # seconds
+_token_state_cache: dict[str, tuple[float, str]] = {}
+
+
+def _invalidate_token_state(email: str) -> None:
+    """Drop the cached validity for an email (call after (re)authorize so the UI
+    reflects the new token immediately instead of a stale 'expired')."""
+    _token_state_cache.pop((email or "").strip().lower(), None)
+
+
+def _seeder_token_state(email: str) -> str:
+    """Validity of this account's saved Google token, for the operator UI.
+
+    Returns one of:
+      "valid"   - a usable credential (refreshed in place if the access token was stale)
+      "expired" - a token file exists but its refresh token is dead/revoked -> re-auth
+      "missing" - no token saved on this server
+      "unknown" - could not determine right now (e.g. a transient network error during
+                  refresh); callers MUST NOT treat this as expired.
+
+    Never returns or logs the token value itself. Only an actually-expired refresh
+    token (RefreshError) yields "expired"; a stale access token that still refreshes
+    stays "valid"; a network blip stays "unknown".
+    """
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        return "missing"
+    now = time.monotonic()
+    hit = _token_state_cache.get(email)
+    if hit and (now - hit[0]) < _TOKEN_STATE_TTL:
+        return hit[1]
+    try:
+        seeder = str(Path(settings.seeder_dir).expanduser().resolve())
+        if seeder not in sys.path:
+            sys.path.insert(0, seeder)
+        from materialize.auth import load_creds_result  # type: ignore
+
+        creds, err = load_creds_result(email)
+    except Exception:
+        return "unknown"  # transient — do not cache, do not call it expired
+    if creds is not None and err is None:
+        state = "valid"
+    elif err == "expired":
+        state = "expired"
+    elif err and str(err).startswith("unknown"):
+        return "unknown"  # transient refresh failure — don't cache or flip to expired
+    else:
+        state = "missing"  # (None, None) -> no token file on disk
+    _token_state_cache[email] = (now, state)
+    return state
 
 
 async def _persona_from_sessions(store: Store, email: str) -> str:
@@ -410,6 +482,80 @@ async def _reap_stuck_sessions(store: Store) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("stuck-session reaper failed: %s", exc)
+
+
+# reset_sessions.mode (the row's recorded op) -> engine mode for a re-launch.
+_ROW_TO_ENGINE_MODE = {"upload": "seed", "reseed": "reseed", "reconcile": "reconcile", "delta": "delta"}
+
+try:
+    MAX_RESUME_ATTEMPTS = max(1, int(os.environ.get("MAX_RESUME_ATTEMPTS", "3")))
+except ValueError:
+    MAX_RESUME_ATTEMPTS = 3
+
+
+async def _resume_inflight_sessions(store: Store) -> None:
+    """Re-drive sessions left queued/running by a crash/restart, so a batch self-heals
+    instead of needing a manual re-upload.
+
+    FastAPI background tasks die with the process, so an OOM/restart leaves in-flight
+    reseed rows orphaned with nothing to continue them. This runs ONCE on startup, when
+    nothing is running in-process yet — so every queued/running row is, by definition,
+    orphaned and safe to re-launch. Reseeds are idempotent (wipe+seed), so re-running
+    converges to the same baseline. A per-session ``resume_count`` caps retries so a
+    persistent failure/OOM can't infinite-loop: after MAX_RESUME_ATTEMPTS the row is
+    marked failed for manual attention instead. Best-effort throughout — it must never
+    stop the app from starting. Each re-launch goes through the normal bounded pool
+    (_sem_for), so concurrency/rate limits and duplicate-prevention still apply.
+    """
+    if not settings.use_supabase:
+        return  # local dev store has no shared rows to resume
+    try:
+        rows = await store.query(
+            settings.supabase_table,
+            {"status": "in.(queued,running)", "select": "*", "order": "created_at.desc"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("auto-resume scan failed: %s", exc)
+        return
+    # One in-flight op per email — keep the newest, so we never launch two for one account.
+    seen: set[str] = set()
+    picked: list[dict[str, Any]] = []
+    for r in rows or []:
+        em = (r.get("email") or "").strip().lower()
+        if not em or em in seen:
+            continue
+        seen.add(em)
+        picked.append(r)
+    resumed = 0
+    for r in picked:
+        sid = r.get("reset_session_id")
+        email = (r.get("email") or "").strip().lower()
+        persona = (r.get("persona") or "").strip()
+        if not sid or not email or not persona:
+            continue
+        row_mode = (r.get("mode") or "reseed").lower()
+        engine_mode = _ROW_TO_ENGINE_MODE.get(row_mode, "reseed")
+        count = int(r.get("resume_count") or 0)
+        if count >= MAX_RESUME_ATTEMPTS:
+            await _safe_update(store, sid, {
+                "status": "failed", "completed_at": _now(),
+                "error": (f"auto-resume gave up after {count} attempts "
+                          "(persistent failure or OOM) — re-run this account manually"),
+            })
+            continue
+        # Re-arm the row (always), then bump the attempt counter (best-effort — the
+        # resume_count column may not exist on an un-migrated DB; resume still works).
+        await _safe_update(store, sid, {
+            "status": "queued", "started_at": None, "completed_at": None, "error": None,
+        })
+        await _safe_update(store, sid, {"resume_count": count + 1})
+        tid = r.get("task_allocation_id") or f"resume-{sid}"
+        asyncio.create_task(
+            _bounded_run(store, sid, tid, email, persona, engine_mode, None, row_mode, "resume")
+        )
+        resumed += 1
+    if resumed:
+        log.info("auto-resume: re-launched %d orphaned in-flight session(s) on startup", resumed)
 
 
 async def _reaper_loop(store: Store) -> None:
@@ -1320,6 +1466,10 @@ async def _start_upload(
     last = await _last_reset_persona(store, email)
     if last:
         raise AlreadySeeded(email, last)
+    # Don't start a second upload for an account whose previous upload is still running.
+    existing = await _active_session_for(store, email)
+    if existing:
+        raise DuplicateActive(email, existing.get("status"))
     upload_session_id = str(uuid.uuid4())
     task_allocation_id = f"upload-{uuid.uuid4()}"  # placeholder; unused downstream
     await store.create({
@@ -1374,6 +1524,10 @@ async def create_upload(
                 "use POST /api/environment/reset"
             ),
         ) from exc
+    except DuplicateActive as exc:
+        raise HTTPException(
+            status_code=409, detail="an operation is already running for this account"
+        ) from exc
     except Exception as exc:
         log.exception("failed to start upload")
         raise HTTPException(status_code=502, detail="could not start the upload; please retry") from exc
@@ -1418,6 +1572,10 @@ async def oauth_callback(
     try:
         upload._db_hooks().on_authorize(email, persona, verified_email=ctx.get("verified_email"))
         activity_log.authorize(email, persona, status="completed")
+        # A fresh token just landed — drop any cached "expired"/"missing" validity so the
+        # operator UI flips to authorized ✓ on the next /ui/account poll instead of waiting
+        # out the TTL.
+        _invalidate_token_state(email)
     except Exception as exc:
         log.warning("on_authorize failed for %s", email, exc_info=True)
         activity_log.authorize(email, persona, status="failed", error=_clarify_error(str(exc)))
@@ -1558,6 +1716,10 @@ async def ui_upload(
                 "use POST /api/environment/reset"
             ),
         ) from exc
+    except DuplicateActive as exc:
+        raise HTTPException(
+            status_code=409, detail="an operation is already running for this account"
+        ) from exc
     except Exception as exc:
         log.exception("ui upload start failed")
         raise HTTPException(status_code=502, detail="could not start the upload; please retry") from exc
@@ -1607,6 +1769,53 @@ async def ui_upload_progress(upload_session_id: str, store: Store = Depends(get_
     }
 
 
+@app.get("/ui/row-status")
+async def ui_row_status(email: str, persona: str = "", store: Store = Depends(get_store)) -> dict:
+    """Server-truth status + live progress for ONE account, looked up by EMAIL — not by a
+    session id the browser is holding. The onboard page calls this on refresh to re-sync
+    each already-loaded row to the REAL current run, even after a crash/restart/auto-resume
+    gave the account a new session id (the browser's old id would otherwise show a stale
+    'failed'/frozen status). Read-only: it never loads, clears, or changes the persisted CSV
+    or the Hard-reset flow — it only reports the latest session + per-service progress.
+    """
+    email = (email or "").strip().lower()
+    latest = None
+    try:
+        rows = await store.query(
+            settings.supabase_table,
+            {"email": f"eq.{email}", "select": "*", "order": "created_at.desc", "limit": "50"},
+        )
+        cand = [r for r in (rows or []) if (r.get("email") or "").lower() == email]
+        cand.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+        latest = cand[0] if cand else None
+    except Exception:
+        latest = None
+    persona = persona or (latest or {}).get("persona") or ""
+    progress = None
+    if email and persona:
+        try:
+            progress = await asyncio.to_thread(engine.read_progress, email, persona)
+        except Exception:  # noqa: BLE001 - progress is best-effort; status still returns
+            progress = None
+    return {
+        "email": email,
+        "persona": persona,
+        "session": (
+            {
+                "reset_session_id": latest.get("reset_session_id"),
+                "status": latest.get("status"),
+                "error": latest.get("error"),
+                "mode": latest.get("mode"),
+            }
+            if latest
+            else None
+        ),
+        "services": (progress or {}).get("services") or {},
+        "github": (progress or {}).get("github"),
+        "verify": (progress or {}).get("verify"),
+    }
+
+
 @app.post("/ui/upload/{upload_session_id}/verify")
 async def ui_upload_verify(upload_session_id: str, store: Store = Depends(get_store)) -> dict:
     """Re-run verification for a finished upload and persist the refreshed counts."""
@@ -1625,6 +1834,46 @@ async def ui_upload_verify(upload_session_id: str, store: Store = Depends(get_st
             detail="nothing to verify yet — this account has not completed an upload",
         )
     return {"upload_session_id": upload_session_id, "verify": verify}
+
+
+async def _active_session_for(store: Store, email: str) -> dict[str, Any] | None:
+    """The in-flight reset/upload session for this email, if any.
+
+    In-flight = queued | running — exactly what the DB partial-unique index
+    uniq_active_reset_per_email covers, and what the stuck-session reaper eventually
+    clears. We deliberately do NOT count ``awaiting_auth``: a consent the operator
+    abandoned would otherwise block that account's uploads forever.
+
+    Used to refuse a duplicate submission (repeated Upload/Bulk clicks, UI re-renders,
+    retries, near-simultaneous requests) BEFORE it is enqueued, so the same work is not run
+    twice. This is a friendly pre-check; the race-safe backstop for a dead heat remains the
+    DB unique index. A store read failure returns None so a transient outage never blocks a
+    legitimate operation.
+    """
+    email = (email or "").strip().lower()
+    try:
+        rows = await store.query(
+            settings.supabase_table,
+            {
+                "select": "reset_session_id,status,created_at",
+                "email": f"eq.{email}",
+                "status": "in.(queued,running)",
+                "order": "created_at.desc",
+                "limit": "1",
+            },
+        )
+    except Exception:
+        return None
+    # Supabase applies the email/status filter server-side; the local JSON store ignores
+    # query filters, so re-check in Python to stay store-agnostic.
+    active = [
+        r
+        for r in (rows or [])
+        if (r.get("email") or "").lower() == email
+        and r.get("status") in ("queued", "running")
+    ]
+    active.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    return active[0] if active else None
 
 
 # CSV `mode` -> (engine_mode, reset_sessions.mode). The operator's explicit choice.
@@ -1655,6 +1904,13 @@ async def _seed_upload(
     Returns (id, task_id, op_mode).
     """
     email = email.lower()
+    # Refuse a duplicate before enqueuing: if this account already has an in-flight
+    # session, do not start the same work again (repeated clicks, Bulk upload re-runs,
+    # retries, concurrent requests). Independent accounts are unaffected — the scope is
+    # one email. The DB unique index is the race-safe backstop for a dead heat.
+    existing = await _active_session_for(store, email)
+    if existing:
+        raise DuplicateActive(email, existing.get("status"))
     if explicit_mode:
         engine_mode, row_mode = _EXPLICIT_MODE_MAP[explicit_mode]
     else:
@@ -1715,10 +1971,19 @@ async def ui_account(email: str, store: Store = Depends(get_store)) -> dict:
     # in shared Supabase and can be True from a *prior* server even when no token exists on
     # this box (tokens are per-server on disk and don't migrate) — trusting it made the UI
     # show "authorized ✓" for accounts a reset would fail on. So gate on the real token.
+    #
+    # Beyond mere presence, we now check the token's VALIDITY: a file whose refresh token
+    # is dead/revoked used to still show "authorized ✓", so Bulk upload enqueued work that
+    # then failed. token_state distinguishes valid / expired / missing. A transient refresh
+    # failure returns "unknown" and is treated as still-authorized (we never flip an account
+    # to "re-auth" on a network blip).
     has_token = _seeder_token_exists(email)
+    token_state = "delegated" if delegated else _seeder_token_state(email)
+    authorized = delegated or token_state in ("valid", "unknown")
     return {
         "email": email.lower(),
-        "authorized": has_token or delegated,
+        "authorized": authorized,
+        "token_state": token_state,  # valid | expired | missing | unknown | delegated
         "delegated": delegated,
         "has_token": has_token,
         "db_flag": bool(r.get("authorized")),  # surfaced for clarity; not used for the gate
@@ -1755,6 +2020,8 @@ async def ui_seed(
             raise HTTPException(status_code=400, detail="account not authorized yet")
     try:
         rsid, tid, op_mode = await _seed_upload(store, background, email, req.persona, req.services, req.mode)
+    except DuplicateActive as exc:
+        raise HTTPException(status_code=409, detail="an operation is already running for this account") from exc
     except Exception as exc:
         if "409" in str(exc) or "duplicate" in str(exc).lower() or "conflict" in str(exc).lower():
             raise HTTPException(status_code=409, detail="an operation is already running for this account") from exc

@@ -59,6 +59,10 @@ create table if not exists reset_sessions (
 );
 -- Older DBs: add the single-use column if missing.
 alter table reset_sessions add column if not exists consumed_at timestamptz;
+-- Auto-resume: how many times a crashed/restart-orphaned session has been re-launched on
+-- startup. Caps retries so a persistent failure/OOM can't infinite-loop (see
+-- _resume_inflight_sessions). Safe to run on an existing DB.
+alter table reset_sessions add column if not exists resume_count int not null default 0;
 create index if not exists idx_reset_sessions_email  on reset_sessions (email);
 create index if not exists idx_reset_sessions_task   on reset_sessions (task_allocation_id);
 create index if not exists idx_reset_sessions_status on reset_sessions (status);
