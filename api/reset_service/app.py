@@ -367,7 +367,13 @@ async def _decide_mode(store: Store, email: str, persona: str, explicit: str | N
       baseline reconcile, not a restore-only delta.
     - different/unknown persona -> ``reseed`` (wipe + seed the new persona).
     An explicit mode (e.g. Cosmo passing ``delta``) is always honored as-is.
+
+    A blank persona is the "universe is empty" case: there is nothing to seed, so the
+    account is WIPED to blank (``clean``). This wins over any requested mode, because a
+    seed/reseed on a personaless account can only fail.
     """
+    if explicit == "clean" or not (persona or "").strip():
+        return "clean"
     if explicit:
         return explicit
     if not settings.reset_auto_route:
@@ -931,7 +937,11 @@ async def ui_task_reset(
     email = email.lower()
 
     # Prefer the persona bound into the signed link; else resolve from gab_accounts.
-    persona = tok_persona
+    persona = (tok_persona or "").strip()
+    # Whether we POSITIVELY know this account's persona state. A blank persona only means
+    # "empty universe -> wipe to blank" when we actually confirmed the account has none;
+    # we must never wipe on an uncertain/failed lookup.
+    account_known = bool(persona)
     if not persona:
         try:
             rows = await store.query(
@@ -939,11 +949,17 @@ async def ui_task_reset(
                 {"select": "persona,last_reset_persona", "email": f"eq.{email}", "limit": "1"},
             )
             if rows:
-                persona = rows[0].get("last_reset_persona") or rows[0].get("persona")
+                account_known = True
+                persona = (rows[0].get("last_reset_persona") or rows[0].get("persona") or "").strip()
         except Exception as exc:
             log.warning("persona lookup failed for %s: %s", email, exc)
-    if not persona:
+            account_known = False
+    if not persona and not account_known:
+        # Persona genuinely unresolved (no token persona AND the account/lookup didn't
+        # resolve) -> do NOT wipe on uncertainty; keep the clear "not provisioned" error.
         raise HTTPException(status_code=400, detail="account not provisioned (no persona on file)")
+    # persona == "" with a KNOWN account == an empty-universe account -> _launch_reset
+    # routes it to a full wipe (clean); a persona present seeds/reconciles as usual.
     try:
         reset_session_id, op_mode = await _launch_reset(
             store, background, email, persona, task_allocation_id, None, None,
@@ -1633,6 +1649,8 @@ _EXPLICIT_MODE_MAP = {
     "reconcile": ("reconcile", "reconcile"),
     "reseed": ("reseed", "reseed"),
     "delta": ("delta", "delta"),
+    # Empty-universe accounts: wipe the account fully, seed nothing.
+    "clean": ("clean", "clean"),
 }
 
 
@@ -1657,6 +1675,9 @@ async def _seed_upload(
     email = email.lower()
     if explicit_mode:
         engine_mode, row_mode = _EXPLICIT_MODE_MAP[explicit_mode]
+    elif not (persona or "").strip():
+        # Empty-universe account (no persona on the sheet): the upload just empties it.
+        engine_mode, row_mode = "clean", "clean"
     else:
         last = await _last_reset_persona(store, email)
         if not last:
