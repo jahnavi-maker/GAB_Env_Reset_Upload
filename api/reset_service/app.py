@@ -368,11 +368,12 @@ async def _decide_mode(store: Store, email: str, persona: str, explicit: str | N
     - different/unknown persona -> ``reseed`` (wipe + seed the new persona).
     An explicit mode (e.g. Cosmo passing ``delta``) is always honored as-is.
 
-    A blank persona is the "universe is empty" case: there is nothing to seed, so the
-    account is WIPED to blank (``clean``). This wins over any requested mode, because a
-    seed/reseed on a personaless account can only fail.
+    An empty-universe persona (blank, or the platform's "no environment required" sentinel)
+    is the "universe is empty" case: there is nothing to seed, so the account is WIPED to
+    blank (``clean``). This wins over any requested mode, because a seed/reseed on a
+    personaless account can only fail.
     """
-    if explicit == "clean" or not (persona or "").strip():
+    if explicit == "clean" or engine.is_empty_universe_persona(persona):
         return "clean"
     if explicit:
         return explicit
@@ -1675,8 +1676,8 @@ async def _seed_upload(
     email = email.lower()
     if explicit_mode:
         engine_mode, row_mode = _EXPLICIT_MODE_MAP[explicit_mode]
-    elif not (persona or "").strip():
-        # Empty-universe account (no persona on the sheet): the upload just empties it.
+    elif engine.is_empty_universe_persona(persona):
+        # Empty-universe account (blank or "no environment required"): the upload just empties it.
         engine_mode, row_mode = "clean", "clean"
     else:
         last = await _last_reset_persona(store, email)

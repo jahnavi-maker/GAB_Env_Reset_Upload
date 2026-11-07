@@ -41,6 +41,27 @@ def _patch_backend():
     return patch("materialize.authbackend.backend_for", return_value=backend)
 
 
+class EmptyUniversePersonaTests(unittest.TestCase):
+    """The platform always sends a persona; these values mean 'no environment' -> clean."""
+
+    def test_blank_values_are_empty_universe(self):
+        for v in (None, "", "   ", "\t"):
+            self.assertTrue(engine.is_empty_universe_persona(v), repr(v))
+
+    def test_no_environment_sentinels_are_empty_universe(self):
+        for v in (
+            "No environment required for this task",
+            "no environment required for this task.",
+            "  No Environment Required For This Task.  ",
+            "NO ENVIRONMENT REQUIRED",
+        ):
+            self.assertTrue(engine.is_empty_universe_persona(v), repr(v))
+
+    def test_real_personas_are_not_empty_universe(self):
+        for v in ("Student", "Startup_founder", "Legal_and_contracts_analyst", "Luxury_travel_advisor"):
+            self.assertFalse(engine.is_empty_universe_persona(v), repr(v))
+
+
 class RunCleanTests(unittest.TestCase):
     """engine._run_clean: full wipe of all three surfaces, then verify the account is empty."""
 
@@ -127,6 +148,15 @@ class RunResetRoutingTests(unittest.TestCase):
         self.assertIs(out, sentinel)
         rc.assert_called_once()
 
+    def test_no_environment_sentinel_persona_routes_to_clean(self):
+        sentinel = engine.ResetResult(True, "emptied", "clean", returncode=0)
+        with patch.object(engine, "settings", _live_off()), \
+             patch.object(engine, "_run_clean", return_value=sentinel) as rc, \
+             patch.object(engine, "_match_persona", side_effect=AssertionError("must not normalize")):
+            out = engine.run_reset("free1@teamdeccan.us", "No environment required for this task", mode=None)
+        self.assertIs(out, sentinel)
+        rc.assert_called_once()
+
     def test_explicit_clean_mode_routes_even_with_persona(self):
         sentinel = engine.ResetResult(True, "emptied", "clean", returncode=0)
         with patch.object(engine, "settings", _live_off()), \
@@ -158,6 +188,12 @@ class AppRoutingTests(unittest.TestCase):
 
     def test_decide_mode_blank_beats_explicit(self):
         self.assertEqual(asyncio.run(self.app._decide_mode(None, "a@b.com", "  ", "reseed")), "clean")
+
+    def test_decide_mode_no_environment_sentinel(self):
+        self.assertEqual(
+            asyncio.run(self.app._decide_mode(None, "a@b.com", "No environment required for this task", None)),
+            "clean",
+        )
 
     def test_decide_mode_explicit_clean(self):
         self.assertEqual(asyncio.run(self.app._decide_mode(None, "a@b.com", "Student", "clean")), "clean")
