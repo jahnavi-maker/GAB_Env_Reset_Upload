@@ -693,6 +693,42 @@ def _baseline_ids(email: str, folder: str) -> dict[str, set]:
     return ids
 
 
+def _github_folder_ids(email: str, folder: str) -> set:
+    """Live ids of seeded folders inside a GitHub repo subtree (manifest ``synthetic_id``
+    starts with ``github/``).
+
+    This is the ONLY scope where the Drive orphan check spares an un-recorded file. A repo
+    can carry duplicate filenames whose ``synthetic_id`` collides, so a few repo FILES end
+    up with no job row of their own and would otherwise look like orphans. We spare anything
+    whose parent chain reaches a recorded GitHub folder — and nowhere else. Generated persona
+    files never collide (unique paths → unique synthetic_ids, every id recorded), so this
+    protection must NOT extend to persona folders; otherwise a file an agent drops into a
+    seeded folder (e.g. ``Ad Concepts/``) would be wrongly treated as legitimate and survive
+    the reconcile — the bug this scoping fixes."""
+    p = _acct_dir(email, folder) / "provision.sqlite"
+    if not p.exists():
+        return set()
+    import sqlite3
+
+    out: set = set()
+    try:
+        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        try:
+            rows = con.execute(
+                "SELECT google_object_id FROM jobs "
+                "WHERE service='drive' AND action='create_folder' AND status='SUCCESS' "
+                "AND google_object_id IS NOT NULL AND google_object_id NOT IN ('wiped','') "
+                "AND synthetic_id LIKE 'github/%'"
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return set()
+    for (gid,) in rows:
+        out.add(gid)
+    return out
+
+
 _BASELINE_ACTIONS = ("insert_message", "insert_event", "upload", "create_folder")
 
 
@@ -941,24 +977,36 @@ def _live_drive_ids(drive) -> set:
     return {fid for fid, _ in _owned_drive_files(drive)}
 
 
-def _drive_orphans(drive, baseline_ids: set) -> set:
-    """Owned Drive ids that are agent-created = not recorded in the manifest AND not a
-    descendant of any manifest-recorded folder.
+def _drive_orphans(drive, baseline_ids: set, github_folder_ids: set | None = None) -> set:
+    """Owned Drive ids that are agent-created = NOT recorded in the manifest, and not a
+    duplicate-name repo file living inside a seeded GitHub folder.
 
-    The manifest records ~all seeded files+folders (incl. the github repo folders, which
-    live OUTSIDE GAB_UltraEvals). A few big-repo files can miss their own id (duplicate
-    names → synthetic_id collisions), so we ALSO keep anything whose parent chain reaches
-    a recorded folder. That closes those gaps without the fragility of a single seed-root.
-    Never seeded (empty baseline) → everything owned is an orphan (→ full nuke + reseed)."""
+    Identity is the item's OWN id: ``baseline_ids`` already holds every seeded file+folder
+    whose id was recorded, which is every generated persona file and every github file that
+    didn't collide. The ONE gap is github repo files whose ``synthetic_id`` collided (so they
+    have no job row at all) — for those we additionally keep anything whose parent chain
+    reaches a recorded **github** folder (``github_folder_ids``).
+
+    We deliberately do NOT keep a file just because an ancestor is *any* seeded folder — that
+    older rule spared every agent file dropped into a seeded persona folder (e.g. a Gemini
+    image saved under ``Ad Concepts/``), so the reconcile left model-A content behind for the
+    next model to see. Scoping the keep to the github subtree removes those orphans while
+    still protecting real repo files. Never seeded (empty baseline) → everything owned is an
+    orphan (→ full nuke + reseed)."""
     files = _owned_drive_files(drive)
     if not baseline_ids:
         return {fid for fid, _ in files}
+    protected = github_folder_ids or set()
     parent = {fid: p for fid, p in files}
 
     def kept(fid: str) -> bool:
-        cur, seen = fid, set()
+        if fid in baseline_ids:  # this exact item was seeded (recorded in the manifest)
+            return True
+        if not protected:
+            return False
+        cur, seen = fid, set()  # or it is a dup-name repo file inside a seeded github folder
         while cur and cur not in seen:
-            if cur in baseline_ids:
+            if cur in protected:
                 return True
             seen.add(cur)
             cur = parent.get(cur)
@@ -999,7 +1047,7 @@ def reconcile_preview(email: str, persona: str) -> dict:
     # Drive: manifest ids + anything under a manifest-recorded folder (ancestry).
     drive = build_service("drive", "v3", creds)
     d_all = _live_drive_ids(drive)
-    d_orphans = _drive_orphans(drive, base["drive"])
+    d_orphans = _drive_orphans(drive, base["drive"], _github_folder_ids(email, folder))
     services["drive"] = {
         "baseline": len(d_all) - len(d_orphans),
         "live": len(d_all),
@@ -1150,10 +1198,11 @@ def _run_reconcile(
     else:
         # All three surfaces identify the baseline by MANIFEST google_object_id (exact, no label):
         # orphans = live items whose id isn't in the manifest (agent-added or stale re-seed dups).
-        # Drive additionally keeps anything under a manifest-recorded folder (github-repo ancestry).
+        # Drive additionally keeps dup-name repo files inside a seeded GITHUB folder only — NOT
+        # files under any seeded persona folder (so agent files in e.g. Ad Concepts/ are removed).
         g_orphans = _live_gmail_ids(gmail) - base["gmail"]
         c_orphans = _live_calendar_ids(cal) - base["calendar"]
-        d_orphans = _drive_orphans(drive, base["drive"])
+        d_orphans = _drive_orphans(drive, base["drive"], _github_folder_ids(email, folder))
     # Audit trail: record which agent-created items we are about to remove (capped sample),
     # so a reset leaves proof of exactly what was cleaned per account.
     for svc, ids in (("gmail", g_orphans), ("calendar", c_orphans), ("drive", d_orphans)):

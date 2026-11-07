@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
+import materialize.verify as verify_mod
 from materialize.verify import verify_seed
 
 
@@ -253,6 +255,34 @@ class VerifyCountingTests(unittest.TestCase):
         )
         self.assertEqual(result["modules"]["drive"]["ineligible"], 3)
         self.assertEqual(result["modules"]["drive"]["tone"], "ok")
+
+
+class VerifyParallelTests(unittest.TestCase):
+    """The three read-back counts now run concurrently (perf fix). These guard that
+    parallelizing preserves BOTH the counts and the failure behavior."""
+
+    def test_parallel_counts_are_correct(self):
+        # Calendar, Gmail and Drive counts are produced through the ThreadPoolExecutor and
+        # must still match their sources exactly.
+        result = _run(
+            _calendar(5),
+            _gmail(3),
+            _drive([_file("a.txt"), _file("b.txt")]),
+            expect_cal=5,
+            expect_mail=3,
+            expect_drive=2,
+        )
+        self.assertEqual(result["modules"]["calendar"]["got"], 5)
+        self.assertEqual(result["modules"]["gmail"]["got"], 3)
+        self.assertEqual(result["modules"]["drive"]["got"], 2)
+        self.assertEqual(result["overall"], "ok")
+
+    def test_exception_in_one_count_still_propagates(self):
+        # A read-back failure must NOT be silently swallowed by the executor — verify still
+        # raises, so a dirty/failed verify never passes as success.
+        with mock.patch.object(verify_mod, "_count_gmail", side_effect=RuntimeError("gmail boom")):
+            with self.assertRaises(RuntimeError):
+                _run(_calendar(1), _gmail(1), _drive([]), expect_cal=1, expect_mail=1, expect_drive=0)
 
 
 if __name__ == "__main__":
