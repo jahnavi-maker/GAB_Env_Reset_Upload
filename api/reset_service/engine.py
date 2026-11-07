@@ -1239,6 +1239,23 @@ def _run_reconcile(
     return ResetResult(restore.success, detail, "reconcile", returncode=restore.returncode, raw=raw)
 
 
+def is_empty_universe_persona(persona: str | None) -> bool:
+    """True when a task carries NO real environment, so the account must be WIPED
+    (``clean``) rather than seeded.
+
+    The platform cannot vary its call per account — it always sends whatever is in the
+    task's persona field. For empty-universe tasks that value is either blank or the
+    "no environment required for this task" sentinel (seen on the platform with different
+    casing and a trailing period). We match all of those here, case- and
+    punctuation-insensitively, and route them to clean. A real persona never contains the
+    phrase "no environment required", so there are no false positives.
+    """
+    p = (persona or "").strip().lower().rstrip(".").strip()
+    if not p:
+        return True
+    return "no environment required" in p
+
+
 def _run_clean(email: str, services: str | None, progress_id: str | None = None) -> ResetResult:
     """Empty an account completely — WIPE, no seed. The "universe is empty" case.
 
@@ -1342,11 +1359,12 @@ def run_reset(
         log.info("SIMULATE reset ok email=%s persona=%s mode=%s services=%s", email, persona, mode, svc or "all")
         return ResetResult(True, "simulated reset", mode, returncode=0)
 
-    # Empty / blank-persona account (the "universe is empty" case): there is no environment
-    # to build, so its only valid state is EMPTY. Both upload and reset wipe it fully
-    # (everything owned) and seed nothing. An explicit mode=="clean" forces it; a blank
-    # persona auto-routes here (it could never seed, and today fails with "unknown persona").
-    if mode == "clean" or not (persona or "").strip():
+    # Empty-universe task (the "universe is empty" case): there is no environment to build,
+    # so its only valid state is EMPTY. Both upload and reset wipe it fully (everything
+    # owned) and seed nothing. Triggered by an explicit mode=="clean", OR by the persona
+    # the platform sends for these tasks — blank, or the "no environment required" sentinel
+    # (see is_empty_universe_persona). A real persona never matches, so seeds are unaffected.
+    if mode == "clean" or is_empty_universe_persona(persona):
         log.info("reset -> clean (empty-universe) email=%s mode=%s persona=%r", email, mode, persona)
         return _run_clean(email, svc, progress_id)
 
