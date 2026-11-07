@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ResetRequest(BaseModel):
@@ -30,14 +30,17 @@ class ResetRequest(BaseModel):
 
 class UploadRequest(BaseModel):
     email: str = Field(..., description="Google account to seed (first upload).")
-    persona: str = Field(..., min_length=1, description="Benchmark persona to seed from the archive.")
+    # Blank ONLY for an empty-universe account (mode="clean"); required otherwise. The
+    # cross-field rule is enforced in _require_persona_unless_clean below.
+    persona: str = Field(default="", description="Benchmark persona to seed; blank only when mode=clean.")
     # Present only to satisfy the platform's request contract; never stored/used
     # for Google access (OAuth handles that).
     password: Optional[str] = Field(default=None, repr=False, exclude=True)
     services: Optional[list[str]] = Field(default=None, description="subset of drive,gmail,calendar")
-    # Explicit operation from the CSV `mode` column: upload|reconcile|reseed|delta. When set,
-    # the server honors it instead of auto-routing by last_reset_persona.
-    mode: Optional[str] = Field(default=None, description="upload|reconcile|reseed|delta")
+    # Explicit operation from the CSV `mode` column: upload|reconcile|reseed|delta|clean. When
+    # set, the server honors it instead of auto-routing by last_reset_persona. "clean" wipes
+    # an empty-universe account to blank and seeds nothing.
+    mode: Optional[str] = Field(default=None, description="upload|reconcile|reseed|delta|clean")
     # Local path to return the browser to after OAuth consent (operator UI only).
     return_to: Optional[str] = Field(default=None, description="e.g. /onboard/authorize")
 
@@ -49,8 +52,8 @@ class UploadRequest(BaseModel):
         v = v.strip().lower()
         if not v:
             return None
-        if v not in {"upload", "reconcile", "reseed", "delta"}:
-            raise ValueError("mode must be one of upload, reconcile, reseed, delta")
+        if v not in {"upload", "reconcile", "reseed", "delta", "clean"}:
+            raise ValueError("mode must be one of upload, reconcile, reseed, delta, clean")
         return v
 
     @field_validator("email")
@@ -60,6 +63,14 @@ class UploadRequest(BaseModel):
         if "@" not in v or "." not in v.split("@")[-1]:
             raise ValueError("email must be a valid address")
         return v
+
+    @model_validator(mode="after")
+    def _require_persona_unless_clean(self) -> "UploadRequest":
+        # A blank persona is allowed ONLY for a clean (empty-universe) upload, so a normal
+        # seed can never slip through personaless and silently wipe the account.
+        if not (self.persona or "").strip() and self.mode != "clean":
+            raise ValueError("persona is required unless mode is 'clean'")
+        return self
 
 
 class TaskLookupRequest(BaseModel):

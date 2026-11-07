@@ -1239,6 +1239,91 @@ def _run_reconcile(
     return ResetResult(restore.success, detail, "reconcile", returncode=restore.returncode, raw=raw)
 
 
+def _run_clean(email: str, services: str | None, progress_id: str | None = None) -> ResetResult:
+    """Empty an account completely — WIPE, no seed. The "universe is empty" case.
+
+    A blank-persona (empty-universe) account has no environment to build, so its only
+    valid state is EMPTY. Both the first upload and every reset for it run this path:
+    a FULL wipe of Gmail, Calendar and Drive (everything owned — not just seeded items,
+    so anything a model/annotator created is removed), then empty Drive Trash, then a
+    verify that the account is actually blank.
+
+    This reuses the provision pipeline's full-wipe helpers (the same ones a reseed runs
+    before seeding), which are battle-tested: Gmail hard-deletes (trash-fallback on a
+    gmail.modify-only scope), Calendar clears the primary calendar, Drive trashes every
+    owned file across a worker pool. Verification is the INVERSE of the seed verify:
+    success = nothing owned remains.
+    """
+    _ensure_seeder_path()
+    try:
+        from materialize.auth import build_service  # type: ignore
+        from materialize.authbackend import backend_for  # type: ignore
+        from materialize.calendar_sync import wipe_seeded_events  # type: ignore
+        from materialize.drive_sync import wipe_seed_folder  # type: ignore
+        from materialize.gmail_sync import wipe_seeded_mail  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return ResetResult(False, f"seeder pipeline unavailable: {exc}", "clean")
+
+    picked = {s.strip() for s in (services or ALL_SERVICES).split(",") if s.strip()}
+    try:
+        creds = backend_for(email).credentials_for(email)
+    except Exception as exc:  # noqa: BLE001
+        return ResetResult(False, f"no saved Google token for {email}: {exc}", "clean")
+
+    _wlog = lambda m: log.info("%s", m)  # noqa: E731
+    removed = {"gmail": 0, "calendar": 0, "drive": 0}
+    errors: list[str] = []
+
+    gmail = build_service("gmail", "v1", creds)
+    cal = build_service("calendar", "v3", creds)
+    drive = build_service("drive", "v3", creds)
+
+    log.info("clean start email=%s services=%s (wipe to blank, no seed)", email, ",".join(sorted(picked)))
+
+    if "gmail" in picked:
+        try:
+            removed["gmail"] = wipe_seeded_mail(gmail, _wlog)  # FULL mailbox wipe
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"gmail wipe: {type(exc).__name__}: {exc}")
+    if "calendar" in picked:
+        try:
+            removed["calendar"] = wipe_seeded_events(cal, _wlog)  # clears the primary calendar
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"calendar wipe: {type(exc).__name__}: {exc}")
+    if "drive" in picked:
+        try:
+            removed["drive"] = wipe_seed_folder(drive, "", _wlog, creds=creds, workers=10)  # trash ALL owned
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"drive wipe: {type(exc).__name__}: {exc}")
+        # Hard-delete: empty Drive Trash so the account is truly blank, not just trashed.
+        try:
+            drive.files().emptyTrash().execute()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("drive emptyTrash failed for %s: %s", email, exc)
+
+    # Verify EMPTY (the inverse of the seed verify): success = nothing owned remains.
+    remaining: dict | None = {"gmail": 0, "calendar": 0, "drive": 0}
+    try:
+        if "gmail" in picked:
+            remaining["gmail"] = len(_live_gmail_ids(gmail))
+        if "calendar" in picked:
+            remaining["calendar"] = len(_live_calendar_ids(cal))
+        if "drive" in picked:
+            remaining["drive"] = len(_live_drive_ids(drive))
+    except Exception as exc:  # noqa: BLE001 - read-back inconclusive: fall back to wipe status
+        log.warning("clean verify inconclusive for %s: %s", email, exc)
+        remaining = None
+
+    raw = {"mode": "clean", "clean_removed": removed, "clean_remaining": remaining}
+    if errors:
+        return ResetResult(False, "clean incomplete: " + "; ".join(errors), "clean", returncode=1, raw=raw)
+    if remaining is not None and any(remaining.get(s, 0) for s in picked):
+        left = ", ".join(f"{s}={remaining[s]}" for s in sorted(picked) if remaining.get(s))
+        return ResetResult(False, f"clean incomplete: items still present ({left})", "clean", returncode=1, raw=raw)
+    log.info("clean done email=%s removed=%s remaining=%s", email, removed, remaining)
+    return ResetResult(True, f"account emptied (clean); removed {removed}", "clean", returncode=0, raw=raw)
+
+
 def run_reset(
     email: str,
     persona: str,
@@ -1256,6 +1341,14 @@ def run_reset(
         time.sleep(1.0)
         log.info("SIMULATE reset ok email=%s persona=%s mode=%s services=%s", email, persona, mode, svc or "all")
         return ResetResult(True, "simulated reset", mode, returncode=0)
+
+    # Empty / blank-persona account (the "universe is empty" case): there is no environment
+    # to build, so its only valid state is EMPTY. Both upload and reset wipe it fully
+    # (everything owned) and seed nothing. An explicit mode=="clean" forces it; a blank
+    # persona auto-routes here (it could never seed, and today fails with "unknown persona").
+    if mode == "clean" or not (persona or "").strip():
+        log.info("reset -> clean (empty-universe) email=%s mode=%s persona=%r", email, mode, persona)
+        return _run_clean(email, svc, progress_id)
 
     # Accept loosely-typed persona names (spaces / casing / underscores) by mapping to
     # the exact archive folder BEFORE either engine runs — so "Startup Founder" seeds
