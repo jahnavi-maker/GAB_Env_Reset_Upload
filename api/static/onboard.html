@@ -103,6 +103,11 @@
       <span class="authprog" id="authProg" style="display:none"></span>
       <span class="counts" id="counts"></span>
     </div>
+    <div class="bar" style="margin-bottom:10px;gap:6px">
+      <input id="dxKey" placeholder="Explain any reset — paste a Reset ID or email" style="flex:1;min-width:260px;padding:6px 8px;border:1px solid #ccc;border-radius:4px">
+      <button class="ghost" id="dxBtn">Explain</button>
+    </div>
+    <div id="dxPanel" style="margin-bottom:10px"></div>
     <div style="overflow:auto">
     <table>
       <thead><tr><th>Account</th><th>Persona</th><th>Password</th><th>Actions</th><th>Status</th><th>Reset ID</th></tr></thead>
@@ -325,10 +330,15 @@
 
       if (["completed","failed"].includes(row.status)){ const rb=document.createElement("button"); rb.className="ghost mini"; rb.textContent="Retry skipped"; rb.title="Delta: re-push missing/failed items"; rb.onclick=()=>startRecover(i); box.appendChild(rb); }
       if (row.uid && row.status==="completed"){ const vb=document.createElement("button"); vb.className="ghost mini"; vb.textContent=row.verifying?"Verifying…":"Verify"; vb.disabled=!!row.verifying; vb.title="Re-count what actually landed per service"; vb.onclick=()=>verifyNow(i); box.appendChild(vb); }
+      // Explain: plain-English "what happened + what to do" for a failed (or partially-failed) row.
+      const partiallyFailed = row.progress && Object.values(row.progress).some(s=>s&&s.failed);
+      if (row.uid && (row.status==="failed" || (row.status==="completed" && partiallyFailed))){ const eb=document.createElement("button"); eb.className="ghost mini"; eb.textContent=row.diagLoading?"Explaining…":"Explain"; eb.disabled=!!row.diagLoading; eb.title="What happened + what to do (reads the EC2 logs for you)"; eb.onclick=()=>explain(i); box.appendChild(eb); }
 
       // Real per-service progress + verified counts (never estimated on the client).
       const detail = serviceBlock(row);
       if (detail) tr.querySelector(".stcell").appendChild(detail);
+      const dg = diagBlock(row);
+      if (dg) tr.querySelector(".stcell").appendChild(dg);
       tb.appendChild(tr);
     });
     updateCounts();
@@ -371,6 +381,45 @@
     } catch(e){ row.verifyErr=e.message; }
     finally { row.verifying=false; renderRows(); }  // always re-render with fresh counts/timestamp
   }
+  // Plain-English diagnosis panel (from /ui/.../diagnose). Works for a row OR the lookup box.
+  const SEV = {ok:{c:"#137333",i:"✅ "},info:{c:"#1a73e8",i:"ℹ️ "},warning:{c:"#b06000",i:"⚠️ "},error:{c:"#c5221f",i:"❌ "}};
+  function diagBlock(src){
+    const d = src && src.diag; if(!d) return null;
+    const sev = SEV[d.severity] || {c:"#444",i:""};
+    const wrap=document.createElement("div");
+    wrap.style.cssText="margin-top:8px;padding:8px 10px;border-left:3px solid "+sev.c+";background:#faf9f7;border-radius:4px;font-size:12px;line-height:1.5;max-width:520px";
+    const h=document.createElement("div"); h.style.cssText="font-weight:600;color:"+sev.c; h.textContent=sev.i+d.headline; wrap.appendChild(h);
+    if(d.detail){ const det=document.createElement("div"); det.style.cssText="color:#444;margin:3px 0"; det.textContent=d.detail; wrap.appendChild(det); }
+    if(d.action){ const act=document.createElement("div"); act.style.cssText="font-weight:600;color:#111"; act.textContent="→ "+d.action; wrap.appendChild(act); }
+    const adv=document.createElement("details"); adv.style.cssText="margin-top:5px";
+    const sum=document.createElement("summary"); sum.style.cssText="cursor:pointer;color:#777"; sum.textContent="raw error + EC2 log tail"; adv.appendChild(sum);
+    const pre=document.createElement("pre"); pre.style.cssText="white-space:pre-wrap;font-size:11px;color:#555;margin:4px 0 0;max-height:200px;overflow:auto";
+    pre.textContent=(d.raw?("ERROR: "+d.raw+"\n\n"):"")+(((src.diagLog)||[]).join("\n")||"(no log lines on disk)");
+    adv.appendChild(pre); wrap.appendChild(adv);
+    return wrap;
+  }
+  async function explain(i){
+    const row=rows[i]; if(!row.uid || row.diagLoading) return;
+    row.diagLoading=true; renderRows();
+    try{ const r=await fetch("/ui/upload/"+row.uid+"/diagnose"); const d=await r.json();
+      if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
+      row.diag=d.diagnosis; row.diagLog=d.log_tail||[];
+    }catch(e){ row.diag={severity:"error",headline:"Couldn't load diagnosis",detail:String(e.message||e),action:"Try Refresh, or use the lookup box with the Reset ID.",raw:""}; row.diagLog=[]; }
+    finally{ row.diagLoading=false; renderRows(); }
+  }
+  async function explainLookup(){
+    const key=$("dxKey").value.trim(); const panel=$("dxPanel"); if(!key){ panel.innerHTML=""; return; }
+    const q = key.includes("@") ? ("email="+encodeURIComponent(key)) : ("session="+encodeURIComponent(key));
+    panel.innerHTML='<div class="hint" style="padding:6px"><span class="spin"></span> reading the logs…</div>';
+    try{ const r=await fetch("/ui/diagnose?"+q); const d=await r.json();
+      if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
+      panel.innerHTML="";
+      const rec=d.record||{}; const head=document.createElement("div"); head.className="hint"; head.style.cssText="padding:4px 2px";
+      head.textContent=[rec.email,rec.persona,rec.mode,rec.status].filter(Boolean).join("  ·  ");
+      panel.appendChild(head);
+      const b=diagBlock({diag:d.diagnosis,diagLog:d.log_tail||[]}); if(b) panel.appendChild(b);
+    }catch(e){ panel.innerHTML='<div class="svc-row verify-err" style="padding:6px">'+String(e.message||e)+'</div>'; }
+  }
   function statusLabel(row){
     if(!row.valid) return "unknown persona";
     if(row.status==="idle") return row.authorized ? "authorized ✓" : "ready";
@@ -391,11 +440,11 @@
   async function refreshAuth(i){
     const row=rows[i]; if(!row.valid) return;
     try { const r=await fetch("/ui/account?email="+encodeURIComponent(row.email)); const d=await r.json();
+      let changed=false;
       // Per-account delegation: Workspace accounts (delegated) hide the Authorize button;
       // consumer gmail.com accounts stay individually authorized even with an SA key loaded.
-      if (row.delegated !== !!d.delegated){ row.delegated = !!d.delegated; renderRows(); }
+      if (row.delegated !== !!d.delegated){ row.delegated = !!d.delegated; changed=true; }
       if (d.authorized){
-        let changed=false;
         if(!row.authorized){ row.authorized=true; changed=true; }
         // Reconcile a stale "awaiting consent" even when we already knew the account was
         // authorized (e.g. Re-authorize on an already-authorized account) so the row
@@ -407,8 +456,22 @@
         else if(row.status==="failed" && /re-authorize|expired|sign-in|invalid_grant/i.test(row.error||"")){
           row.status="authorized"; row.error=null; changed=true;
         }
-        if(changed) renderRows();
-      } }
+      }
+      // Reconcile the REAL upload/reset status from the server — even when this browser
+      // never held the uid (upload run from another operator/browser, localStorage cleared,
+      // or the CSV reloaded). pollSeed only runs for rows this browser started, so without
+      // this a finished account sits on "ready"/"authorized" and a plain Refresh never
+      // corrects it. Never stomp a row that's seeding live here — pollSeed owns that.
+      const ls=d.last_session, liveHere=["running","queued","authorizing"].includes(row.status);
+      if(ls && ls.id && ["completed","failed"].includes(ls.status||"") && !liveHere){
+        if(row.status!==ls.status || row.uid!==ls.id){
+          row.status=ls.status; row.error=ls.error||null;
+          row.uid=ls.id; row.sid=ls.id; if(ls.mode) row.opMode=ls.mode;
+          row.diag=null; row.diagLog=null;  // stale explanation no longer applies
+          changed=true;
+        }
+      }
+      if(changed) renderRows(); }
     catch(e){}
   }
   // Per-account authorize: open Google consent in a NEW tab, then poll until the server
@@ -432,7 +495,7 @@
 
   async function startSeed(i){
     const row=rows[i]; if(!row.authorized||!row.valid) return;
-    row.status="running"; row.error=null; renderRows();
+    row.status="running"; row.error=null; row.diag=null; row.diagLog=null; renderRows();
     try {
       const body={email:row.email,persona:row.persona||"",return_to:"/authorized"};  // "" for an empty-universe (clean) row
       if(row.mode) body.mode=row.mode;   // explicit CSV mode -> server honors it (no auto-route)
@@ -455,7 +518,7 @@
   }
   async function startRecover(i){
     const row=rows[i]; if(!row.valid) return;
-    row.status="running"; row.error=null; renderRows();
+    row.status="running"; row.error=null; row.diag=null; row.diagLog=null; renderRows();
     try {
       const r=await fetch("/ui/recover",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:row.email,persona:row.persona,return_to:"/authorized"})});
       const d=await r.json(); if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
@@ -511,6 +574,8 @@
   $("bulkUpload").addEventListener("click", ()=>{ rows.forEach((row,i)=>{ if(row.authorized&&["idle","authorized","failed","completed"].includes(row.status)) startSeed(i); }); });
   $("recoverAll").addEventListener("click", ()=>{ rows.forEach((row,i)=>{ if(row.valid&&["completed","failed"].includes(row.status)) startRecover(i); }); });
   $("refreshAll").addEventListener("click", ()=>{ rows.forEach((r,i)=>{ refreshAuth(i); if(r.uid) pollSeed(i); }); });
+  $("dxBtn").addEventListener("click", explainLookup);
+  $("dxKey").addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); explainLookup(); } });
   $("hardReset").addEventListener("click", hardReset);
 
   // ---- boot ----

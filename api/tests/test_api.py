@@ -3,10 +3,12 @@
 No Google credentials and no Supabase project required. Run with:
     GAB_RESET_SIMULATE=1 python -m pytest -q     (or unittest, below)
 """
+import asyncio
 import os
 import tempfile
 import time
 import unittest
+import uuid
 
 # Configure BEFORE importing the app so settings pick these up.
 # Set Supabase vars to empty (not pop) so the .env auto-loader's setdefault
@@ -20,7 +22,7 @@ os.environ["LOCAL_STORE_PATH"] = os.path.join(tempfile.mkdtemp(), "sessions.json
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from reset_service.app import app  # noqa: E402
+from reset_service.app import app, _ensure_store  # noqa: E402
 from reset_service.config import settings  # noqa: E402
 
 # The store writes to settings.local_store_path (fixed at first import). Read that,
@@ -131,6 +133,67 @@ class UploadApiTest(unittest.TestCase):
     def test_upload_unknown_session_404(self) -> None:
         r = self.client.get("/api/environment/upload/nope", headers=AUTH)
         self.assertEqual(r.status_code, 404)
+
+
+class DiagnoseEndpointTest(unittest.TestCase):
+    """The diagnose endpoints are same-origin /ui/* (no API key, no IP gate). We seed a
+    record straight through the store so the test exercises only diagnosis — not the
+    IP-gated /api upload path — and so it's robust to cross-file import order."""
+
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+        self.store = _ensure_store(app)
+
+    def _seed(self, *, status="failed", error="", email="userX@deccanteam.us",
+              mode="reseed") -> str:
+        sid = "diag-" + uuid.uuid4().hex[:8]
+        asyncio.run(self.store.create({
+            "reset_session_id": sid, "email": email, "persona": "Student",
+            "mode": mode, "status": status, "error": error,
+        }))
+        return sid
+
+    def test_diagnose_by_session_auth_dwd(self) -> None:
+        sid = self._seed(error="RefreshError: unauthorized_client: Client is unauthorized ...",
+                         email="user141@deccanteam.us")
+        r = self.client.get(f"/ui/upload/{sid}/diagnose")
+        self.assertEqual(r.status_code, 200, r.text)
+        d = r.json()
+        self.assertEqual(d["diagnosis"]["category"], "auth_dwd_grant")
+        self.assertTrue(d["diagnosis"]["headline"])
+        self.assertIn("action", d["diagnosis"])
+        self.assertIn("log_tail", d)
+        self.assertIn("record", d)
+
+    def test_diagnose_lookup_by_session_drive404(self) -> None:
+        sid = self._seed(error=("reset incomplete (reseed): 25 baseline item(s) failed "
+                                "permanently; first error: HttpError 404 ... File not found: . "
+                                "'root' in parents"))
+        r = self.client.get(f"/ui/diagnose?session={sid}")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["diagnosis"]["category"], "transient_drive_404")
+
+    def test_diagnose_unknown_session_404(self) -> None:
+        r = self.client.get("/ui/upload/does-not-exist-xyz/diagnose")
+        self.assertEqual(r.status_code, 404)
+
+    def test_diagnose_requires_a_key(self) -> None:
+        r = self.client.get("/ui/diagnose")
+        self.assertEqual(r.status_code, 400)
+
+    def test_account_reports_last_session_for_refresh_reconcile(self) -> None:
+        # The onboard Refresh reconciles a row's status from /ui/account.last_session even
+        # when this browser never held the uid — so a completed upload stops showing as
+        # "ready/reset" after refresh. Seed a completed record, then read it back by email.
+        email = "user777@deccanteam.us"
+        sid = self._seed(status="completed", error=None, email=email, mode="upload")
+        r = self.client.get("/ui/account?email=" + email)
+        self.assertEqual(r.status_code, 200, r.text)
+        ls = r.json().get("last_session")
+        self.assertIsNotNone(ls, "last_session must be present so the UI can reconcile")
+        self.assertEqual(ls["id"], sid)
+        self.assertEqual(ls["status"], "completed")
+        self.assertEqual(ls["mode"], "upload")
 
 
 class FreelancerUiTest(unittest.TestCase):

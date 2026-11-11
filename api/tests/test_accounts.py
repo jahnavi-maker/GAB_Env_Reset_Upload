@@ -245,7 +245,9 @@ class UploadProgressTest(unittest.TestCase):
 
         sid = "44444444-4444-4444-4444-444444444444"
         email = "prog-counts@gmail.com"
-        self._make_session(sid, email)
+        # A still-RUNNING session: the endpoint must report the raw job-store counts as-is
+        # (reconcile only kicks in once the session is completed — asserted separately below).
+        self._make_session(sid, email, status="running")
         # The job store is persistent per account+persona, not per session id.
         base = engine._acct_dir(email, engine._persona_dir("Student"))
         base.mkdir(parents=True, exist_ok=True)
@@ -263,6 +265,16 @@ class UploadProgressTest(unittest.TestCase):
             self.assertEqual(d["services"]["drive"]["state"], "in_progress")
             self.assertEqual(d["services"]["gmail"]["done"], 200)
             self.assertEqual(d["services"]["gmail"]["state"], "completed")
+
+            # Display-consistency: once the SESSION is completed, a service still showing
+            # in_progress in the shared job store (a later run of the same account rebuilt
+            # it) is presented as done=total so the badge and counts agree.
+            sid2 = "44444444-4444-4444-4444-444444444445"
+            self._make_session(sid2, email, status="completed")
+            d2 = self.client.get(f"/ui/upload/{sid2}/progress").json()
+            self.assertEqual(d2["services"]["drive"]["state"], "completed")
+            self.assertEqual(d2["services"]["drive"]["done"], 200)
+            self.assertEqual(d2["services"]["drive"]["left"], 0)
         finally:
             import shutil
             shutil.rmtree(base, ignore_errors=True)

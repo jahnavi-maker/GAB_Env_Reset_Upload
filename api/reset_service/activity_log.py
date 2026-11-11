@@ -118,6 +118,21 @@ def _service_map(services: dict | None) -> dict:
     return {s: services.get(s, "—") for s in ("gmail", "calendar", "drive", "github")}
 
 
+def tail_email_log(email: str | None, limit: int = 40) -> list[str]:
+    """Last ``limit`` human-readable activity lines for one account (newest last).
+
+    Reads the on-disk ``by-email/<email>.log`` the activity logger already writes — a
+    readable per-account history (one line per upload/reset/authorize, with ``ERROR: …``
+    on failures). No journald/sudo needed, so the UI can show it to admins directly.
+    """
+    path = _ensure_dir() / "by-email" / f"{_safe_email(email)}.log"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    return [ln.rstrip() for ln in lines if ln.strip()][-max(1, limit):]
+
+
 def record(
     email: str | None,
     function: str,               # "upload" | "reset"
