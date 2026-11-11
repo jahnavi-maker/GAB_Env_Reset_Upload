@@ -30,7 +30,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPExcepti
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from . import __version__, access, activity_log, engine, google_login, upload
+from . import __version__, access, activity_log, diagnostics, engine, google_login, runlog, upload
 from .accounts import (
     CSV_FORMAT,
     LOGIN_CSV_FORMAT,
@@ -1614,11 +1614,31 @@ async def ui_upload_progress(upload_session_id: str, store: Store = Depends(get_
     progress = None
     if email and persona:
         progress = await asyncio.to_thread(engine.read_progress, email, persona)
+    status = record.get("status") or "unknown"
+    services = (progress or {}).get("services") or {}
+    # Display-consistency: once THIS upload session is "completed", it cannot still be
+    # uploading. Per-service counts come from the account's SHARED job store
+    # (RUNS/<acct>/provision.sqlite, keyed by email+persona, with no per-session column),
+    # which a LATER reseed of the same account wipes and rebuilds. So a finished row could
+    # otherwise freeze on a newer run's "Drive 136/9115 in progress" next to a green
+    # "uploaded" badge. When this session is completed, never report a service as
+    # in_progress/pending — present it as done so the status and the counts agree.
+    # (The per-run truth is the verify sidecar / the Verify button, which recounts live.)
+    if status == "completed" and services:
+        reconciled = {}
+        for name, svc in services.items():
+            svc = dict(svc)
+            if svc.get("state") in ("in_progress", "pending"):
+                svc["state"] = "completed"
+                svc["done"] = svc.get("total", svc.get("done", 0))
+                svc["left"] = 0
+            reconciled[name] = svc
+        services = reconciled
     return {
         "upload_session_id": upload_session_id,
-        "status": record.get("status") or "unknown",
+        "status": status,
         "error": record.get("error"),
-        "services": (progress or {}).get("services") or {},
+        "services": services,
         "github": (progress or {}).get("github"),
         "verify": (progress or {}).get("verify"),
     }
@@ -1642,6 +1662,96 @@ async def ui_upload_verify(upload_session_id: str, store: Store = Depends(get_st
             detail="nothing to verify yet — this account has not completed an upload",
         )
     return {"upload_session_id": upload_session_id, "verify": verify}
+
+
+async def _latest_record_for_email(store: Store, email: str) -> dict | None:
+    """Most recent reset_sessions record for an email (works on Supabase and local JSON)."""
+    want = (email or "").strip().lower()
+    if not want:
+        return None
+    try:
+        rows = await store.query(
+            settings.supabase_table,
+            {"email": f"eq.{want}", "order": "created_at.desc", "limit": "1"},
+        )
+    except Exception:  # noqa: BLE001
+        rows = []
+    rows = [r for r in (rows or []) if (r.get("email") or "").strip().lower() == want]
+    if not rows:
+        return None
+    rows.sort(key=lambda r: r.get("created_at") or r.get("started_at") or "", reverse=True)
+    return rows[0]
+
+
+async def _diagnose_record(record: dict) -> dict:
+    """Build the plain-English diagnosis + readable log tail for one record (no journald)."""
+    email = record.get("email") or ""
+    persona = record.get("persona") or record.get("last_reset_persona") or ""
+    progress = None
+    if email and persona:
+        progress = await asyncio.to_thread(engine.read_progress, email, persona)
+    services = (progress or {}).get("services") or {}
+    verify = (progress or {}).get("verify")
+    # Readable on-disk history the app can read WITHOUT journald/sudo.
+    log_tail = await asyncio.to_thread(activity_log.tail_email_log, email, 40)
+    run_progress = (
+        await asyncio.to_thread(runlog.read_account_progress, email) if email else None
+    )
+    diag = diagnostics.diagnose(
+        status=record.get("status"),
+        error=record.get("error"),
+        mode=record.get("mode"),
+        persona=persona,
+        email=email,
+        services=services,
+        verify=verify,
+        raw_logs="\n".join(log_tail),
+    )
+    return {
+        "diagnosis": diag,
+        "log_tail": log_tail,
+        "run_progress": run_progress,
+        "record": {
+            "reset_session_id": record.get("reset_session_id"),
+            "email": email,
+            "persona": persona,
+            "mode": record.get("mode"),
+            "status": record.get("status"),
+            "error": record.get("error"),
+            "task_allocation_id": record.get("task_allocation_id"),
+        },
+    }
+
+
+@app.get("/ui/upload/{upload_session_id}/diagnose")
+async def ui_upload_diagnose(upload_session_id: str, store: Store = Depends(get_store)) -> dict:
+    """Plain-English 'what happened + what to do' for a finished/failed upload or reset.
+
+    Admin self-service: reads the stored reset-session record + the account's on-disk
+    sidecars/log tail and runs the deterministic classifier — no journald, no SSH.
+    """
+    record = await store.get(upload_session_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="unknown upload_session_id")
+    return await _diagnose_record(record)
+
+
+@app.get("/ui/diagnose")
+async def ui_diagnose(
+    session: str | None = None,
+    email: str | None = None,
+    store: Store = Depends(get_store),
+) -> dict:
+    """Diagnose any reset by ``?session=<id>`` or ``?email=<addr>`` (latest run)."""
+    if session:
+        record = await store.get(session)
+    elif email:
+        record = await _latest_record_for_email(store, email)
+    else:
+        raise HTTPException(status_code=400, detail="pass ?session= or ?email=")
+    if not record:
+        raise HTTPException(status_code=404, detail="no reset found for that session/email")
+    return await _diagnose_record(record)
 
 
 # CSV `mode` -> (engine_mode, reset_sessions.mode). The operator's explicit choice.
@@ -1738,6 +1848,20 @@ async def ui_account(email: str, store: Store = Depends(get_store)) -> dict:
     # this box (tokens are per-server on disk and don't migrate) — trusting it made the UI
     # show "authorized ✓" for accounts a reset would fail on. So gate on the real token.
     has_token = _seeder_token_exists(email)
+    # Latest upload/reset session for this email, so the operator UI can reconcile a row's
+    # status on Refresh/reload even when THIS browser never held the uid (upload run from
+    # another operator/browser, localStorage cleared, or the CSV reloaded). Without this a
+    # finished account can sit on "ready"/"authorized" and a plain Refresh never corrects it.
+    latest = await _latest_record_for_email(store, email)
+    last_session = None
+    if latest:
+        last_session = {
+            "id": latest.get("reset_session_id"),
+            "status": latest.get("status"),
+            "mode": latest.get("mode"),
+            "error": latest.get("error"),
+            "persona": latest.get("persona") or latest.get("last_reset_persona"),
+        }
     return {
         "email": email.lower(),
         "authorized": has_token or delegated,
@@ -1746,6 +1870,7 @@ async def ui_account(email: str, store: Store = Depends(get_store)) -> dict:
         "db_flag": bool(r.get("authorized")),  # surfaced for clarity; not used for the gate
         "persona": r.get("persona"),
         "last_reset_persona": r.get("last_reset_persona"),
+        "last_session": last_session,
     }
 
 
