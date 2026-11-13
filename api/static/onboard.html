@@ -727,14 +727,20 @@
   // row to "running" synchronously, so a second click finds nothing left to start.
   $("bulkUpload").addEventListener("click", ()=>{
     let started=0, done=0, active=0, unauth=0;
+    let prior=0;
     rows.forEach((row,i)=>{
       if(!row.valid) return;
       if(!row.authorized){ unauth++; return; }
       if(["running","queued","authorizing"].includes(row.status)){ active++; return; }
-      if(row.status==="completed"){ done++; return; }
+      // Skip a "completed" from THIS session (don't re-churn what we just finished). A
+      // "completed" from a PRIOR run (loaded fresh here, e.g. a reseed batch) is NOT skipped
+      // — the operator loaded it to act on it now, so we re-run it. Additive: the original
+      // skip is preserved for this-session completions.
+      if(row.status==="completed" && !row.statusPrior){ done++; return; }
+      if(row.status==="completed" && row.statusPrior) prior++;
       startSeed(i); started++;
     });
-    setProg(`Bulk upload: started ${started} · ${done} already done · ${active} in progress · ${unauth} need re-auth`);
+    setProg(`Bulk upload: started ${started}${prior?` (incl. ${prior} from a previous run)`:""} · ${done} done this session · ${active} in progress · ${unauth} need re-auth`);
     setTimeout(()=>setProg(""), 6000);
   });
   $("recoverAll").addEventListener("click", ()=>{ rows.forEach((row,i)=>{ if(row.valid&&["completed","failed"].includes(row.status)) startRecover(i); }); });
