@@ -366,7 +366,10 @@
       else {
         const p = prog ? prog[key] : null;
         const v = ver ? ver[key] : null;
-        if (p){ text += p.done+"/"+p.total+" "+({pending:"pending",in_progress:"in progress",completed:"done",failed:"failed"}[p.state]||p.state); line.classList.add("svc-"+p.state); if(p.failed) text += " ("+p.failed+" failed)"; }
+        if (p){ text += p.done+"/"+p.total+" "+({pending:"pending",in_progress:"in progress",completed:"done",failed:"failed"}[p.state]||p.state); line.classList.add("svc-"+p.state); if(p.failed) text += " ("+p.failed+" failed)";
+          // While still working, show how many items remain (live count, not a prior run).
+          const left = (p.left!=null) ? p.left : ((p.total!=null && p.done!=null) ? (p.total-p.done) : null);
+          if (left!=null && left>0 && p.state!=="completed") text += " · "+left+" left"; }
         else if (!v){ text += "—"; line.classList.add("svc-na"); }
         if (v && v.expect!=null){ text += "  ·  verified "+ (v.got==null?"?":v.got) +"/"+v.expect; if(v.tone) line.classList.add("verify-"+v.tone); }
       }
@@ -561,7 +564,7 @@
 
   async function startSeed(i){
     const row=rows[i]; if(!row.authorized||!row.valid) return;
-    row.status="running"; row.error=null; row.diag=null; row.diagLog=null; row.statusPrior=false; row.statusAt=null; renderRows();
+    row.status="running"; row.error=null; row.diag=null; row.diagLog=null; row.statusPrior=false; row.statusAt=null; row.progress=null; row.verify=null; renderRows();
     try {
       const body={email:row.email,persona:row.persona||"",return_to:"/authorized"};  // "" for an empty-universe (clean) row
       if(row.mode) body.mode=row.mode;   // explicit CSV mode -> server honors it (no auto-route)
@@ -666,7 +669,7 @@
   }
   async function startRecover(i){
     const row=rows[i]; if(!row.valid) return;
-    row.status="running"; row.error=null; row.diag=null; row.diagLog=null; row.statusPrior=false; row.statusAt=null; renderRows();
+    row.status="running"; row.error=null; row.diag=null; row.diagLog=null; row.statusPrior=false; row.statusAt=null; row.progress=null; row.verify=null; renderRows();
     try {
       const r=await fetch("/ui/recover",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:row.email,persona:row.persona,return_to:"/authorized"})});
       const d=await r.json(); if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
