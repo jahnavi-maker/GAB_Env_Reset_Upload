@@ -724,6 +724,20 @@ async def ui_authorized_landing() -> HTMLResponse:
     return HTMLResponse((STATIC_DIR / "authorized.html").read_text(encoding="utf-8"))
 
 
+@app.get("/home", response_class=HTMLResponse)
+async def ui_public_home() -> HTMLResponse:
+    """Public landing page (not IP-gated) — used as the OAuth app's homepage URL for the
+    consent screen / Google verification."""
+    return HTMLResponse((STATIC_DIR / "home.html").read_text(encoding="utf-8"))
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def ui_privacy_policy() -> HTMLResponse:
+    """Public privacy policy (not IP-gated) — used as the OAuth app's privacy-policy URL for
+    the consent screen / Google verification; includes the Google API Limited Use disclosure."""
+    return HTMLResponse((STATIC_DIR / "privacy.html").read_text(encoding="utf-8"))
+
+
 @app.get("/reset/status/{reset_session_id}", response_class=HTMLResponse)
 async def ui_reset_status_page(reset_session_id: str) -> HTMLResponse:
     """Browser-facing status page: reads the id from the path and polls the JSON
