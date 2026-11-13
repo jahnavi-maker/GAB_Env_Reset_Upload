@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from materialize.auth import build_service
@@ -145,14 +146,31 @@ def verify_seed(
     if not folder_id:
         folder_id = find_seed_folder(drive, persona, log)
 
-    got_cal = _count_calendar(calendar, log) if expect_calendar is not None else None
-    # Gmail: count by manifest ids when available (label-independent), else by GAB-SEED label.
-    got_mail = _count_gmail(gmail, log, gmail_baseline) if expect_gmail is not None else None
-    # Drive: generated files materialize in My Drive ROOT (no GAB_UltraEvals wrapper), so the
-    # verified count MUST walk from root (skipping the Github folder + zip), never a stale/empty
-    # seed-folder id. Counting inside the old wrapper returned 0 for a fully-intact Drive and
-    # made a good reconcile look "empty". expect (generated uploads) matches a root walk.
-    got_drive = _count_drive(drive, "root", log) if expect_drive is not None else None
+    # The three read-backs hit independent Google services (Calendar/Gmail/Drive), each on its
+    # own service object (never shared across threads), with its own rate limiter and its own
+    # _retry wrapper. Run them CONCURRENTLY instead of one-after-another: the API calls, the
+    # counts, and the per-service rate profile are identical — only the per-account wall-clock
+    # tail (previously calendar + gmail + drive in series) shrinks. Exceptions re-raise on
+    # .result(), so verify's failure behavior is unchanged.
+    def _cal():
+        return _count_calendar(calendar, log) if expect_calendar is not None else None
+
+    def _mail():
+        # Gmail: count by manifest ids when available (label-independent), else by GAB-SEED label.
+        return _count_gmail(gmail, log, gmail_baseline) if expect_gmail is not None else None
+
+    def _drv():
+        # Drive: generated files materialize in My Drive ROOT (no GAB_UltraEvals wrapper), so the
+        # verified count MUST walk from root (skipping the Github folder + zip), never a stale/empty
+        # seed-folder id. Counting inside the old wrapper returned 0 for a fully-intact Drive and
+        # made a good reconcile look "empty". expect (generated uploads) matches a root walk.
+        return _count_drive(drive, "root", log) if expect_drive is not None else None
+
+    with ThreadPoolExecutor(max_workers=3) as _ex:
+        f_cal, f_mail, f_drv = _ex.submit(_cal), _ex.submit(_mail), _ex.submit(_drv)
+        got_cal = f_cal.result()
+        got_mail = f_mail.result()
+        got_drive = f_drv.result()
 
     def tone(got: int | None, expect: int | None) -> str:
         if got is None or expect is None:
