@@ -747,7 +747,11 @@
     setTimeout(()=>setProg(""), 6000);
   });
   $("recoverAll").addEventListener("click", ()=>{ rows.forEach((row,i)=>{ if(row.valid&&["completed","failed"].includes(row.status)) startRecover(i); }); });
-  $("refreshAll").addEventListener("click", ()=>{ rows.forEach((r,i)=>{ refreshAuth(i); syncRow(i); }); });
+  // Refresh: stagger the per-account auth check and pull run status via ONE batched poll
+  // (batchSyncAll -> /ui/batch-status), NOT a per-row /ui/row-status storm, which stalls
+  // under load (that endpoint blocks while an account is actively seeding) and froze Refresh
+  // so live progress never showed. Mirrors the reload path. (syncRow kept for single-row use.)
+  $("refreshAll").addEventListener("click", ()=>{ rows.forEach((row,i)=> setTimeout(()=>refreshAuth(i), i*150)); batchSyncAll(); });
   $("dxBtn").addEventListener("click", explainLookup);
   $("dxKey").addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); explainLookup(); } });
   $("hardReset").addEventListener("click", hardReset);
