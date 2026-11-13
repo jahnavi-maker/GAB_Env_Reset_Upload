@@ -181,12 +181,17 @@
     } catch(e){ return false; }
   }
   // The ONLY wipe: an explicit operator action. A normal refresh must never do this.
-  function hardReset(){
-    if (!confirm("Clear the loaded accounts, passwords and CSV from this browser? This does not touch any seeded accounts on the server.")) return;
+  // Wipes the CSV + accounts (localStorage) AND this session's uploaded client.json on the
+  // server, so the page goes fully blank — ready for the next client.json + CSV.
+  async function hardReset(){
+    if (!confirm("Clear the loaded accounts, passwords, CSV and the uploaded client.json for this page? This does not touch any seeded accounts on the server.")) return;
     try { localStorage.removeItem(ONB_KEY); localStorage.removeItem(CSV_KEY); } catch(e){}
     rows.length = 0;
     if ($("csv")) $("csv").value = "";
     $("tableCard").style.display = "none";
+    try { await fetch("/ui/client", { method:"DELETE" }); } catch(e){}
+    clientReady = false; delegation = false;
+    await checkClient();   // reflect the wiped client in Step 2
     renderRows();
   }
 
@@ -208,7 +213,8 @@
       if (d && d.delegation) { clientReady = true; delegation = true;
         $("clientName").innerHTML = "🔑 Domain delegation active ✓ <b>"+(d.domain||"any Workspace domain")+"</b> — Workspace accounts authorize automatically; gmail.com accounts still authorize individually."; }
       else if (d && d.present) { clientReady = true; delegation = false;
-        $("clientName").textContent = "OAuth web client configured ✓ (upload to replace)"; }
+        const loc = d.project_id ? (" — <b>locked to "+d.project_id+"</b> (client …"+(d.client_id||"")+")") : "";
+        $("clientName").innerHTML = "🔒 This page is authorizing with your client.json ✓"+loc+" · upload another to replace, or Hard reset to clear."; }
       else { clientReady = false; delegation = false; $("clientName").textContent = "No client configured — drop client.json or the admin service-account key."; }
     } catch(e){ clientReady=false; $("clientName").textContent="No client configured — drop client.json or the admin service-account key."; }
     renderRows();
@@ -229,7 +235,8 @@
         // re-check auth for loaded rows so they flip to authorized ✓ without a click
         rows.forEach((row,i)=> refreshAuth(i));
       } else if (missing.length) { delegation=false; $("clientNote").className="note warn"; $("clientNote").textContent="Saved. Also register these redirect URIs in Google: "+missing.join(", "); }
-      else { delegation=false; $("clientNote").className="note ok"; $("clientNote").textContent="Web client saved ✓"; }
+      else { delegation=false; $("clientNote").className="note ok"; $("clientNote").textContent="Web client saved ✓ — this page is now locked to "+(d.project_id||"your project")+". You can authorize all your accounts with it."; }
+      await checkClient();   // refresh the "locked to <project>" line
       renderRows();
     } catch(err){ clientReady=false; $("clientNote").className="note err"; $("clientNote").textContent="Rejected: "+err.message; }
   }

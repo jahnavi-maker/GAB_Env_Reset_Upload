@@ -26,7 +26,7 @@ from typing import Any
 
 from pathlib import Path
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
@@ -1549,27 +1549,63 @@ async def ui_authorize_workspace() -> RedirectResponse:
     return RedirectResponse(url="/onboard", status_code=307)
 
 
+_ONBOARD_SID_COOKIE = "gab_onboard_sid"
+
+
+def _onboard_sid(request: Request, response: Response) -> str:
+    """Return (minting + setting if absent) this browser's onboard session id. It scopes
+    the uploaded web client so several operators share one /onboard URL yet each authorizes
+    through their OWN client.json. The cookie persists across reloads; the Hard-reset button
+    wipes the session client, and a normal refresh keeps it."""
+    import secrets as _secrets
+
+    sid = request.cookies.get(_ONBOARD_SID_COOKIE) or ""
+    valid = bool(sid) and len(sid) <= 64 and all(c.isalnum() or c in "-_" for c in sid)
+    if not valid:
+        raw = _secrets.token_urlsafe(18)
+        sid = "".join(c for c in raw if c.isalnum() or c in "-_")[:64]
+        response.set_cookie(
+            _ONBOARD_SID_COOKIE, sid,
+            max_age=60 * 60 * 24 * 30, httponly=True, samesite="lax",
+            secure=settings.public_base_url.startswith("https"), path="/",
+        )
+    return sid
+
+
 @app.post("/ui/client")
-async def ui_client(file: UploadFile = File(...)) -> dict:
+async def ui_client(request: Request, response: Response, file: UploadFile = File(...)) -> dict:
     """Operator drops the OAuth artifact. Auto-detected:
 
     - an admin **service-account key** -> Workspace domain-wide delegation: every domain
       account is authorized automatically (no per-account OAuth). Drop the key + the CSV
-      of domain accounts and just Upload.
-    - a consumer OAuth **web client** -> the per-account authorize flow (gmail.com).
+      of domain accounts and just Upload. (Delegation is global — no per-session client.)
+    - a consumer OAuth **web client** -> the per-account authorize flow (gmail.com). Stored
+      PER browser session, so concurrent operators don't overwrite each other's client.
     """
+    sid = _onboard_sid(request, response)
     raw = await file.read()
     try:
-        status_info = upload.save_client(raw)
+        status_info = upload.save_client(raw, session_id=sid)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, **(status_info or {})}
 
 
 @app.get("/ui/client")
-async def ui_client_status() -> dict:
-    """Whether an OAuth client is already configured (lets the UI skip re-upload)."""
-    return upload.client_status()
+async def ui_client_status(request: Request, response: Response) -> dict:
+    """Which OAuth client THIS session is locked to (lets the UI skip re-upload and show the
+    project the page is bound to). Delegation is reported globally."""
+    sid = _onboard_sid(request, response)
+    return upload.client_status(session_id=sid)
+
+
+@app.delete("/ui/client")
+async def ui_client_clear(request: Request, response: Response) -> dict:
+    """Hard-reset: wipe THIS session's uploaded web client. Leaves the global client and the
+    delegation key untouched, and never affects other operators' sessions."""
+    sid = _onboard_sid(request, response)
+    wiped = upload.discard_client(sid)
+    return {"ok": True, "wiped": bool(wiped)}
 
 
 @app.post("/ui/upload")
@@ -1835,12 +1871,18 @@ async def _seed_upload(
 
 
 @app.post("/ui/authorize")
-async def ui_authorize(req: UploadRequest, store: Store = Depends(get_store)) -> dict:
+async def ui_authorize(req: UploadRequest, request: Request, response: Response,
+                       store: Store = Depends(get_store)) -> dict:
     """Operator step 2: authorize ONE account (consent only). On success the
-    callback writes gab_accounts. No seeding here — that's the Bulk upload step."""
+    callback writes gab_accounts. No seeding here — that's the Bulk upload step.
+
+    Uses this browser session's uploaded web client, so concurrent operators each authorize
+    through their own client.json."""
+    sid = _onboard_sid(request, response)
     try:
         auth_url = upload.build_auth_url(
-            req.email.lower(), req.persona, kind="authorize", return_to=req.return_to
+            req.email.lower(), req.persona, kind="authorize", return_to=req.return_to,
+            session_id=sid,
         )
     except Exception as exc:
         log.exception("ui authorize init failed")

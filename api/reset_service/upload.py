@@ -73,13 +73,39 @@ def save_web_client(raw: bytes) -> dict[str, Any]:
     return ConsumerOAuthBackend().save_web_client(raw)
 
 
-def save_client(raw: bytes) -> dict[str, Any]:
+def _save_session_web_client(raw: bytes, session_id: str) -> dict[str, Any]:
+    """Validate a web client.json and store it for ONE browser session (not the global
+    credentials.json). Lets several operators each lock their own client on the same page."""
+    from materialize import auth  # type: ignore
+    import json as _json
+
+    try:
+        data = _json.loads(raw.decode("utf-8-sig"))
+    except Exception as exc:  # noqa: BLE001
+        raise UploadError(f"That file is not JSON: {exc}") from exc
+    if not isinstance(data, dict) or "web" not in data:
+        if isinstance(data, dict) and "installed" in data:
+            raise UploadError(
+                "That file is a Desktop OAuth client. In Google Cloud Console create an "
+                "OAuth client of type Web application and upload that JSON."
+            )
+        raise UploadError('JSON must contain a top-level "web" object (Google Web OAuth client).')
+    data = auth.ensure_local_redirects(data)
+    auth.save_session_client(session_id, data)
+    return auth.credentials_status(auth.session_client_path(session_id))
+
+
+def save_client(raw: bytes, session_id: str | None = None) -> dict[str, Any]:
     """Save the dropped OAuth artifact, auto-detecting which kind it is:
 
     - a Google **service-account key** (admin key) -> switch to domain-wide DELEGATION:
       every account in the Workspace domain is authorized automatically, no per-account
       OAuth. (``save_service_account_key`` also flips the auth mode + resets the backend.)
-    - a consumer OAuth **web client** -> the per-account authorize flow.
+      Delegation has no consent screen or client, so it's always global (``session_id`` is
+      ignored for it).
+    - a consumer OAuth **web client** -> the per-account authorize flow. With ``session_id``
+      it is stored PER SESSION (this browser only), so concurrent operators don't clobber
+      each other's client; without one it writes the shared global credentials.json.
     """
     import json as _json
 
@@ -94,12 +120,23 @@ def save_client(raw: bytes) -> dict[str, Any]:
         info = save_service_account_key(raw)  # saves key, sets delegation mode, resets backend
         return {"kind": "service_account", "delegation": True,
                 "domain": workspace_domain(), **(info or {})}
+    if session_id:
+        info = _save_session_web_client(raw, session_id)
+        return {"kind": "web", "delegation": False, "session": True, **(info or {})}
     info = save_web_client(raw)
     # Explicitly pin consumer mode so dropping a web client switches BACK from a prior
     # delegation setup (the SA key file/env would otherwise keep delegation sticky).
     os.environ["ENV_LOADER_AUTH_BACKEND"] = "consumer_oauth"
     reset_backend()
     return {"kind": "web", "delegation": False, **(info or {})}
+
+
+def discard_client(session_id: str | None) -> bool:
+    """Wipe this session's uploaded web client (the Hard-reset action). Never touches the
+    global credentials.json or the delegation key. True if a session client was removed."""
+    from materialize import auth  # type: ignore
+
+    return auth.discard_session_client(session_id)
 
 
 def delegation_active() -> bool:
@@ -138,9 +175,11 @@ def account_uses_delegation(email: str) -> bool:
         return False
 
 
-def client_status() -> dict[str, Any]:
+def client_status(session_id: str | None = None) -> dict[str, Any]:
     """Report the configured auth artifact. In delegation mode this reflects the admin
-    service-account key (accounts authorize automatically); otherwise the web client."""
+    service-account key (accounts authorize automatically). Otherwise, if this browser
+    session has its own uploaded web client, report THAT (so each operator sees the client
+    their page is locked to); else the shared global web client."""
     try:
         from materialize.authbackend import (  # type: ignore
             ConsumerOAuthBackend, discover_sa_key, resolve_auth_mode, sa_client_status,
@@ -151,6 +190,10 @@ def client_status() -> dict[str, Any]:
             st = sa_client_status(key) if key else {}
             return {"present": bool(key), "kind": "service_account", "delegation": True,
                     "domain": workspace_domain(), **(st or {})}
+        from materialize import auth  # type: ignore
+        sp = auth.session_client_path(session_id)
+        if sp is not None and sp.exists():
+            return {"delegation": False, "session": True, **auth.credentials_status(sp)}
         return {"delegation": False, **ConsumerOAuthBackend().client_status()}
     except Exception:  # noqa: BLE001
         return {"present": False, "delegation": False}
@@ -193,15 +236,21 @@ def _write_pending(state: str, entry: dict[str, Any]) -> None:
 def build_auth_url(email: str, persona: str, *, kind: str = "authorize",
                    upload_session_id: str | None = None,
                    services: list[str] | None = None,
-                   return_to: str | None = None) -> str:
+                   return_to: str | None = None,
+                   session_id: str | None = None) -> str:
     """Create a consent URL and remember the handshake keyed by OAuth state.
 
     ``kind`` tells the callback what to do after consent:
       - "authorize": just persist the account to gab_accounts (operator UI step 1).
       - "seed": authorize AND kick off first-time engine seed (POST /api/environment/upload).
+
+    ``session_id`` (the browser-session cookie) selects THIS operator's uploaded web client,
+    so concurrent operators each authorize through their own client.json. The chosen client
+    is recorded in the pending entry so the callback exchanges the code with the SAME client.
     """
     auth = _auth()
-    flow = auth.make_flow(settings.upload_redirect_uri)
+    client_path = auth.resolve_client_path(session_id)
+    flow = auth.make_flow(settings.upload_redirect_uri, client_path=client_path)
     auth_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="false",
@@ -220,6 +269,9 @@ def build_auth_url(email: str, persona: str, *, kind: str = "authorize",
         # PKCE: the verifier generated for THIS auth URL must be replayed at
         # token exchange, or Google rejects with "Missing code verifier".
         "code_verifier": getattr(flow, "code_verifier", None),
+        # The exact web client used to start this handshake, so the callback exchanges the
+        # code with the same client (concurrent operators use different clients).
+        "client_path": str(client_path),
         "expires": time.time() + _PENDING_TTL_S,
     }
     with _pending_lock:
@@ -263,7 +315,11 @@ def complete_callback(code: str | None, state: str | None, error: str | None) ->
         raise UploadError("missing authorization code")
 
     auth = _auth()
-    flow = auth.make_flow(settings.upload_redirect_uri)
+    # Exchange with the SAME client that started this handshake (per-session), falling back
+    # to the global client for older pending entries that predate client_path.
+    _cp = pending.get("client_path")
+    client_path = Path(_cp) if _cp else None
+    flow = auth.make_flow(settings.upload_redirect_uri, client_path=client_path)
     # Replay the PKCE verifier captured when the auth URL was built.
     flow.code_verifier = pending.get("code_verifier")
     try:

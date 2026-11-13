@@ -39,8 +39,60 @@ SCOPES = [
 ROOT = Path(__file__).resolve().parent.parent
 TOKENS_DIR = ROOT / "tokens"
 CREDENTIALS_PATH = ROOT / "credentials.json"
+# Per-browser-session OAuth web clients. Several operators share one onboard page/URL but
+# each uploads their OWN client.json (one per Google Cloud project / 100-test-user shard).
+# Binding the client to a browser session (cookie) lets 5 people authorize concurrently
+# without clobbering a single global credentials.json. Falls back to CREDENTIALS_PATH.
+CLIENTS_DIR = ROOT / "clients"
 BASE_URL = os.environ.get("ENV_LOADER_BASE_URL", "http://127.0.0.1:8765").rstrip("/")
 HTTP_TIMEOUT = 60
+
+
+def _safe_sid(session_id: str) -> str:
+    """Sanitize a session id to a safe filename fragment ([A-Za-z0-9_-], capped)."""
+    cleaned = "".join(ch for ch in (session_id or "") if ch.isalnum() or ch in "-_")
+    return cleaned[:64]
+
+
+def session_client_path(session_id: str | None) -> Path | None:
+    """Path to this session's uploaded web client, or None when there's no session."""
+    sid = _safe_sid(session_id or "")
+    if not sid:
+        return None
+    return CLIENTS_DIR / f"{sid}.json"
+
+
+def resolve_client_path(session_id: str | None = None) -> Path:
+    """The web client to use: the session's if present, else the global credentials.json."""
+    p = session_client_path(session_id)
+    if p is not None and p.exists():
+        return p
+    return CREDENTIALS_PATH
+
+
+def save_session_client(session_id: str, data: dict[str, Any]) -> None:
+    """Persist a validated web-client dict for one browser session (owner-only)."""
+    p = session_client_path(session_id)
+    if p is None:
+        raise ValueError("missing session id")
+    CLIENTS_DIR.mkdir(mode=0o700, exist_ok=True)
+    try:
+        CLIENTS_DIR.chmod(0o700)
+    except OSError:
+        pass
+    secure_write(p, json.dumps(data, indent=2) + "\n")
+
+
+def discard_session_client(session_id: str | None) -> bool:
+    """Delete this session's uploaded client (the Hard-reset wipe). True if one existed."""
+    p = session_client_path(session_id)
+    if p is None or not p.exists():
+        return False
+    try:
+        p.unlink()
+        return True
+    except OSError:
+        return False
 
 
 VERIFY_TTL_S = 10 * 60
@@ -169,11 +221,12 @@ def ensure_local_redirects(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def credentials_status() -> dict[str, Any]:
+def credentials_status(path: Path | None = None) -> dict[str, Any]:
     needed = required_redirects()
-    if not CREDENTIALS_PATH.exists():
+    cred_path = path or CREDENTIALS_PATH
+    if not cred_path.exists():
         return {"present": False, "kind": None, "missing_redirects": needed}
-    data = json.loads(CREDENTIALS_PATH.read_text())
+    data = json.loads(cred_path.read_text())
     info = data.get("web") or data.get("installed") or {}
     kind = "web" if "web" in data else ("installed" if "installed" in data else "unknown")
     uris = info.get("redirect_uris") or []
@@ -186,6 +239,7 @@ def credentials_status() -> dict[str, Any]:
         "present": True,
         "kind": kind,
         "client_id": (info.get("client_id") or "")[-18:],
+        "project_id": info.get("project_id") or "",
         "redirect_uris": uris,
         "missing_redirects": missing,
     }
@@ -290,13 +344,14 @@ def discard_creds(account_email: str) -> None:
             old.unlink()
 
 
-def make_flow(redirect_uri: str) -> Flow:
-    if not CREDENTIALS_PATH.exists():
+def make_flow(redirect_uri: str, client_path: Path | None = None) -> Flow:
+    path = client_path or CREDENTIALS_PATH
+    if not path.exists():
         raise FileNotFoundError(
             "Missing credentials.json. Create a Google Cloud OAuth Web client "
             "and save it next to this app."
         )
-    data = json.loads(CREDENTIALS_PATH.read_text())
+    data = json.loads(path.read_text())
     if "web" not in data:
         raise FileNotFoundError(
             "credentials.json is not a Web OAuth client. "
@@ -304,7 +359,7 @@ def make_flow(redirect_uri: str) -> Flow:
             f"{BASE_URL}/oauth/callback and replace this file."
         )
     return Flow.from_client_secrets_file(
-        str(CREDENTIALS_PATH),
+        str(path),
         scopes=SCOPES,
         redirect_uri=redirect_uri,
     )
