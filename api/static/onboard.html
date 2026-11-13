@@ -150,6 +150,7 @@
         email:r.email, persona:r.persona, rawP:r.rawP, valid:r.valid, password:r.password||null,
         mode:r.mode||null,
         authorized:!!r.authorized, status:r.status, sid:r.sid||null, uid:r.uid||null,
+        statusAt:r.statusAt||null, statusPrior:!!r.statusPrior,
         progress:r.progress||null, verify:r.verify||null,
       }))));
     } catch(e){}
@@ -426,6 +427,14 @@
       const b=diagBlock({diag:d.diagnosis,diagLog:d.log_tail||[]}); if(b) panel.appendChild(b);
     }catch(e){ panel.innerHTML='<div class="svc-row verify-err" style="padding:6px">'+String(e.message||e)+'</div>'; }
   }
+  // Human "when": "today 14:23", "Nov 11 14:23", or "" if unknown.
+  function fmtWhen(iso){
+    if(!iso) return "";
+    const d=new Date(iso); if(isNaN(d.getTime())) return "";
+    const t=d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+    return (d.toDateString()===new Date().toDateString())
+      ? ("today "+t) : (d.toLocaleDateString([], {month:"short", day:"numeric"})+" "+t);
+  }
   function statusLabel(row){
     if(!row.valid) return "unknown persona";
     // A dead/revoked token before any operation starts -> needs re-auth (not "authorized ✓").
@@ -434,8 +443,18 @@
     if(row.status==="authorizing") return '<span class="spin"></span> awaiting consent';
     if(row.status==="authorized") return "authorized ✓";
     if(row.status==="running"||row.status==="queued") return '<span class="spin"></span> seeding…';
-    if(row.status==="completed") return "✅ uploaded";
-    if(row.status==="failed") return "❌ "+humanError(row.error);
+    // completed/failed: show WHEN, and whether it was THIS page or an earlier run, so a stale
+    // "uploaded" from days ago never looks like something just done here.
+    const when = fmtWhen(row.statusAt);
+    if(row.status==="completed"){
+      if(row.statusPrior) return "✅ uploaded <span class='hint'>· "+(when||"earlier")+" · previous run</span>";
+      return "✅ uploaded"+(when?" <span class='hint'>· "+when+"</span>":"");
+    }
+    if(row.status==="failed"){
+      const tail = row.statusPrior ? " <span class='hint'>· "+(when||"earlier")+" · previous run</span>"
+                                   : (when?" <span class='hint'>· "+when+"</span>":"");
+      return "❌ "+humanError(row.error)+tail;
+    }
     return row.status;
   }
   function updateCounts(){
@@ -488,6 +507,10 @@
           row.diag=null; row.diagLog=null;  // stale explanation no longer applies
           changed=true;
         }
+        // This status came from a PRIOR run on the server, not an action on this page.
+        // Record when it happened + mark it prior, so the row reads "uploaded · <when>
+        // (previous run)" instead of looking like it was just done here.
+        if(row.statusAt!==(ls.at||null) || !row.statusPrior){ row.statusAt=ls.at||null; row.statusPrior=true; changed=true; }
       }
       if(changed) renderRows(); }
     catch(e){}
@@ -521,7 +544,7 @@
   // reports the account authorized. The main tab keeps all its rows (localStorage).
   async function startAuthorize(i){
     const row=rows[i]; if(!clientReady||!row.valid) return;
-    row.status="authorizing"; row.error=null; renderRows();
+    row.status="authorizing"; row.error=null; row.statusPrior=false; renderRows();
     try {
       const r=await fetch("/ui/authorize",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:row.email,persona:row.persona||"",...(row.mode?{mode:row.mode}:{}),return_to:"/authorized"})});
       const d=await r.json(); if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
@@ -538,7 +561,7 @@
 
   async function startSeed(i){
     const row=rows[i]; if(!row.authorized||!row.valid) return;
-    row.status="running"; row.error=null; row.diag=null; row.diagLog=null; renderRows();
+    row.status="running"; row.error=null; row.diag=null; row.diagLog=null; row.statusPrior=false; row.statusAt=null; renderRows();
     try {
       const body={email:row.email,persona:row.persona||"",return_to:"/authorized"};  // "" for an empty-universe (clean) row
       if(row.mode) body.mode=row.mode;   // explicit CSV mode -> server honors it (no auto-route)
@@ -582,7 +605,11 @@
       for(const i of idx){
         const st = statuses[rows[i].email]; if(!st) continue;
         const ns = _ST_MAP[st.status];
-        if(ns && rows[i].status!==ns){ rows[i].status=ns; changed=true; }
+        if(ns && rows[i].status!==ns){ rows[i].status=ns;
+          // Live transition on THIS page -> mark current (not a prior run); stamp finishes.
+          rows[i].statusPrior=false;
+          if(["completed","failed"].includes(ns)) rows[i].statusAt=new Date().toISOString();
+          changed=true; }
         if(st.status==="failed" && st.error && rows[i].error!==st.error){ rows[i].error=st.error; changed=true; }
         else if(["running","queued","completed"].includes(st.status) && rows[i].error){ rows[i].error=null; changed=true; }
         if(st.reset_session_id && rows[i].uid!==st.reset_session_id){ rows[i].uid=st.reset_session_id; rows[i].sid=st.reset_session_id; changed=true; }
@@ -603,7 +630,9 @@
     try {
       const r = await fetchT("/ui/upload/"+row.uid+"/progress", {}, 9000); if(!r.ok) return;
       const d = await r.json(); let changed=false;
-      if(d.status){ const m=_ST_MAP[d.status]; if(m && row.status!==m){ row.status=m; row.error=d.error||row.error; changed=true; } }
+      if(d.status){ const m=_ST_MAP[d.status]; if(m && row.status!==m){ row.status=m; row.error=d.error||row.error;
+        row.statusPrior=false; if(["completed","failed"].includes(m)) row.statusAt=new Date().toISOString();
+        changed=true; } }
       if(d.services){ row.progress=d.services; changed=true; }
       if(d.verify){ row.verify=d.verify; changed=true; }
       if(changed){ renderRows(); persistRows(); }
@@ -637,7 +666,7 @@
   }
   async function startRecover(i){
     const row=rows[i]; if(!row.valid) return;
-    row.status="running"; row.error=null; row.diag=null; row.diagLog=null; renderRows();
+    row.status="running"; row.error=null; row.diag=null; row.diagLog=null; row.statusPrior=false; row.statusAt=null; renderRows();
     try {
       const r=await fetch("/ui/recover",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:row.email,persona:row.persona,return_to:"/authorized"})});
       const d=await r.json(); if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
@@ -658,7 +687,7 @@
       const row=rows[i]; let settled=false;
       const done=(v)=>{ if(settled) return; settled=true; resolve(v); };
       try {
-        row.status="authorizing"; row.error=null; renderRows();
+        row.status="authorizing"; row.error=null; row.statusPrior=false; renderRows();
         const r=await fetch("/ui/authorize",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:row.email,persona:row.persona||"",...(row.mode?{mode:row.mode}:{}),return_to:"/authorized"})});
         const d=await r.json(); if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
         row.authUrl=d.auth_url; window.open(d.auth_url,"_blank"); renderRows();

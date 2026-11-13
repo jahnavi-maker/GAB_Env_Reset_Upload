@@ -2236,6 +2236,10 @@ async def ui_account(email: str, store: Store = Depends(get_store)) -> dict:
             "mode": latest.get("mode"),
             "error": latest.get("error"),
             "persona": latest.get("persona") or latest.get("last_reset_persona"),
+            # When this prior run finished — so the UI can show "uploaded · <when>" and make
+            # clear a status is from an EARLIER run, not something just done on this page.
+            "at": (latest.get("completed_at") or latest.get("last_reset_at")
+                   or latest.get("started_at") or latest.get("created_at")),
         }
     token_state = "delegated" if delegated else _seeder_token_state(email)
     authorized = delegated or token_state in ("valid", "unknown")
