@@ -279,3 +279,103 @@ class LoginUpsertRequest(BaseModel):
         if self.email:
             rows.append(LoginItem(email=self.email, name=self.name))
         return rows
+
+
+# --- Freelancer managers (QMs) + blocklist -------------------------------------
+class ManagerItem(BaseModel):
+    email: str = Field(..., min_length=3)
+    name: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def _norm(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if "@" not in v:
+            raise ValueError("email must contain @")
+        return v
+
+
+class ManagerUpsertRequest(BaseModel):
+    """Admin: add/update the QMs allowed to add freelancers on /managers (Bearer)."""
+    email: Optional[str] = None
+    name: Optional[str] = None
+    managers: Optional[list[ManagerItem]] = None
+
+    def items(self) -> list[ManagerItem]:
+        rows: list[ManagerItem] = list(self.managers or [])
+        if self.email:
+            rows.append(ManagerItem(email=self.email, name=self.name))
+        return rows
+
+
+class BlocklistItem(BaseModel):
+    email: str = Field(..., min_length=3)
+    reason: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def _norm(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if "@" not in v:
+            raise ValueError("email must contain @")
+        return v
+
+
+class BlocklistUpsertRequest(BaseModel):
+    """Admin: emails a QM may never add to the freelancers table (Bearer)."""
+    email: Optional[str] = None
+    reason: Optional[str] = None
+    blocked: Optional[list[BlocklistItem]] = None
+
+    def items(self) -> list[BlocklistItem]:
+        rows: list[BlocklistItem] = list(self.blocked or [])
+        if self.email:
+            rows.append(BlocklistItem(email=self.email, reason=self.reason))
+        return rows
+
+
+class ManagerVerifyRequest(BaseModel):
+    """Body for POST /ui/manager/verify — the /managers page login check.
+
+    Prefer ``credential`` (a Google ID token) so the signed-in email is PROVEN by
+    Google. ``email`` is the dev fallback used only when Google sign-in is not
+    configured (no GOOGLE_CLIENT_ID).
+    """
+    credential: Optional[str] = None
+    email: Optional[str] = None
+
+
+class ManagerVerifyResponse(BaseModel):
+    verified: bool
+    name: Optional[str] = None
+    email: Optional[str] = None
+
+
+class ManagerFreelancerAddRequest(BaseModel):
+    """A QM adds one freelancer. The QM identity comes from ``credential``
+    (verified server-side); the QM can never set added_by for someone else."""
+    credential: Optional[str] = None
+    email: Optional[str] = None  # dev fallback QM identity (no Google configured)
+    freelancer_email: str = Field(..., min_length=3)
+    freelancer_name: Optional[str] = None
+
+    @field_validator("freelancer_email")
+    @classmethod
+    def _norm_fl(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if "@" not in v or "." not in v.split("@")[-1]:
+            raise ValueError("freelancer_email must be a valid address")
+        return v
+
+
+class ManagerFreelancerActionRequest(BaseModel):
+    """A QM lists or removes one of their own freelancers."""
+    credential: Optional[str] = None
+    email: Optional[str] = None  # dev fallback QM identity
+    freelancer_email: Optional[str] = None
+
+
+class ManagerFreelancerAddResponse(BaseModel):
+    ok: bool
+    added: Optional[str] = None
+    detail: Optional[str] = None

@@ -39,7 +39,9 @@ class Store:
         raise NotImplementedError
 
     # --- freelancers allow-list (email-only access check for the reset page) ---
-    async def upsert_freelancer(self, email: str, name: str | None = None) -> dict[str, Any]:
+    async def upsert_freelancer(
+        self, email: str, name: str | None = None, added_by: str | None = None
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
     async def get_freelancer(self, email: str) -> Optional[dict[str, Any]]:
@@ -49,6 +51,40 @@ class Store:
         raise NotImplementedError
 
     async def delete_freelancer(self, email: str) -> None:
+        raise NotImplementedError
+
+    # Per-QM views: freelancers a given manager (added_by email) created, and a
+    # delete that only succeeds when the row belongs to that manager.
+    async def list_freelancers_by(self, added_by: str) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    async def delete_freelancer_owned(self, email: str, added_by: str) -> bool:
+        raise NotImplementedError
+
+    # --- freelancer-managers allow-list (QMs who may add freelancers on /managers) ---
+    async def upsert_manager(self, email: str, name: str | None = None) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def get_manager(self, email: str) -> Optional[dict[str, Any]]:
+        raise NotImplementedError
+
+    async def list_managers(self) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    async def delete_manager(self, email: str) -> None:
+        raise NotImplementedError
+
+    # --- freelancer blocklist (emails a QM may never add) --------------------
+    async def upsert_blocked(self, email: str, reason: str | None = None) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def get_blocked(self, email: str) -> Optional[dict[str, Any]]:
+        raise NotImplementedError
+
+    async def list_blocked(self) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    async def delete_blocked(self, email: str) -> None:
         raise NotImplementedError
 
     async def upsert_account(
@@ -177,10 +213,14 @@ class SupabaseStore(Store):
     def _fl_url(self) -> str:
         return f"{settings.supabase_url.rstrip('/')}/rest/v1/{settings.freelancers_table}"
 
-    async def upsert_freelancer(self, email: str, name: str | None = None) -> dict[str, Any]:
+    async def upsert_freelancer(
+        self, email: str, name: str | None = None, added_by: str | None = None
+    ) -> dict[str, Any]:
         rec: dict[str, Any] = {"email": _norm_email(email)}
         if name is not None:
             rec["name"] = name
+        if added_by is not None:
+            rec["added_by"] = _norm_email(added_by)
         r = await self._client.post(
             self._fl_url(),
             json=rec,
@@ -203,13 +243,118 @@ class SupabaseStore(Store):
     async def list_freelancers(self) -> list[dict[str, Any]]:
         r = await self._client.get(
             self._fl_url(),
-            params={"select": "email,name,active,created_at", "order": "created_at.desc"},
+            params={"select": "email,name,active,added_by,created_at", "order": "created_at.desc"},
         )
         r.raise_for_status()
         return r.json()
 
     async def delete_freelancer(self, email: str) -> None:
         r = await self._client.delete(self._fl_url(), params={"email": f"eq.{_norm_email(email)}"})
+        r.raise_for_status()
+
+    async def list_freelancers_by(self, added_by: str) -> list[dict[str, Any]]:
+        r = await self._client.get(
+            self._fl_url(),
+            params={
+                "select": "email,name,active,added_by,created_at",
+                "added_by": f"eq.{_norm_email(added_by)}",
+                "order": "created_at.desc",
+            },
+        )
+        if r.status_code == 400:
+            return []
+        r.raise_for_status()
+        return r.json()
+
+    async def delete_freelancer_owned(self, email: str, added_by: str) -> bool:
+        # Delete ONLY when the row's added_by matches this QM, so a QM can't remove
+        # another QM's freelancer. return=representation tells us if a row matched.
+        r = await self._client.delete(
+            self._fl_url(),
+            params={
+                "email": f"eq.{_norm_email(email)}",
+                "added_by": f"eq.{_norm_email(added_by)}",
+            },
+            headers={"Prefer": "return=representation"},
+        )
+        r.raise_for_status()
+        rows = r.json() if r.content else []
+        return bool(rows)
+
+    def _mgr_url(self) -> str:
+        return f"{settings.supabase_url.rstrip('/')}/rest/v1/{settings.managers_table}"
+
+    async def upsert_manager(self, email: str, name: str | None = None) -> dict[str, Any]:
+        rec: dict[str, Any] = {"email": _norm_email(email)}
+        if name is not None:
+            rec["name"] = name
+        r = await self._client.post(
+            self._mgr_url(),
+            json=rec,
+            headers={"Prefer": "resolution=merge-duplicates,return=representation"},
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else rec
+
+    async def get_manager(self, email: str) -> Optional[dict[str, Any]]:
+        r = await self._client.get(
+            self._mgr_url(), params={"email": f"eq.{_norm_email(email)}", "limit": "1"}
+        )
+        if r.status_code == 400:
+            return None
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else None
+
+    async def list_managers(self) -> list[dict[str, Any]]:
+        r = await self._client.get(
+            self._mgr_url(),
+            params={"select": "email,name,active,created_at", "order": "created_at.desc"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def delete_manager(self, email: str) -> None:
+        r = await self._client.delete(self._mgr_url(), params={"email": f"eq.{_norm_email(email)}"})
+        r.raise_for_status()
+
+    def _blk_url(self) -> str:
+        return f"{settings.supabase_url.rstrip('/')}/rest/v1/{settings.blocklist_table}"
+
+    async def upsert_blocked(self, email: str, reason: str | None = None) -> dict[str, Any]:
+        rec: dict[str, Any] = {"email": _norm_email(email)}
+        if reason is not None:
+            rec["reason"] = reason
+        r = await self._client.post(
+            self._blk_url(),
+            json=rec,
+            headers={"Prefer": "resolution=merge-duplicates,return=representation"},
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else rec
+
+    async def get_blocked(self, email: str) -> Optional[dict[str, Any]]:
+        r = await self._client.get(
+            self._blk_url(), params={"email": f"eq.{_norm_email(email)}", "limit": "1"}
+        )
+        if r.status_code == 400:
+            return None
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else None
+
+    async def list_blocked(self) -> list[dict[str, Any]]:
+        r = await self._client.get(
+            self._blk_url(),
+            params={"select": "email,reason,created_at", "order": "created_at.desc"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def delete_blocked(self, email: str) -> None:
+        r = await self._client.delete(self._blk_url(), params={"email": f"eq.{_norm_email(email)}"})
         r.raise_for_status()
 
     def _wl_url(self) -> str:
@@ -342,8 +487,10 @@ class SplitLoginStore(Store):
     async def patch_table(self, table: str, params: dict[str, str], fields: dict[str, Any]) -> None:
         await self._primary.patch_table(table, params, fields)
 
-    async def upsert_freelancer(self, email: str, name: str | None = None) -> dict[str, Any]:
-        return await self._logins.upsert_freelancer(email, name)
+    async def upsert_freelancer(
+        self, email: str, name: str | None = None, added_by: str | None = None
+    ) -> dict[str, Any]:
+        return await self._logins.upsert_freelancer(email, name, added_by)
 
     async def get_freelancer(self, email: str) -> Optional[dict[str, Any]]:
         return await self._logins.get_freelancer(email)
@@ -353,6 +500,36 @@ class SplitLoginStore(Store):
 
     async def delete_freelancer(self, email: str) -> None:
         await self._logins.delete_freelancer(email)
+
+    async def list_freelancers_by(self, added_by: str) -> list[dict[str, Any]]:
+        return await self._logins.list_freelancers_by(added_by)
+
+    async def delete_freelancer_owned(self, email: str, added_by: str) -> bool:
+        return await self._logins.delete_freelancer_owned(email, added_by)
+
+    async def upsert_manager(self, email: str, name: str | None = None) -> dict[str, Any]:
+        return await self._logins.upsert_manager(email, name)
+
+    async def get_manager(self, email: str) -> Optional[dict[str, Any]]:
+        return await self._logins.get_manager(email)
+
+    async def list_managers(self) -> list[dict[str, Any]]:
+        return await self._logins.list_managers()
+
+    async def delete_manager(self, email: str) -> None:
+        await self._logins.delete_manager(email)
+
+    async def upsert_blocked(self, email: str, reason: str | None = None) -> dict[str, Any]:
+        return await self._logins.upsert_blocked(email, reason)
+
+    async def get_blocked(self, email: str) -> Optional[dict[str, Any]]:
+        return await self._logins.get_blocked(email)
+
+    async def list_blocked(self) -> list[dict[str, Any]]:
+        return await self._logins.list_blocked()
+
+    async def delete_blocked(self, email: str) -> None:
+        await self._logins.delete_blocked(email)
 
     async def list_whitelist(self) -> list[dict[str, Any]]:
         return await self._primary.list_whitelist()
@@ -403,6 +580,8 @@ class LocalJsonStore(Store):
         self._acct_path = self._path.with_name(self._path.stem + ".accounts.json")
         self._login_path = self._path.with_name(self._path.stem + ".logins.json")
         self._wl_path = self._path.with_name(self._path.stem + ".whitelist.json")
+        self._mgr_path = self._path.with_name(self._path.stem + ".managers.json")
+        self._blk_path = self._path.with_name(self._path.stem + ".blocklist.json")
         self._lock = asyncio.Lock()
         if not self._path.exists():
             self._path.write_text("{}", encoding="utf-8")
@@ -470,13 +649,17 @@ class LocalJsonStore(Store):
     def _write_fl(self, data: dict[str, Any]) -> None:
         self._fl_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
 
-    async def upsert_freelancer(self, email: str, name: str | None = None) -> dict[str, Any]:
+    async def upsert_freelancer(
+        self, email: str, name: str | None = None, added_by: str | None = None
+    ) -> dict[str, Any]:
         async with self._lock:
             data = self._read_fl()
             key = _norm_email(email)
             rec = data.get(key) or {"email": key, "active": True, "created_at": _now_iso()}
             if name is not None:
                 rec["name"] = name
+            if added_by is not None:
+                rec["added_by"] = _norm_email(added_by)
             rec.setdefault("active", True)
             data[key] = rec
             self._write_fl(data)
@@ -495,6 +678,94 @@ class LocalJsonStore(Store):
             data = self._read_fl()
             if data.pop(_norm_email(email), None) is not None:
                 self._write_fl(data)
+
+    async def list_freelancers_by(self, added_by: str) -> list[dict[str, Any]]:
+        want = _norm_email(added_by)
+        async with self._lock:
+            return [r for r in self._read_fl().values() if (r.get("added_by") or "") == want]
+
+    async def delete_freelancer_owned(self, email: str, added_by: str) -> bool:
+        key = _norm_email(email)
+        want = _norm_email(added_by)
+        async with self._lock:
+            data = self._read_fl()
+            rec = data.get(key)
+            if rec is None or (rec.get("added_by") or "") != want:
+                return False
+            data.pop(key, None)
+            self._write_fl(data)
+            return True
+
+    # --- freelancer-managers (QM allow-list) ---------------------------------
+    def _read_mgr(self) -> dict[str, Any]:
+        try:
+            return json.loads(self._mgr_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _write_mgr(self, data: dict[str, Any]) -> None:
+        self._mgr_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+
+    async def upsert_manager(self, email: str, name: str | None = None) -> dict[str, Any]:
+        async with self._lock:
+            data = self._read_mgr()
+            key = _norm_email(email)
+            rec = data.get(key) or {"email": key, "active": True, "created_at": _now_iso()}
+            if name is not None:
+                rec["name"] = name
+            rec.setdefault("active", True)
+            data[key] = rec
+            self._write_mgr(data)
+        return rec
+
+    async def get_manager(self, email: str) -> Optional[dict[str, Any]]:
+        async with self._lock:
+            return self._read_mgr().get(_norm_email(email))
+
+    async def list_managers(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            return list(self._read_mgr().values())
+
+    async def delete_manager(self, email: str) -> None:
+        async with self._lock:
+            data = self._read_mgr()
+            if data.pop(_norm_email(email), None) is not None:
+                self._write_mgr(data)
+
+    # --- freelancer blocklist ------------------------------------------------
+    def _read_blk(self) -> dict[str, Any]:
+        try:
+            return json.loads(self._blk_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _write_blk(self, data: dict[str, Any]) -> None:
+        self._blk_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+
+    async def upsert_blocked(self, email: str, reason: str | None = None) -> dict[str, Any]:
+        async with self._lock:
+            data = self._read_blk()
+            key = _norm_email(email)
+            rec = data.get(key) or {"email": key, "created_at": _now_iso()}
+            if reason is not None:
+                rec["reason"] = reason
+            data[key] = rec
+            self._write_blk(data)
+        return rec
+
+    async def get_blocked(self, email: str) -> Optional[dict[str, Any]]:
+        async with self._lock:
+            return self._read_blk().get(_norm_email(email))
+
+    async def list_blocked(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            return list(self._read_blk().values())
+
+    async def delete_blocked(self, email: str) -> None:
+        async with self._lock:
+            data = self._read_blk()
+            if data.pop(_norm_email(email), None) is not None:
+                self._write_blk(data)
 
     def _read_wl(self) -> dict[str, Any]:
         try:

@@ -133,6 +133,51 @@ delete from freelancers f
 update freelancers set email = lower(btrim(email, E' \t\n\r\f\v'))
     where email <> lower(btrim(email, E' \t\n\r\f\v'));
 
+-- added_by : which QM (freelancer-manager email) created this freelancer row, via
+-- the /managers self-service page. NULL for rows added by the platform/API (Cosmo)
+-- or before this column existed. Additive + nullable, so existing rows are untouched.
+alter table freelancers add column if not exists added_by text;
+create index if not exists idx_freelancers_added_by on freelancers (added_by);
+
+-- ---------------------------------------------------------------------------
+-- freelancer_managers : the small allow-list of QMs (quality managers) who may
+-- sign in to the /managers page and add freelancers there. The page verifies the
+-- signed-in Google email against this table (email-only check), exactly like the
+-- freelancers gate. Populated by an admin via POST /api/managers (Bearer).
+-- ---------------------------------------------------------------------------
+create table if not exists freelancer_managers (
+    email       text primary key,                      -- stored lowercased
+    name        text,
+    active      boolean     not null default true,      -- flip to false to revoke QM access
+    created_at  timestamptz not null default now(),
+    updated_at  timestamptz not null default now()
+);
+create index if not exists idx_freelancer_managers_active on freelancer_managers (active);
+
+drop trigger if exists trg_freelancer_managers_updated on freelancer_managers;
+create trigger trg_freelancer_managers_updated before update on freelancer_managers
+    for each row execute function set_updated_at();
+
+-- Reuse the same email-normalization used for freelancers (trim + lowercase on every write).
+drop trigger if exists trg_freelancer_managers_normalize_email on freelancer_managers;
+create trigger trg_freelancer_managers_normalize_email before insert or update on freelancer_managers
+    for each row execute function normalize_freelancer_email();
+
+-- ---------------------------------------------------------------------------
+-- freelancer_blocklist : emails a QM may NEVER add to the freelancers table. The
+-- /managers add endpoint rejects any freelancer email present here, regardless of
+-- which QM is adding it. Managed by an admin via POST /api/blocklist (Bearer).
+-- ---------------------------------------------------------------------------
+create table if not exists freelancer_blocklist (
+    email       text primary key,                      -- stored lowercased
+    reason      text,                                   -- optional note (why blocked)
+    created_at  timestamptz not null default now()
+);
+
+drop trigger if exists trg_freelancer_blocklist_normalize_email on freelancer_blocklist;
+create trigger trg_freelancer_blocklist_normalize_email before insert or update on freelancer_blocklist
+    for each row execute function normalize_freelancer_email();
+
 -- ---------------------------------------------------------------------------
 -- gab_logins : REMOVED. The sign-in allow-list is the `freelancers` table above.
 -- The app reads/writes it via SUPABASE_LOGINS_TABLE (default "freelancers"), so

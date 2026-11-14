@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Freelancer Managers</title>
+<style>
+  :root {
+    --bg:#f6f3f0; --card:#ffffff; --ink:#111113; --muted:#6b6b70;
+    --brand:#175fff; --ok:#12855a; --err:#c0392b; --line:#e6e2dd; --chip:#eef1f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#111113; --card:#1b1b1e; --ink:#f6f3f0; --muted:#9a9aa0; --line:#2c2c30; --chip:#23232a; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",sans-serif;
+    display:flex; align-items:flex-start; justify-content:center; padding:24px 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:16px;
+    width:100%; max-width:480px; box-shadow:0 10px 40px rgba(0,0,0,.06); overflow:hidden; }
+  .pad { padding:26px 26px; }
+  .divider { border-top:1px solid var(--line); }
+  h1 { font-size:22px; margin:0 0 4px; letter-spacing:-.01em; }
+  .subtle { color:var(--muted); font-size:13px; margin:0; }
+  .field { margin-bottom:14px; }
+  .label { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-bottom:3px; }
+  .value { font-size:14px; font-weight:600; word-break:break-all; }
+  button { appearance:none; border:0; cursor:pointer; width:100%; margin-top:6px;
+    background:var(--brand); color:#fff; font-size:16px; font-weight:600; padding:14px; border-radius:12px;
+    transition:opacity .15s, transform .05s; }
+  button:hover { opacity:.92; } button:active { transform:translateY(1px); }
+  button:disabled { opacity:.5; cursor:default; }
+  input[type=email], input[type=text] { width:100%; padding:13px 14px; font-size:16px; border:1px solid var(--line);
+    border-radius:12px; background:var(--bg); color:var(--ink); margin-top:4px; }
+  input:focus { outline:2px solid var(--brand); outline-offset:1px; }
+  .or { text-align:center; color:var(--muted); font-size:12px; margin:14px 0 8px; }
+  .hidden { display:none; }
+  .err-detail { color:var(--err); font-size:13px; margin-top:10px; min-height:1em; }
+  .ok-detail { color:var(--ok); font-size:13px; margin-top:10px; min-height:1em; }
+  .who { color:var(--muted); font-size:13px; }
+  .list { list-style:none; margin:4px 0 0; padding:0; }
+  .list li { display:flex; align-items:center; justify-content:space-between; gap:10px;
+    padding:11px 0; border-top:1px solid var(--line); font-size:14px; }
+  .list li:first-child { border-top:0; }
+  .flmail { font-weight:600; word-break:break-all; }
+  .flname { color:var(--muted); font-size:12px; }
+  .rm { width:auto; margin:0; padding:7px 12px; font-size:13px; background:transparent; color:var(--err);
+    border:1px solid var(--line); border-radius:9px; }
+  .rm:hover { opacity:1; border-color:var(--err); }
+  .empty { color:var(--muted); font-size:13px; padding:12px 0; }
+  .row2 { display:flex; gap:10px; align-items:flex-end; }
+  .row2 .field { flex:1; margin-bottom:0; }
+  .addbtn { margin-top:14px; }
+</style>
+</head>
+<body>
+  <div class="card" id="card">
+    <!-- login view -->
+    <div id="loginView" class="hidden">
+      <div class="pad">
+        <h1>Freelancer Managers</h1>
+        <p class="subtle" id="loginSub">Sign in with your Google account to continue.</p>
+      </div>
+      <div class="divider"></div>
+      <div class="pad">
+        <div id="googleBox">
+          <div id="gsiButton"></div>
+        </div>
+        <div class="err-detail" id="loginErr"></div>
+      </div>
+    </div>
+
+    <!-- manager view -->
+    <div id="mgrView" class="hidden">
+      <div class="pad">
+        <h1>Add freelancers</h1>
+        <p class="subtle">Signed in as <span class="who" id="signedInAs">—</span></p>
+      </div>
+      <div class="divider"></div>
+      <div class="pad">
+        <div class="row2">
+          <div class="field">
+            <div class="label">Freelancer email</div>
+            <input id="flEmail" type="email" autocomplete="off" placeholder="person@example.com" />
+          </div>
+          <div class="field">
+            <div class="label">Name (optional)</div>
+            <input id="flName" type="text" autocomplete="off" placeholder="Full name" />
+          </div>
+        </div>
+        <button id="addBtn" class="addbtn">Add freelancer</button>
+        <div class="err-detail" id="addErr"></div>
+        <div class="ok-detail" id="addOk"></div>
+      </div>
+      <div class="divider"></div>
+      <div class="pad">
+        <div class="label" style="margin-bottom:8px;">Freelancers you added</div>
+        <ul class="list" id="flList"></ul>
+        <div class="empty hidden" id="flEmpty">You haven't added anyone yet.</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const $ = id => document.getElementById(id);
+  const hash = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+  const query = new URLSearchParams(location.search);
+  const ctx = { credential: null, email: null };
+
+  async function postJSON(url, body){
+    const r = await fetch(url, {
+      method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body),
+    });
+    let d = {};
+    try { d = await r.json(); } catch(_){}
+    return { ok: r.ok, status: r.status, data: d };
+  }
+
+  function authBody(extra){
+    return Object.assign({ credential: ctx.credential, email: ctx.email }, extra || {});
+  }
+
+  function renderList(rows){
+    const ul = $("flList"); ul.innerHTML = "";
+    if (!rows || !rows.length){ $("flEmpty").classList.remove("hidden"); return; }
+    $("flEmpty").classList.add("hidden");
+    rows.forEach(fl => {
+      const li = document.createElement("li");
+      const left = document.createElement("div");
+      const em = document.createElement("div"); em.className = "flmail"; em.textContent = fl.email;
+      left.appendChild(em);
+      if (fl.name){ const nm = document.createElement("div"); nm.className = "flname"; nm.textContent = fl.name; left.appendChild(nm); }
+      const rm = document.createElement("button"); rm.className = "rm"; rm.textContent = "Remove";
+      rm.addEventListener("click", ()=> removeFreelancer(fl.email, rm));
+      li.appendChild(left); li.appendChild(rm); ul.appendChild(li);
+    });
+  }
+
+  async function loadList(){
+    const { ok, data } = await postJSON("/ui/manager/freelancers", authBody());
+    if (ok) renderList(data.freelancers || []);
+  }
+
+  async function addFreelancer(){
+    $("addErr").textContent = ""; $("addOk").textContent = "";
+    const email = ($("flEmail").value || "").trim().toLowerCase();
+    const name = ($("flName").value || "").trim();
+    if (!email || email.indexOf("@") < 0){ $("addErr").textContent = "Enter a valid freelancer email."; return; }
+    $("addBtn").disabled = true;
+    try {
+      const { ok, status, data } = await postJSON("/ui/manager/freelancer",
+        authBody({ freelancer_email: email, freelancer_name: name || null }));
+      if (ok && data.ok){
+        $("addOk").textContent = "Added " + (data.added || email) + ".";
+        $("flEmail").value = ""; $("flName").value = "";
+        loadList();
+      } else if (status === 401 || status === 403){
+        $("addErr").textContent = data.detail || "You are not authorized.";
+      } else {
+        $("addErr").textContent = (data && data.detail) || "Could not add this freelancer.";
+      }
+    } catch(e){ $("addErr").textContent = "Something went wrong — please try again."; }
+    $("addBtn").disabled = false;
+  }
+
+  async function removeFreelancer(email, btn){
+    if (btn) btn.disabled = true;
+    const { ok, data } = await postJSON("/ui/manager/freelancer/delete", authBody({ freelancer_email: email }));
+    if (ok && data.ok){ loadList(); }
+    else { $("addErr").textContent = (data && data.detail) || "Could not remove."; if (btn) btn.disabled = false; }
+  }
+
+  function showManager(email){
+    $("loginView").classList.add("hidden");
+    $("mgrView").classList.remove("hidden");
+    $("signedInAs").textContent = email || "—";
+    loadList();
+  }
+
+  async function verify(body){
+    $("loginErr").textContent = "";
+    try {
+      const { ok, data } = await postJSON("/ui/manager/verify", body);
+      if (ok && data.verified){
+        ctx.credential = body.credential || null;
+        ctx.email = data.email || null;
+        showManager(data.email);
+        return true;
+      }
+      $("loginErr").textContent = (data && data.detail) || "This Google account is not a freelancer manager.";
+    } catch(e){ $("loginErr").textContent = "Couldn't verify right now — please try again."; }
+    return false;
+  }
+
+  window.__onGoogleCredential = function(resp){ verify({ credential: resp.credential }); };
+  function setupGoogle(clientId){
+    const s = document.createElement("script");
+    s.src = "https://accounts.google.com/gsi/client"; s.async = true; s.defer = true;
+    s.onload = function(){
+      try {
+        google.accounts.id.initialize({ client_id: clientId, callback: window.__onGoogleCredential, auto_select: false });
+        google.accounts.id.renderButton($("gsiButton"), { theme:"outline", size:"large", width:320, text:"signin_with" });
+      } catch(e){ $("loginErr").textContent = "Could not start Google sign-in — refresh and try again."; }
+    };
+    document.head.appendChild(s);
+  }
+  function loginErrorMessage(code){
+    if (code === "not_allowed") return "This Google account is not a freelancer manager.";
+    if (code === "google") return "Google sign-in did not complete. Try again.";
+    return "";
+  }
+
+  $("addBtn").addEventListener("click", addFreelancer);
+  $("flEmail").addEventListener("keydown", e => { if (e.key === "Enter") addFreelancer(); });
+  $("flName").addEventListener("keydown", e => { if (e.key === "Enter") addFreelancer(); });
+
+  (function init(){
+    const le = query.get("login_error");
+    if (le){ $("loginErr").textContent = loginErrorMessage(le) || "Sign-in failed."; }
+    // Returning from the server-side Google redirect with a verified credential.
+    const cred = hash.get("credential");
+    if (cred){ verify({ credential: cred }); return; }
+    $("loginView").classList.remove("hidden");
+    fetch("/ui/auth-config").then(r=>r.json()).then(cfg=>{
+      if (cfg && cfg.google_client_id){ setupGoogle(cfg.google_client_id); }
+      else { $("loginErr").textContent = "Google sign-in is not configured on this server."; }
+    }).catch(()=>{ $("loginErr").textContent = "Could not load Google sign-in — refresh and try again."; });
+  })();
+</script>
+</body>
+</html>

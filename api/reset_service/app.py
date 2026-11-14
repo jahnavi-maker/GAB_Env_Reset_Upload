@@ -59,6 +59,13 @@ from .models import (
     FreelancerUpsertRequest,
     FreelancerVerifyRequest,
     FreelancerVerifyResponse,
+    ManagerUpsertRequest,
+    BlocklistUpsertRequest,
+    ManagerVerifyRequest,
+    ManagerVerifyResponse,
+    ManagerFreelancerAddRequest,
+    ManagerFreelancerActionRequest,
+    ManagerFreelancerAddResponse,
     ResetLinkRequest,
     ResetLinkResponse,
     ResetRequest,
@@ -1428,6 +1435,177 @@ async def verify_freelancer(
         activity_log.login(email, "freelancer")
         return FreelancerVerifyResponse(verified=True, name=row.get("name"), email=email)
     return FreelancerVerifyResponse(verified=False, email=email)
+
+
+# ---------------------------------------------------------------------------- #
+# QM (freelancer-manager) self-service: a page where only the ~10 QMs on the    #
+# freelancer_managers allow-list may add freelancers. Each QM sees/manages only #
+# the freelancers they added (added_by), and can never add a blocklisted email. #
+# Same-origin /ui/manager/* — the QM identity is PROVEN by a Google ID token     #
+# (or a plain email only when Google sign-in is not configured, dev only).       #
+# ---------------------------------------------------------------------------- #
+def _resolve_signed_in_email(credential: str | None, email_fallback: str | None) -> str | None:
+    """The email the caller proved they own: Google ID token when configured,
+    else a plain email (dev only). Returns None when it can't be trusted."""
+    if resolve_google_client_id():
+        return _verify_google_credential(credential or "")
+    email = (email_fallback or "").strip().lower()
+    if not email or "@" not in email:
+        return None
+    return email
+
+
+async def _require_manager(
+    store: Store, credential: str | None, email_fallback: str | None
+) -> tuple[str, dict[str, Any]]:
+    """Resolve + authorize the QM. Returns (email, manager_row) or raises 403/401."""
+    email = _resolve_signed_in_email(credential, email_fallback)
+    if not email:
+        raise HTTPException(status_code=401, detail="sign in with Google to continue")
+    try:
+        row = await store.get_manager(email)
+    except Exception:  # noqa: BLE001 - a store hiccup must not leak details
+        log.exception("manager lookup failed")
+        raise HTTPException(status_code=503, detail="verification temporarily unavailable")
+    if not row or not row.get("active", True):
+        raise HTTPException(status_code=403, detail="this Google account is not a freelancer manager")
+    return email, row
+
+
+@app.get("/managers", response_class=HTMLResponse)
+async def ui_managers_page() -> HTMLResponse:
+    """Self-service page: a QM signs in with Google and adds their freelancers."""
+    return HTMLResponse((STATIC_DIR / "managers.html").read_text(encoding="utf-8"))
+
+
+@app.post("/ui/manager/verify", response_model=ManagerVerifyResponse)
+async def ui_manager_verify(
+    req: ManagerVerifyRequest, store: Store = Depends(get_store)
+) -> ManagerVerifyResponse:
+    """Is the signed-in Google user one of the QMs? Gates the /managers page."""
+    email = _resolve_signed_in_email(req.credential, req.email)
+    if not email:
+        return ManagerVerifyResponse(verified=False)
+    try:
+        row = await store.get_manager(email)
+    except Exception:  # noqa: BLE001
+        log.exception("manager verify lookup failed")
+        raise HTTPException(status_code=503, detail="verification temporarily unavailable")
+    if row and row.get("active", True):
+        activity_log.login(email, "manager")
+        return ManagerVerifyResponse(verified=True, name=row.get("name"), email=email)
+    return ManagerVerifyResponse(verified=False, email=email)
+
+
+@app.post("/ui/manager/freelancers")
+async def ui_manager_list_freelancers(
+    req: ManagerFreelancerActionRequest, store: Store = Depends(get_store)
+) -> dict:
+    """List ONLY the freelancers this QM added."""
+    email, _ = await _require_manager(store, req.credential, req.email)
+    rows = await store.list_freelancers_by(email)
+    return {"count": len(rows), "freelancers": rows, "manager": email}
+
+
+@app.post("/ui/manager/freelancer", response_model=ManagerFreelancerAddResponse)
+async def ui_manager_add_freelancer(
+    req: ManagerFreelancerAddRequest, store: Store = Depends(get_store)
+) -> ManagerFreelancerAddResponse:
+    """A QM adds one freelancer — gated on QM identity + the blocklist."""
+    manager_email, _ = await _require_manager(store, req.credential, req.email)
+    target = req.freelancer_email  # already normalized by the model validator
+
+    # Hard denylist: refuse any blocklisted email, whoever is adding it.
+    try:
+        blocked = await store.get_blocked(target)
+    except Exception:  # noqa: BLE001
+        log.exception("blocklist lookup failed")
+        raise HTTPException(status_code=503, detail="could not check the blocklist — try again")
+    if blocked:
+        reason = (blocked.get("reason") or "").strip()
+        detail = "This email is on the blocklist and can't be added" + (f" ({reason})" if reason else ".")
+        return ManagerFreelancerAddResponse(ok=False, detail=detail)
+
+    # Don't let a QM silently take over a freelancer another QM already owns.
+    existing = await store.get_freelancer(target)
+    if existing:
+        owner = (existing.get("added_by") or "").strip().lower()
+        if owner and owner != manager_email:
+            return ManagerFreelancerAddResponse(
+                ok=False, detail="This freelancer is already managed by someone else."
+            )
+
+    await store.upsert_freelancer(target, req.freelancer_name, added_by=manager_email)
+    activity_log.account_registered(target, None, source=f"manager:{manager_email}")
+    return ManagerFreelancerAddResponse(ok=True, added=target)
+
+
+@app.post("/ui/manager/freelancer/delete", response_model=ManagerFreelancerAddResponse)
+async def ui_manager_delete_freelancer(
+    req: ManagerFreelancerActionRequest, store: Store = Depends(get_store)
+) -> ManagerFreelancerAddResponse:
+    """A QM removes one of THEIR OWN freelancers (added_by must match)."""
+    manager_email, _ = await _require_manager(store, req.credential, req.email)
+    target = (req.freelancer_email or "").strip().lower()
+    if not target or "@" not in target:
+        raise HTTPException(status_code=422, detail="provide freelancer_email")
+    removed = await store.delete_freelancer_owned(target, manager_email)
+    if not removed:
+        return ManagerFreelancerAddResponse(
+            ok=False, detail="You can only remove freelancers you added."
+        )
+    return ManagerFreelancerAddResponse(ok=True, added=target)
+
+
+# --- Admin (Bearer): manage the QM allow-list and the blocklist ---------------
+@app.post("/api/managers", dependencies=[Depends(require_api_key)])
+async def upsert_managers(req: ManagerUpsertRequest, store: Store = Depends(get_store)) -> dict:
+    """Add/update the QMs allowed to add freelancers on /managers."""
+    rows = req.items()
+    if not rows:
+        raise HTTPException(status_code=422, detail="provide 'email' (and optional 'name') or 'managers'")
+    saved: list[str] = []
+    for item in rows:
+        await store.upsert_manager(item.email, item.name)
+        saved.append(item.email)
+    return {"upserted": len(saved), "emails": saved}
+
+
+@app.get("/api/managers", dependencies=[Depends(require_api_key)])
+async def list_managers(store: Store = Depends(get_store)) -> dict:
+    rows = await store.list_managers()
+    return {"count": len(rows), "managers": rows}
+
+
+@app.delete("/api/managers/{email}", dependencies=[Depends(require_api_key)])
+async def delete_manager(email: str, store: Store = Depends(get_store)) -> dict:
+    await store.delete_manager(email)
+    return {"deleted": email.strip().lower()}
+
+
+@app.post("/api/blocklist", dependencies=[Depends(require_api_key)])
+async def upsert_blocklist(req: BlocklistUpsertRequest, store: Store = Depends(get_store)) -> dict:
+    """Add/update emails a QM may never add to the freelancers table."""
+    rows = req.items()
+    if not rows:
+        raise HTTPException(status_code=422, detail="provide 'email' (and optional 'reason') or 'blocked'")
+    saved: list[str] = []
+    for item in rows:
+        await store.upsert_blocked(item.email, item.reason)
+        saved.append(item.email)
+    return {"blocked": len(saved), "emails": saved}
+
+
+@app.get("/api/blocklist", dependencies=[Depends(require_api_key)])
+async def list_blocklist(store: Store = Depends(get_store)) -> dict:
+    rows = await store.list_blocked()
+    return {"count": len(rows), "blocked": rows}
+
+
+@app.delete("/api/blocklist/{email}", dependencies=[Depends(require_api_key)])
+async def delete_blocklist(email: str, store: Store = Depends(get_store)) -> dict:
+    await store.delete_blocked(email)
+    return {"unblocked": email.strip().lower()}
 
 
 def _login_email_from_request(req: AccountLoginRequest) -> str | None:

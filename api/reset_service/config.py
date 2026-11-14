@@ -148,6 +148,10 @@ class Settings:
     logins_use_supabase: bool = _flag("LOGINS_USE_SUPABASE", True)
     # Allow-list of freelancers permitted to open the reset page (email-only check).
     freelancers_table: str = os.environ.get("SUPABASE_FREELANCERS_TABLE", "freelancers")
+    # Allow-list of QMs (quality managers) who may add freelancers on the /managers page.
+    managers_table: str = os.environ.get("SUPABASE_MANAGERS_TABLE", "freelancer_managers")
+    # Emails a QM may never add to the freelancers table (hard denylist).
+    blocklist_table: str = os.environ.get("SUPABASE_BLOCKLIST_TABLE", "freelancer_blocklist")
     # OAuth web client id for "Sign in with Google" on the reset page (public value).
     # When set, the reset page requires a Google sign-in (email proven by Google) and
     # then checks that email against the freelancers table. When empty (dev), the page
