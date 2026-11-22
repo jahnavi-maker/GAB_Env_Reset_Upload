@@ -346,6 +346,65 @@ def _persona_dir(persona: str) -> str:
     return _match_persona(persona) or persona
 
 
+# --- Wave 2 (GAB v2 turn-split personas) ---------------------------------------------
+# Wave 2 personas live in their own root (GAB_WAVE2_ROOT) and seed seven surfaces
+# (Gmail, Calendar, Drive, Contacts, Tasks + Keep/Chat reported as manual), so they run
+# through seeder/wave2 instead of the provision pipeline. With GAB_WAVE2_ROOT unset no
+# persona ever matches and every existing path is unchanged.
+def _wave2_persona(persona: str | None) -> str | None:
+    """The Wave 2 persona folder for ``persona``, or None (feature off / not Wave 2)."""
+    _ensure_seeder_path()
+    try:
+        from wave2.personas import match  # type: ignore
+    except Exception:  # noqa: BLE001 - wave2 package missing must never break resets
+        return None
+    try:
+        return match(persona)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("wave2 persona lookup failed for %r: %s", persona, exc)
+        return None
+
+
+def _run_wave2(email: str, folder: str, mode: str, progress_id: str | None = None) -> ResetResult:
+    """Seed (upload/seed/reseed) or restore (delta/reconcile) a Wave 2 persona."""
+    _ensure_seeder_path()
+    try:
+        from wave2.creds import Wave2AuthError  # type: ignore
+        from wave2.runner import run as wave2_run  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return ResetResult(False, f"wave2 seeder unavailable: {exc}", mode)
+    log.info("reset -> wave2 email=%s persona=%s mode=%s", email, folder, mode)
+    try:
+        out = wave2_run(email, folder, mode, log=lambda m: log.info("%s", m))
+    except Wave2AuthError as exc:
+        return ResetResult(False, f"auth: {exc}", mode, returncode=1)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("wave2 %s failed for %s", mode, email)
+        return ResetResult(False, f"wave2 {mode} failed: {type(exc).__name__}: {exc}", mode, returncode=1)
+    # delta/reconcile with no baseline yet falls back to a full reseed, like the classic path.
+    effective = "reseed" if out.get("action") == "reseed" and mode in ("delta", "reconcile") else mode
+    ok = bool(out.get("ok"))
+    return ResetResult(ok, str(out.get("detail") or ""), effective, returncode=0 if ok else 1, raw=out)
+
+
+def _wave2_clean_extras(email: str) -> dict | None:
+    """Wipe Contacts/Tasks/labels/drafts/extra calendars on a clean, for accounts that hold
+    a Wave 2 grant. None (skipped) when Wave 2 is not configured or the account was never
+    authorized for it. Best-effort: never fails the clean."""
+    _ensure_seeder_path()
+    try:
+        from wave2.personas import enabled  # type: ignore
+
+        if not enabled():
+            return None
+        from wave2.runner import clean_extras  # type: ignore
+
+        return clean_extras(email, log=lambda m: log.info("%s", m))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("wave2 clean extras skipped for %s: %s", email, exc)
+        return None
+
+
 def _account_has_content(creds, *, log) -> bool:
     """True if the account already has ANY owned Drive file, Gmail message, or Calendar
     event. Cheap (one 1-item list per surface, short-circuits on the first hit); used to
@@ -1367,6 +1426,11 @@ def _run_clean(email: str, services: str | None, progress_id: str | None = None)
         except Exception as exc:  # noqa: BLE001
             log.warning("drive emptyTrash failed for %s: %s", email, exc)
 
+    # Wave 2 accounts can also hold Contacts, Tasks, labels, drafts and extra calendars.
+    # Runs only when Wave 2 is configured AND this account has a Wave 2 grant; otherwise
+    # it is skipped and the clean is exactly as before. Recorded, never fatal.
+    clean_extras = _wave2_clean_extras(email)
+
     # Verify EMPTY (the inverse of the seed verify): success = nothing owned remains.
     remaining: dict | None = {"gmail": 0, "calendar": 0, "drive": 0}
     try:
@@ -1381,6 +1445,8 @@ def _run_clean(email: str, services: str | None, progress_id: str | None = None)
         remaining = None
 
     raw = {"mode": "clean", "clean_removed": removed, "clean_remaining": remaining}
+    if clean_extras is not None:
+        raw["clean_extras"] = clean_extras
     if errors:
         return ResetResult(False, "clean incomplete: " + "; ".join(errors), "clean", returncode=1, raw=raw)
     if remaining is not None and any(remaining.get(s, 0) for s in picked):
@@ -1416,6 +1482,11 @@ def run_reset(
     if mode == "clean" or is_empty_universe_persona(persona):
         log.info("reset -> clean (empty-universe) email=%s mode=%s persona=%r", email, mode, persona)
         return _run_clean(email, svc, progress_id)
+
+    # Wave 2 persona (only possible when GAB_WAVE2_ROOT is configured): its own seeder.
+    wave2_folder = _wave2_persona(persona)
+    if wave2_folder:
+        return _run_wave2(email, wave2_folder, mode, progress_id)
 
     # Accept loosely-typed persona names (spaces / casing / underscores) by mapping to
     # the exact archive folder BEFORE either engine runs — so "Startup Founder" seeds

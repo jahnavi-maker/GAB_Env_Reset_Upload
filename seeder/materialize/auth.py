@@ -36,6 +36,18 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+# Wave 2 (GAB v2 turn-split) personas also seed Contacts and Tasks. These scopes are
+# requested ONLY when an account is authorized for a Wave 2 persona (see
+# upload.build_auth_url). Every existing load path keeps requesting SCOPES above, which
+# Google accepts as a subset of a wider grant, so a Wave 2 consent never breaks the
+# existing Gmail/Calendar/Drive resets. Sheets content is written via the Sheets API,
+# which accepts the full drive scope, so no separate spreadsheets scope is needed.
+WAVE2_EXTRA_SCOPES = [
+    "https://www.googleapis.com/auth/contacts",
+    "https://www.googleapis.com/auth/tasks",
+]
+WAVE2_SCOPES = SCOPES + WAVE2_EXTRA_SCOPES
+
 ROOT = Path(__file__).resolve().parent.parent
 TOKENS_DIR = ROOT / "tokens"
 CREDENTIALS_PATH = ROOT / "credentials.json"
@@ -344,7 +356,13 @@ def discard_creds(account_email: str) -> None:
             old.unlink()
 
 
-def make_flow(redirect_uri: str, client_path: Path | None = None) -> Flow:
+def make_flow(
+    redirect_uri: str,
+    client_path: Path | None = None,
+    extra_scopes: list[str] | None = None,
+) -> Flow:
+    """OAuth web flow. ``extra_scopes`` (e.g. WAVE2_EXTRA_SCOPES) are appended to SCOPES;
+    omitted -> exactly the original SCOPES, so every existing caller is unchanged."""
     path = client_path or CREDENTIALS_PATH
     if not path.exists():
         raise FileNotFoundError(
@@ -358,9 +376,10 @@ def make_flow(redirect_uri: str, client_path: Path | None = None) -> Flow:
             "Create a Web client with redirect "
             f"{BASE_URL}/oauth/callback and replace this file."
         )
+    scopes = SCOPES + [s for s in (extra_scopes or []) if s not in SCOPES]
     return Flow.from_client_secrets_file(
         str(path),
-        scopes=SCOPES,
+        scopes=scopes,
         redirect_uri=redirect_uri,
     )
 

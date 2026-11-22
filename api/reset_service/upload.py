@@ -58,6 +58,26 @@ def _auth():
     return auth
 
 
+def _wave2_extra_scopes(persona: str | None) -> list[str]:
+    """Contacts + Tasks scopes when ``persona`` is a Wave 2 persona (or when
+    GAB_REQUEST_WAVE2_SCOPES=1 asks for them on every authorization). Otherwise [] so an
+    existing authorization requests exactly the original scopes, unchanged."""
+    try:
+        extra = list(getattr(_auth(), "WAVE2_EXTRA_SCOPES", []) or [])
+    except Exception:  # noqa: BLE001
+        return []
+    if not extra:
+        return []
+    if (os.environ.get("GAB_REQUEST_WAVE2_SCOPES") or "").strip().lower() in ("1", "true", "yes"):
+        return extra
+    try:
+        from wave2.personas import match  # type: ignore
+
+        return extra if match(persona) else []
+    except Exception:  # noqa: BLE001 - wave2 package absent -> original behavior
+        return []
+
+
 def _db_hooks():
     import db_hooks  # type: ignore
 
@@ -250,7 +270,12 @@ def build_auth_url(email: str, persona: str, *, kind: str = "authorize",
     """
     auth = _auth()
     client_path = auth.resolve_client_path(session_id)
-    flow = auth.make_flow(settings.upload_redirect_uri, client_path=client_path)
+    # Wave 2 personas also need Contacts + Tasks; everyone else gets the original scopes.
+    extra_scopes = _wave2_extra_scopes(persona)
+    flow_kw: dict[str, Any] = {"client_path": client_path}
+    if extra_scopes:  # only then -> a non-Wave 2 authorization is the exact original call
+        flow_kw["extra_scopes"] = extra_scopes
+    flow = auth.make_flow(settings.upload_redirect_uri, **flow_kw)
     auth_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="false",
@@ -272,6 +297,9 @@ def build_auth_url(email: str, persona: str, *, kind: str = "authorize",
         # The exact web client used to start this handshake, so the callback exchanges the
         # code with the same client (concurrent operators use different clients).
         "client_path": str(client_path),
+        # Scopes beyond the default set (Wave 2). The callback must build its flow with the
+        # same scopes it asked for, or the token exchange sees a scope mismatch.
+        "extra_scopes": extra_scopes,
         "expires": time.time() + _PENDING_TTL_S,
     }
     with _pending_lock:
@@ -319,7 +347,10 @@ def complete_callback(code: str | None, state: str | None, error: str | None) ->
     # to the global client for older pending entries that predate client_path.
     _cp = pending.get("client_path")
     client_path = Path(_cp) if _cp else None
-    flow = auth.make_flow(settings.upload_redirect_uri, client_path=client_path)
+    flow_kw: dict[str, Any] = {"client_path": client_path}
+    if pending.get("extra_scopes"):  # same scopes as the auth URL asked for (Wave 2)
+        flow_kw["extra_scopes"] = pending["extra_scopes"]
+    flow = auth.make_flow(settings.upload_redirect_uri, **flow_kw)
     # Replay the PKCE verifier captured when the auth URL was built.
     flow.code_verifier = pending.get("code_verifier")
     try:
