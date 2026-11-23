@@ -161,6 +161,7 @@ class PlanVerifyTests(_Wave2Env):
 
     def test_state_lives_under_the_wave2_state_dir(self):
         from wave2 import runner
+        from wave2 import runner  # noqa: PLC0415
         b = runner.base()
         self.assertTrue(str(b.state_dir()).startswith(os.environ["GAB_WAVE2_STATE_DIR"]))
 
@@ -171,6 +172,7 @@ class RunRoutingTests(_Wave2Env):
     def _run(self, mode, baseline_folder=None, wipe_errors=()):
         from wave2 import runner
         from wave2.personas import WorldCtx
+        from wave2 import runner  # noqa: PLC0415
         b = runner.base()
         ctx = WorldCtx("test_person", ACCOUNT)
         if baseline_folder:
@@ -581,6 +583,7 @@ class DriveAttachmentTests(_Wave2Env):
     def test_a_file_with_bytes_is_uploaded_as_is_not_skipped(self):
         import base64
         from wave2 import runner
+        from wave2 import runner  # noqa: PLC0415
         b = runner.base()
         f = self.rec({"inline_bytes": base64.b64encode(self.PNG).decode()})
         self.assertEqual(b.file_kind(f), "attachment")
@@ -597,6 +600,7 @@ class DriveAttachmentTests(_Wave2Env):
 
     def test_a_file_without_bytes_keeps_the_old_path(self):
         from wave2 import runner
+        from wave2 import runner  # noqa: PLC0415
         b = runner.base()
         f = self.rec(None, mime="text/plain")
         self.assertNotEqual(b.file_kind(f), "attachment")
@@ -647,6 +651,7 @@ class RecurringCollapseTests(unittest.TestCase):
 class DriveDedupeTests(_Wave2Env):
     def test_a_twin_of_our_item_is_removed_and_its_contents_moved(self):
         from wave2 import runner
+        from wave2 import runner  # noqa: PLC0415
         b = runner.base()
         st = {"drive_folders": {"fld_1": {"id": "KEEP_F"}}, "drive_files": {"file_1": {"id": "KEEP_D"}}}
         live = [{"id": "KEEP_F", "mimeType": b.FOLDER, "appProperties": {"gab_id": b.gid("fld_1")}},
@@ -683,6 +688,7 @@ class CalendarReuseTests(_Wave2Env):
 
     def test_same_name_reused_spare_renamed_extra_deleted_none_created(self):
         runner, ctx, cmap = self._ctx_with(["Family", "Medical"])
+        from wave2 import runner  # noqa: PLC0415
         b = runner.base()
         S = MagicMock()
         owned = [{"id": "g_primary", "primary": True, "accessRole": "owner"},
@@ -703,6 +709,7 @@ class CalendarReuseTests(_Wave2Env):
 
     def test_creation_limit_falls_back_to_primary_and_fails_the_run(self):
         runner, ctx, cmap = self._ctx_with(["A", "B", "C"])
+        from wave2 import runner  # noqa: PLC0415
         b = runner.base()
         S = MagicMock()
         S.cal.calendars().insert.return_value.execute.side_effect = RuntimeError(
@@ -721,6 +728,7 @@ class CalendarReuseTests(_Wave2Env):
         S.cal.calendarList().list().execute.return_value = {"items": [
             {"id": "primary", "primary": True, "accessRole": "owner"}, {"id": "fam", "accessRole": "owner"}]}
         S.cal.events().list.side_effect = lambda **kw: MagicMock(**{"execute.return_value": {"items": [{"id": "e1"}, {"id": "e2"}]}})
+        from wave2 import runner  # noqa: PLC0415
         b = runner.base()
         one_page = lambda method, key, **kw: list((method(**kw).execute() or {}).get(key, []) or [])
         with patch.object(b, "pages", side_effect=one_page):
@@ -749,3 +757,59 @@ class GmailReadbackTests(unittest.TestCase):
         finally:
             runner._READBACK.on = False
         self.assertEqual(calls["n"], 1 + 4)
+
+
+class DocConversionFallbackTests(unittest.TestCase):
+    """Google answers 500 converting some documents' HTML to a Doc, every time; the Doc is then made from plain text."""
+
+    def setUp(self):
+        from wave2 import runner  # noqa: PLC0415
+        b = runner.base()
+        self._sleep = patch.object(b.time, "sleep", lambda *_: None)   # skip the seeder's real retry backoff
+        self._sleep.start()
+
+    def tearDown(self):
+        self._sleep.stop()
+
+    def _drive(self, fail_html_status):
+        import types  # noqa: PLC0415
+        calls = []
+
+        class Req:
+            def __init__(self, kw): self.kw = kw
+            def execute(self, **_):
+                media = self.kw.get("media_body")
+                mime = getattr(media, "mimetype", lambda: None)()
+                calls.append(mime)
+                if mime == "text/html" and fail_html_status:
+                    from googleapiclient.errors import HttpError
+                    raise HttpError(types.SimpleNamespace(status=fail_html_status, reason="Internal Error"), b"{}")
+                return {"id": "DOC1"}
+
+        class Files:
+            def create(self, **kw): return Req(kw)
+
+        return types.SimpleNamespace(drive=types.SimpleNamespace(files=lambda: Files())), calls
+
+    def test_a_server_error_on_html_falls_back_to_plain_text(self):
+        from wave2 import runner  # noqa: PLC0415
+        b = runner.base()
+        S, calls = self._drive(500)
+        self.assertEqual(b.make_google_file(S, b.DOC, "# Brief\nhello", {"name": "Nordic"}), "DOC1")
+        self.assertEqual(calls[0], "text/html")
+        self.assertEqual(calls[-1], "text/plain")
+
+    def test_html_that_converts_is_left_alone(self):
+        from wave2 import runner  # noqa: PLC0415
+        b = runner.base()
+        S, calls = self._drive(None)
+        self.assertEqual(b.make_google_file(S, b.DOC, "hello", {"name": "ok"}), "DOC1")
+        self.assertEqual(calls, ["text/html"])
+
+    def test_client_errors_still_raise(self):
+        from wave2 import runner  # noqa: PLC0415
+        b = runner.base()
+        S, _ = self._drive(403)
+        from googleapiclient.errors import HttpError
+        with self.assertRaises(HttpError):
+            b.make_google_file(S, b.DOC, "hello", {"name": "denied"})

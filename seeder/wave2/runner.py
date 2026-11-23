@@ -148,6 +148,27 @@ def base():
                 return _upload_attachment(gab_seed, S, st, f, data)
 
             gab_seed.create_drive_file = _create_drive_file
+            # Google's HTML -> Doc conversion answers 500 "Internal Error" on some documents, every
+            # time (Bianca's "Nordic DTU Academic Partnership ..." brief). The same text uploaded as
+            # plain text converts fine, so on a server error the Doc is made from plain text instead.
+            _orig_make = gab_seed.make_google_file
+
+            def _make_google_file(S, gtype, text, meta):
+                try:
+                    return _orig_make(S, gtype, text, meta)
+                except Exception as exc:  # noqa: BLE001 - only Google server errors on a Doc fall back
+                    status = getattr(getattr(exc, "resp", None), "status", None)
+                    if gtype != gab_seed.DOC or not (isinstance(status, int) and status >= 500):
+                        raise
+                    from googleapiclient.http import MediaInMemoryUpload  # noqa: PLC0415
+
+                    LOG.warning("wave2: Google could not convert %r from HTML (HTTP %s); uploading it as plain text",
+                                meta.get("name"), status)
+                    media = MediaInMemoryUpload((text or "").encode("utf-8"), mimetype="text/plain", resumable=False)
+                    return gab_seed.ex(S.drive.files().create(body=dict(meta, mimeType=gtype), media_body=media,
+                                                              fields="id"))["id"]
+
+            gab_seed.make_google_file = _make_google_file
             # Every seeded/restored item ends with save_state(ctx, st); piggy-back on it to
             # publish live per-surface counts for the Wave 2 page (throttled, per account).
             _orig_save = gab_seed.save_state
