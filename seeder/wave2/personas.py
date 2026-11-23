@@ -180,41 +180,92 @@ def collapse_recurring_events(bc: dict[str, Any]) -> int:
     The Wave 2 worlds store every weekly/daily occurrence of a repeating event as its own
     record, each carrying the full RRULE (Adrian's Sunday long run: 8 records, each
     'RRULE:FREQ=WEEKLY;BYDAY=SU'). Creating each one makes 8 overlapping series, so every
-    Sunday shows 8 copies. Records of the same series (calendar, title, rule, local time of
-    day, length — and weekday when the rule has no BYDAY) keep only the earliest, which
-    already produces all the later occurrences. Returns how many records were dropped."""
+    Sunday shows 8 copies. The weekly files also disagree with each other: the rule, length
+    and calendar id of the same event change between weeks, and some weeks store it as a
+    one-off. So records are grouped by base title (the part before ':') and local time of
+    day, and the stored dates are treated as the truth:
+
+    - every record is shown once, on its own stored date, with its own title, length and
+      description (day-specific agendas such as 'Client Focus Block: Apex Labs …' are kept);
+    - only the newest plain-titled repeating record keeps its rule, so the event continues
+      after the data ends; any later stored record of that group is excluded from it
+      (EXDATE) so its day shows one event, not two;
+    - exact copies of a slot already shown are dropped.
+    Returns how many records were changed or dropped."""
     import datetime as _dt
 
     cal = bc.get("CALENDAR")
     events = ((cal or {}).get("calendar_events_info") or {}).get("events") if isinstance(cal, dict) else None
     if not isinstance(events, list):
         return 0
-    first: dict[tuple, dict[str, Any]] = {}
-    drop: set[int] = set()
+
+    def rules_of(e: dict[str, Any]) -> list[str]:
+        return [r.strip() for r in (e.get("recurrence_data") or e.get("recurrence") or []) if isinstance(r, str) and r.strip()]
+
+    def strip_rules(e: dict[str, Any]) -> None:
+        for f in ("recurrence_data", "recurrence"):
+            if f in e:
+                e[f] = []
+
+    # Group every record (repeating or not) by base title + local time of day. The weekly
+    # files disagree with each other (rule, length and calendar id change between weeks), so
+    # the stored dates are the truth: each record is shown on its own date, and only the
+    # newest plain repeating record keeps its rule so the event continues past the data.
+    groups: dict[tuple, list[tuple[int, int]]] = {}
+    has_rule: set[tuple] = set()
     for i, e in enumerate(events):
-        if not isinstance(e, dict):
-            continue
-        rules = [r.strip() for r in (e.get("recurrence_data") or e.get("recurrence") or []) if isinstance(r, str) and r.strip()]
-        st = _event_start(e)
-        if not rules or st is None:
+        st = _event_start(e) if isinstance(e, dict) else None
+        if st is None:
             continue
         local = _dt.datetime.utcfromtimestamp((st[0] + st[1]) / 1000)
-        en = (e.get("end") or {}).get("date_time") if isinstance(e.get("end"), dict) else None
-        length = (int(en["time_ms"]) - st[0]) if isinstance(en, dict) and en.get("time_ms") is not None else None
-        by_day = any("BYDAY=" in r or "BYMONTHDAY=" in r or "FREQ=DAILY" in r for r in rules)
-        key = (e.get("calendar_id"), " ".join(str(e.get("summary") or "").split()).lower(), tuple(sorted(rules)),
-               local.strftime("%H:%M"), length, None if by_day else local.weekday())
-        keep = first.get(key)
-        if keep is None:
-            first[key] = {"i": i, "t": st[0]}
-        elif st[0] < keep["t"]:
-            drop.add(keep["i"])
-            first[key] = {"i": i, "t": st[0]}
-        else:
-            drop.add(i)
+        base = " ".join(str(e.get("summary") or "").split()).split(":", 1)[0].strip().lower()
+        key = (base, local.strftime("%H:%M"))
+        groups.setdefault(key, []).append((st[0], i))
+        if rules_of(e):
+            has_rule.add(key)
+
+    # A title whose time of day changed between weeks forms two groups; only the group with
+    # the newest plain repeating record continues, the older time stays on its stored dates.
+    newest_by_title: dict[str, tuple[int, tuple]] = {}
+    for key in has_rule:
+        for t, i in groups[key]:
+            if rules_of(events[i]) and " ".join(str(events[i].get("summary") or "").split()).lower() == key[0]:
+                if t > newest_by_title.get(key[0], (-1, None))[0]:
+                    newest_by_title[key[0]] = (t, key)
+
+    drop: set[int] = set()
+    changed = 0
+    for key in has_rule:
+        if newest_by_title.get(key[0], (None, key))[1] != key:
+            for t, i in groups[key]:                 # an older time of this title: stored dates only
+                if rules_of(events[i]):
+                    strip_rules(events[i])
+                    changed += 1
+        members = sorted(groups[key])
+        is_plain = lambda i: " ".join(str(events[i].get("summary") or "").split()).lower() == key[0]
+        plain_series = [(t, i) for t, i in members if rules_of(events[i]) and is_plain(i)]
+        series_t, series_i = plain_series[-1] if plain_series else (None, None)
+        seen: dict[int, int] = {}                    # start instant -> kept record (one event per slot)
+        exdates = []
+        for t, i in members:
+            if i == series_i:
+                continue
+            if t in seen or (series_t is not None and t == series_t):
+                drop.add(i)                          # an exact copy of a slot we already show
+                changed += 1
+                continue
+            seen[t] = i
+            if rules_of(events[i]):
+                strip_rules(events[i])               # shown once, on its own stored date
+                changed += 1
+            if series_t is not None and t > series_t:
+                exdates.append(_dt.datetime.utcfromtimestamp(t / 1000).strftime("EXDATE:%Y%m%dT%H%M%SZ"))
+        if exdates:
+            field = "recurrence_data" if events[series_i].get("recurrence_data") else "recurrence"
+            events[series_i][field] = list(events[series_i].get(field) or []) + sorted(set(exdates))
     if drop:
         cal["calendar_events_info"]["events"] = [e for i, e in enumerate(events) if i not in drop]
-    return len(drop)
+    return changed
 
 
 def _drive_ctx(bc: dict[str, Any]) -> dict[str, Any]:

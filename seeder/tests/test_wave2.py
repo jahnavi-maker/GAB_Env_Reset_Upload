@@ -613,16 +613,30 @@ class RecurringCollapseTests(unittest.TestCase):
             e[key] = list(rule)
         return e
 
-    def test_weekly_copies_of_one_series_become_one(self):
+    def test_weekly_copies_show_once_and_only_the_newest_repeats(self):
         from wave2.personas import collapse_recurring_events
         t0 = 1789300800000
-        evs = [self.ev(i, t0 + i * self.WEEK) for i in (3, 0, 1, 2)]           # out of order on purpose
-        evs += [self.ev(9, t0, summary="Dentist", rule=None),                    # one-off: untouched
-                self.ev(10, t0 + 3600000 * 2, key="recurrence")]                 # same rule, other time: own series
+        evs = [self.ev(i, t0 + i * self.WEEK, cal=f"c{i % 2}") for i in (3, 0, 1, 2)]   # calendar id differs by week
+        evs += [self.ev(9, t0, summary="Dentist", rule=None),                    # unrelated one-off: untouched
+                self.ev(10, t0 + 3600000 * 2, key="recurrence"),                 # same title, older time: stored date only
+                self.ev(11, t0 + self.WEEK, rule=None)]                          # one-off exact copy of a stored slot
         bc = {"CALENDAR": {"calendar_events_info": {"events": evs}}}
-        self.assertEqual(collapse_recurring_events(bc), 3)
-        kept = [e["id"] for e in bc["CALENDAR"]["calendar_events_info"]["events"]]
-        self.assertEqual(kept, ["e0", "e9", "e10"])                              # the earliest copy is kept
+        collapse_recurring_events(bc)
+        out = {e["id"]: e for e in bc["CALENDAR"]["calendar_events_info"]["events"]}
+        self.assertNotIn("e11", out)                                             # duplicate slot dropped
+        repeating = [i for i, e in out.items() if e.get("recurrence_data") or e.get("recurrence")]
+        self.assertEqual(repeating, ["e3"])                                      # only the newest keeps its rule
+        self.assertEqual(sorted(out), ["e0", "e1", "e10", "e2", "e3", "e9"])     # every stored date is still shown
+
+    def test_a_day_specific_agenda_after_the_series_start_is_excluded_from_it(self):
+        from wave2.personas import collapse_recurring_events
+        t0 = 1789300800000
+        series = self.ev(1, t0, summary="Focus Block")
+        agenda = self.ev(2, t0 + self.WEEK, summary="Focus Block: Apex Labs review")
+        bc = {"CALENDAR": {"calendar_events_info": {"events": [series, agenda]}}}
+        collapse_recurring_events(bc)
+        self.assertEqual(agenda["recurrence_data"], [])                          # shown once, on its own day
+        self.assertIn("EXDATE:", " ".join(series["recurrence_data"]))           # and not also as the series
 
     def test_nothing_to_do(self):
         from wave2.personas import collapse_recurring_events
