@@ -65,6 +65,14 @@ class SupabaseJobStoreTests(unittest.IsolatedAsyncioTestCase):
         params = rec.requests[0].url.params
         self.assertEqual((params["status"], params["account"], params["correlation->>reset_session_id"], params["limit"], params["order"]),
                          ("eq.queued", "eq.a@example.com", "eq.rs-1", "50", "created_at.asc,job_id.asc"))
+        self.assertNotIn("offset", params)
+
+    async def test_list_can_page_go_newest_first_and_filter_by_workflow_and_age(self):
+        rec = Recorder((200, [JOB]))
+        await rec.store().list(status="queued", workflow="keep-seed", limit=500, offset=1000, newest_first=True, created_before="2026-11-24T00:00:00+00:00")
+        params = rec.requests[0].url.params
+        self.assertEqual((params["workflow"], params["offset"], params["order"], params["created_at"]),
+                         ("eq.keep-seed", "1000", "created_at.desc,job_id.desc", "lt.2026-11-24T00:00:00+00:00"))
 
     async def test_update_if_is_a_conditional_patch_and_returns_the_updated_row(self):
         updated = {**JOB, "status": "running", "attempt": 1}

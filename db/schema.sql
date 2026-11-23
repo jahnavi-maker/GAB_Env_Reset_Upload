@@ -235,3 +235,12 @@ create table if not exists module_workers (
     pack_version  text,
     last_seen     timestamptz not null
 );
+
+-- module_jobs.inventory : what the worker saw in Keep after a run ({home:[titles], archive:[titles], trash:[titles]}), so the
+-- platform can check every expected note is there once and nothing else is. Optional: older workers do not send it.
+alter table module_jobs add column if not exists inventory jsonb;
+
+-- Row-level security on: with no policies, only the service-role key (which the platform uses) can read or write these tables.
+-- The anon key sees nothing, so account emails and follow-ups are not exposed through PostgREST.
+alter table module_jobs    enable row level security;
+alter table module_workers enable row level security;

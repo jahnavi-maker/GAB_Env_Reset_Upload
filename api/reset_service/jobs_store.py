@@ -34,7 +34,10 @@ class JobStore:
     async def find_by_request_id(self, request_id: str) -> Optional[dict[str, Any]]:
         raise NotImplementedError
 
-    async def list(self, status: str | None = None, account: str | None = None, reset_session_id: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
+    async def list(self, status: str | None = None, account: str | None = None, reset_session_id: str | None = None, limit: int = 500,
+                   offset: int = 0, newest_first: bool = False, created_before: str | None = None, workflow: str | None = None) -> list[dict[str, Any]]:
+        """Jobs matching every filter given. ``offset`` pages through more than ``limit`` rows; ``newest_first`` flips the order
+        (created_at, job_id); ``created_before`` keeps rows created strictly before that ISO time."""
         raise NotImplementedError
 
     async def update_if(self, job_id: str, expected: dict[str, Any], fields: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -70,15 +73,17 @@ class MemoryJobStore(JobStore):
                 return copy.deepcopy(job)
         return None
 
-    async def list(self, status=None, account=None, reset_session_id=None, limit=500):
+    async def list(self, status=None, account=None, reset_session_id=None, limit=500, offset=0, newest_first=False, created_before=None, workflow=None):
         rows = [
             j for j in self._jobs.values()
             if (status is None or j["status"] == status)
             and (account is None or j["account"] == account)
+            and (workflow is None or j["workflow"] == workflow)
             and (reset_session_id is None or (j.get("correlation") or {}).get("reset_session_id") == reset_session_id)
+            and (created_before is None or j["created_at"] < created_before)
         ]
-        rows.sort(key=lambda j: (j["created_at"], j["job_id"]))
-        return [copy.deepcopy(j) for j in rows[:limit]]
+        rows.sort(key=lambda j: (j["created_at"], j["job_id"]), reverse=newest_first)
+        return [copy.deepcopy(j) for j in rows[offset:offset + limit]]
 
     async def update_if(self, job_id, expected, fields):
         job = self._jobs.get(job_id)
@@ -135,8 +140,15 @@ class SupabaseJobStore(JobStore):
     async def find_by_request_id(self, request_id):
         return await self._one({"request_id": f"eq.{request_id}"})
 
-    async def list(self, status=None, account=None, reset_session_id=None, limit=500):
-        params = {"order": "created_at.asc,job_id.asc", "limit": str(limit)}
+    async def list(self, status=None, account=None, reset_session_id=None, limit=500, offset=0, newest_first=False, created_before=None, workflow=None):
+        order = "created_at.desc,job_id.desc" if newest_first else "created_at.asc,job_id.asc"
+        params = {"order": order, "limit": str(limit)}
+        if offset:
+            params["offset"] = str(offset)
+        if workflow is not None:
+            params["workflow"] = f"eq.{workflow}"
+        if created_before is not None:
+            params["created_at"] = f"lt.{created_before}"
         if status is not None:
             params["status"] = f"eq.{status}"
         if account is not None:

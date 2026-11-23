@@ -179,9 +179,6 @@ class WiringTests(unittest.TestCase):
         self.assertTrue({"/api/jobs", "/api/jobs/{job_id}", "/api/followups", "/api/worker/claim"} <= paths)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # --------------------------------------------------------------------------- #
 # Screenshots: a worker uploads what the window showed when a job needed a person; callers fetch it.
@@ -263,3 +260,7 @@ class ScreenshotTests(unittest.TestCase):
         c = make_client_with_files()
         for bad in ("../../etc/passwd", "..%2F..%2Fsecret", "a/b"):
             self.assertIn(c.get(f"/api/jobs/{bad}/screenshot", headers=CALLER).status_code, (404, 422))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -7,6 +7,7 @@ Neither key opens the other's routes. The worker routes stay off (503) until WOR
 """
 from __future__ import annotations
 
+import asyncio
 import hmac
 from typing import Any, Callable
 
@@ -58,8 +59,10 @@ def build_router(get_service: Callable[[], JobService], require_caller: Callable
         return out
 
     @router.get("/api/jobs", dependencies=caller)
-    async def list_jobs(status: str | None = None, reset_session_id: str | None = None):
-        return await call(lambda svc: svc.list_jobs(status=status, reset_session_id=reset_session_id))
+    async def list_jobs(status: str | None = None, reset_session_id: str | None = None, account: str | None = None,
+                        workflow: str | None = None, limit: int = 500):
+        return await call(lambda svc: svc.list_jobs(status=status, reset_session_id=reset_session_id, account=account,
+                                                     workflow=workflow, limit=limit))
 
     @router.get("/api/jobs/{job_id}", dependencies=caller)
     async def get_job(job_id: str):
@@ -84,7 +87,7 @@ def build_router(get_service: Callable[[], JobService], require_caller: Callable
     @router.get("/api/jobs/{job_id}/screenshot", dependencies=caller)
     async def screenshot(job_id: str):
         files = get_files() if get_files else None
-        data = files.get(job_id) if files else None
+        data = await asyncio.to_thread(files.get, job_id) if files else None   # disk I/O off the event loop
         if data is None:
             raise HTTPException(status_code=404, detail="no screenshot for this job")
         return Response(content=data, media_type="image/png", headers={"Cache-Control": "no-store"})
@@ -97,13 +100,14 @@ def build_router(get_service: Callable[[], JobService], require_caller: Callable
 
     @router.post("/api/worker/jobs/{job_id}/heartbeat", dependencies=worker)
     async def heartbeat(job_id: str, payload: dict = Body(...)):
-        return await call(lambda svc: svc.heartbeat(job_id, str(payload.get("worker_id") or "")))
+        return await call(lambda svc: svc.heartbeat(job_id, str(payload.get("worker_id") or ""), attempt=payload.get("attempt")))
 
     @router.post("/api/worker/jobs/{job_id}/result", dependencies=worker)
     async def result(job_id: str, payload: dict = Body(...)):
         return await call(lambda svc: svc.result(
             job_id, str(payload.get("worker_id") or ""), str(payload.get("outcome") or ""),
-            summary=payload.get("summary"), follow_up=payload.get("follow_up"), pack_version=payload.get("pack_version")))
+            summary=payload.get("summary"), follow_up=payload.get("follow_up"), pack_version=payload.get("pack_version"),
+            attempt=payload.get("attempt"), inventory=payload.get("inventory")))
 
     @router.post("/api/worker/jobs/{job_id}/screenshot", dependencies=worker, status_code=201)
     async def upload_screenshot(job_id: str, request: Request, x_worker_id: str | None = Header(default=None)):
@@ -119,7 +123,7 @@ def build_router(get_service: Callable[[], JobService], require_caller: Callable
             raise too_large
         if not body.startswith(PNG_MAGIC):
             raise HTTPException(status_code=422, detail="the screenshot must be a PNG image")
-        files.put(job_id, body)
+        await asyncio.to_thread(files.put, job_id, body)   # disk I/O off the event loop
         return {"url": f"/api/jobs/{job_id}/screenshot"}
 
     return router

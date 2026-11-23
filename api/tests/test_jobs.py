@@ -337,5 +337,96 @@ class CancelTests(JobsTestBase):
         self.assertEqual(out["status"], "cancelled")
 
 
+class ReviewFixTests(JobsTestBase):
+    """Fixes from the PR review: cancel honoured at lease expiry, no 500-row blind spot, stale attempts refused, result fields checked."""
+
+    async def test_a_cancelled_running_job_whose_lease_runs_out_is_cancelled_not_requeued(self):
+        await self.svc.enqueue(seed_payload())
+        job = await self.svc.claim(worker("mac-1"))
+        await self.svc.cancel(job["job_id"])   # running: only asks the worker to stop
+        self.clock.advance(601)                # the worker never reports back
+        self.assertIsNone(await self.svc.claim(worker("mac-2")), "the cancelled job must not be handed out again")
+        self.assertEqual((await self.svc.get(job["job_id"]))["status"], "cancelled")
+
+    async def test_a_queued_job_with_a_cancel_request_is_never_claimed(self):
+        job = (await self.svc.enqueue(seed_payload()))["job"]
+        await self.store.update_if(job["job_id"], {"status": "queued"}, {"cancel_requested": True})
+        self.assertIsNone(await self.svc.claim(worker()))
+
+    async def test_a_worker_still_gets_its_job_behind_more_than_a_page_of_jobs_it_cannot_take(self):
+        for n in range(self.svc._PAGE + 5):   # queued for accounts no worker has
+            await self.svc.enqueue(seed_payload(request_id=f"req-orphan-{n:04d}", account=f"nobody{n}@example.com"))
+        mine = (await self.svc.enqueue(seed_payload(request_id="req-mine-0001")))["job"]
+        got = await self.svc.claim(worker())
+        self.assertIsNotNone(got)
+        self.assertEqual(got["job_id"], mine["job_id"])
+
+    async def test_new_follow_ups_and_queued_jobs_are_listed_even_after_a_long_history(self):
+        for n in range(self.svc._PAGE + 5):
+            old = (await self.svc.enqueue(seed_payload(request_id=f"req-old-{n:04d}")))["job"]
+            await self.svc.cancel(old["job_id"])
+        self.clock.advance(1)
+        await self.svc.enqueue(seed_payload(request_id="req-new-0001"))
+        job = await self.svc.claim(worker())
+        await self.svc.result(job["job_id"], "mac-1", "needs_manual", follow_up={"code": "SIGN_IN_NEEDED", "reason": "Signed out.", "needs": "sign-in"})
+        self.assertEqual([j["job_id"] for j in await self.svc.follow_ups()], [job["job_id"]])
+        self.clock.advance(1)
+        queued = (await self.svc.enqueue(seed_payload(request_id="req-new-0002")))["job"]
+        self.assertEqual([j["job_id"] for j in await self.svc.list_jobs(status="queued")], [queued["job_id"]])
+
+    async def test_jobs_can_be_listed_by_account_and_workflow_newest_first(self):
+        a = (await self.svc.enqueue(seed_payload(request_id="req-a-000001")))["job"]
+        self.clock.advance(1)
+        b = (await self.svc.enqueue(seed_payload(request_id="req-b-000001")))["job"]
+        await self.svc.enqueue(seed_payload(request_id="req-c-000001", account=A2))
+        await self.svc.enqueue({"request_id": "req-d-000001", "workflow": "keep-wipe", "account": A1})
+        listed = await self.svc.list_jobs(account=A1.upper(), workflow="keep-seed")
+        self.assertEqual([j["job_id"] for j in listed], [b["job_id"], a["job_id"]])
+        self.assertEqual(len(await self.svc.list_jobs(account=A1, workflow="keep-seed", limit=1)), 1)
+
+    async def test_a_late_report_from_an_earlier_attempt_cannot_close_the_newer_attempt_of_the_same_worker(self):
+        await self.svc.enqueue(seed_payload())
+        first = await self.svc.claim(worker("mac-1"))
+        await self.svc.result(first["job_id"], "mac-1", "retry", attempt=1, follow_up={"code": "CLICK_FAILED", "reason": "A click did not work.", "needs": "check"})
+        second = await self.svc.claim(worker("mac-1"))   # the same worker takes attempt 2
+        self.assertEqual(second["attempt"], 2)
+        with self.assertRaises(JobError):
+            await self.svc.result(first["job_id"], "mac-1", "failed", attempt=1, follow_up={"code": "X_FAILED", "reason": "late copy of attempt 1", "needs": "check"})
+        with self.assertRaises(JobError):
+            await self.svc.heartbeat(first["job_id"], "mac-1", attempt=1)
+        self.assertEqual((await self.svc.get(first["job_id"]))["status"], "running")
+        done = await self.svc.result(first["job_id"], "mac-1", "done", attempt=2, summary="ok")
+        self.assertEqual(done["status"], "done")
+        again = await self.svc.result(first["job_id"], "mac-1", "done", attempt=2, summary="ok")   # a retried copy of the same report
+        self.assertEqual(again["finished_at"], done["finished_at"])
+
+    async def test_reports_without_an_attempt_number_still_work(self):
+        await self.svc.enqueue(seed_payload())
+        job = await self.svc.claim(worker())
+        await self.svc.heartbeat(job["job_id"], "mac-1")
+        self.assertEqual((await self.svc.result(job["job_id"], "mac-1", "done"))["status"], "done")
+
+    async def test_a_bad_attempt_or_data_version_in_a_report_is_refused_by_name(self):
+        await self.svc.enqueue(seed_payload())
+        job = await self.svc.claim(worker())
+        for bad in ({"attempt": "1"}, {"attempt": 0}, {"attempt": True}, {"pack_version": {"sha": "x"}}, {"pack_version": "x" * 101}):
+            with self.subTest(bad=bad), self.assertRaises(InvalidJob):
+                await self.svc.result(job["job_id"], "mac-1", "done", **bad)
+
+    async def test_the_keep_inventory_a_worker_reports_is_stored(self):
+        await self.svc.enqueue(seed_payload())
+        job = await self.svc.claim(worker())
+        inv = {"home": ["Groceries", " Reading list "], "archive": [], "trash": []}
+        out = await self.svc.result(job["job_id"], "mac-1", "done", summary="2 created", inventory=inv)
+        self.assertEqual(out["inventory"], {"home": ["Groceries", "Reading list"], "archive": [], "trash": []})
+
+    async def test_a_malformed_inventory_is_refused(self):
+        await self.svc.enqueue(seed_payload())
+        job = await self.svc.claim(worker())
+        for bad in ("home", {"home": "x"}, {"pinned": []}, {"home": [1]}, {"home": ["t"] * 501}):
+            with self.subTest(bad=bad), self.assertRaises(InvalidJob):
+                await self.svc.result(job["job_id"], "mac-1", "done", inventory=bad)
+
+
 if __name__ == "__main__":
     unittest.main()

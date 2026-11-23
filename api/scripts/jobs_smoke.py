@@ -4,8 +4,9 @@
     BASE_URL=http://127.0.0.1:8791 CALLER_KEY=... WORKER_KEY=... python api/scripts/jobs_smoke.py [--fast]
 
 It plays both roles with a made-up account (smoke-test@example.com) and a made-up worker (smoke-worker), so no real worker or real
-Google account is ever involved: a real worker only takes jobs for accounts it has signed in. It leaves nothing open: every job it creates
-ends cancelled, resolved or done.
+Google account is ever involved: a real worker only takes jobs for accounts it has signed in. It leaves no job open: every job it creates
+ends cancelled, resolved or done, and if a step fails part-way the jobs it made are cancelled (or closed as failed) before it exits.
+The made-up workers (smoke-worker, smoke-other, ...) do stay in module_workers; they hold only the made-up accounts.
 
 --fast also checks lease expiry and the "nobody can take this job" view. Those need short timings, so start the platform with
 JOB_LEASE_S=3 JOB_UNROUTABLE_AFTER_S=3 JOB_WORKER_LIVE_S=2 first. Do not use --fast against production.
@@ -27,6 +28,7 @@ FAST = "--fast" in sys.argv
 RUN = uuid.uuid4().hex[:8]
 client = httpx.Client(base_url=BASE, timeout=20.0)
 failures: list[str] = []
+ACCOUNTS = [ACCOUNT]   # every made-up account a job was created for, so cleanup can find them
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
@@ -49,7 +51,37 @@ def section(title: str) -> None:
     print(f"\n{title}")
 
 
+def cleanup() -> None:
+    """Close every job this run left open: queued or waiting ones are cancelled, running ones are reported failed by their worker."""
+    for account in ACCOUNTS:
+        try:
+            r = client.get("/api/jobs", headers=CALLER, params={"account": account})
+            if r.status_code != 200:
+                continue
+            for j in r.json():
+                if not str(j.get("request_id", "")).startswith(f"smoke-{RUN}-"):
+                    continue
+                if j["status"] in ("queued", "needs_manual"):
+                    client.post(f"/api/jobs/{j['job_id']}/cancel", headers=CALLER)
+                elif j["status"] == "running":
+                    client.post(f"/api/worker/jobs/{j['job_id']}/result", headers=WORKER, json={
+                        "worker_id": j["worker_id"], "outcome": "failed",
+                        "follow_up": {"code": "SMOKE_ABORTED", "reason": "The smoke test stopped part-way and closed this job.", "needs": "none"}})
+        except httpx.HTTPError:
+            pass
+
+
 def main() -> int:
+    try:
+        return checks()
+    except (KeyError, TypeError, ValueError, httpx.HTTPError) as exc:   # an answer the next step could not use: stop, do not guess
+        print(f"\nstopped part-way: {type(exc).__name__}: {exc}")
+        return 1
+    finally:
+        cleanup()
+
+
+def checks() -> int:
     section("platform")
     r = client.get("/healthz")
     check("healthz answers", r.status_code == 200, f"{r.status_code} {r.text[:120]}")
@@ -66,6 +98,9 @@ def main() -> int:
     r = client.post("/api/jobs", headers=CALLER, json=job(1))
     first = r.json() if r.status_code in (200, 201) else {}
     check("a job is queued (201)", r.status_code == 201 and first.get("job", {}).get("status") == "queued", f"{r.status_code} {r.text[:160]}")
+    if not first.get("job"):
+        print("\nthe first job could not be created, so the rest cannot run (is the schema applied?)")
+        return 1
     check("it is not routable yet: no worker has the account", first.get("routable") is False)
     r = client.post("/api/jobs", headers=CALLER, json=job(1))
     check("the same request again returns the same job (200)", r.status_code == 200 and r.json()["job"]["job_id"] == first["job"]["job_id"])
@@ -121,6 +156,7 @@ def main() -> int:
         check("after the lease ran out another worker gets it as attempt 2", r.status_code == 200 and r.json()["job"]["attempt"] == 2 and r.json()["job"]["worker_id"] == "smoke-worker-2", f"{r.status_code} {r.text[:160]}")
         client.post(f"/api/worker/jobs/{lease_id}/result", headers=WORKER, json={"worker_id": "smoke-worker-2", "outcome": "done", "summary": "smoke"})
         orphan = f"nobody-{RUN}@example.com"
+        ACCOUNTS.append(orphan)
         r = client.post("/api/jobs", headers=CALLER, json=job(5, account=orphan))
         orphan_id = r.json()["job"]["job_id"]
         check("a job for an account no worker has is flagged at once as not routable", r.json()["routable"] is False)

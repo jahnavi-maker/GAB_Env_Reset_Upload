@@ -22,6 +22,7 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
     "keep-wipe": {"persona": False, "modes": (), "default_mode": None},
 }
 NEEDS = ("sign-in", "verification", "check", "none")
+INVENTORY_VIEWS = ("home", "archive", "trash")   # Keep's views, as the worker reports what it saw in each after a run
 OUTCOMES = ("done", "needs_manual", "retry", "failed")
 _STATUS_FOR_OUTCOME = {"done": "done", "needs_manual": "needs_manual", "failed": "failed"}   # a retry has no status of its own: it re-queues
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{8,100}$")
@@ -125,7 +126,7 @@ class JobService:
                 "persona": request["persona"], "mode": request["mode"], "correlation": request["correlation"], "max_attempts": request["max_attempts"],
                 "pack_version": request["pack_version"], "request": request, "status": "queued", "attempt": 0, "worker_id": None,
                 "lease_expires_at": None, "created_at": now, "updated_at": now, "started_at": None, "finished_at": None, "summary": None,
-                "follow_up": None, "resolution_note": None, "pack_version_used": None, "cancel_requested": False,
+                "follow_up": None, "resolution_note": None, "pack_version_used": None, "cancel_requested": False, "inventory": None,
                 "events": [{"at": now, "event": "queued"}],
             }
             try:
@@ -198,14 +199,34 @@ class JobService:
             raise InvalidJob("pack_version: must be text")
         return {"worker_id": worker_id, "pack_version": pack_version, **lists}
 
+    _PAGE = 500
+
+    async def _pages(self, **filters: Any):
+        """Every matching job, oldest first, a page at a time: the store's limit never hides newer rows."""
+        offset = 0
+        while True:
+            rows = await self.store.list(limit=self._PAGE, offset=offset, **filters)
+            for row in rows:
+                yield row
+            if len(rows) < self._PAGE:
+                return
+            offset += len(rows)
+
+    async def _all(self, **filters: Any) -> list[dict[str, Any]]:
+        return [row async for row in self._pages(**filters)]
+
     async def _expire_leases(self) -> None:
-        """A running job whose lease has passed goes back to the queue, or to a person once its attempts are used up."""
+        """A running job whose lease has passed goes back to the queue, or to a person once its attempts are used up.
+        A job somebody asked to cancel is cancelled instead: it never goes back to the queue."""
         now = self._now()
-        for job in await self.store.list(status="running"):
+        for job in await self._all(status="running"):
             if job["lease_expires_at"] and _parse(job["lease_expires_at"]) <= now:
                 stamp = _iso(now)
                 event = {"at": stamp, "event": "lease expired", "worker_id": job["worker_id"]}
-                if job["attempt"] >= job["max_attempts"]:
+                if job.get("cancel_requested"):
+                    fields = {"status": "cancelled", "lease_expires_at": None, "finished_at": stamp, "updated_at": stamp,
+                              "events": job["events"] + [event, {"at": stamp, "event": "cancelled"}]}
+                elif job["attempt"] >= job["max_attempts"]:
                     fields = {"status": "needs_manual", "lease_expires_at": None, "finished_at": stamp, "updated_at": stamp, "events": job["events"] + [event],
                               "follow_up": {"code": "LEASE_EXPIRED", "needs": "check", "step": None, "screenshot": None,
                                             "reason": f"The worker ({job['worker_id']}) stopped reporting and the attempts are used up."}}
@@ -218,9 +239,9 @@ class JobService:
         now = self._now()
         await self.store.upsert_worker({**spec, "last_seen": _iso(now)})
         await self._expire_leases()
-        busy = {j["account"] for j in await self.store.list(status="running")}
-        for job in await self.store.list(status="queued"):
-            if job["account"] in busy or not self._capable(spec, job):
+        busy = {j["account"] for j in await self._all(status="running")}
+        async for job in self._pages(status="queued"):
+            if job["account"] in busy or job.get("cancel_requested") or not self._capable(spec, job):
                 continue
             stamp = _iso(now)
             won = await self.store.update_if(
@@ -233,20 +254,31 @@ class JobService:
         return None
 
     # -------------------------------------------------------- heartbeat, result
-    async def _held(self, job_id: str, worker_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _attempt(value: Any) -> Optional[int]:
+        """The attempt number a worker was given on claim, echoed back on heartbeat and result. Optional, so older workers keep working."""
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise InvalidJob("attempt: the whole number the claim returned")
+        return value
+
+    async def _held(self, job_id: str, worker_id: str, attempt: Optional[int] = None) -> dict[str, Any]:
         job = await self.store.get(job_id)
         if not job:
             raise NotFound("no such job")
         if job["status"] != "running" or job["worker_id"] != worker_id:
             raise JobError("this job is not held by this worker")
+        if attempt is not None and attempt != job["attempt"]:
+            raise JobError("this report is for an earlier attempt of the job")
         return job
 
     async def holds(self, job_id: str, worker_id: str) -> dict[str, Any]:
         """The running job this worker holds, or NotFound / JobError. Used before accepting a file from the worker."""
         return await self._held(job_id, worker_id)
 
-    async def heartbeat(self, job_id: str, worker_id: str) -> dict[str, Any]:
-        job = await self._held(job_id, worker_id)
+    async def heartbeat(self, job_id: str, worker_id: str, attempt: Any = None) -> dict[str, Any]:
+        job = await self._held(job_id, worker_id, self._attempt(attempt))
         now = self._now()
         lease = _iso(now + timedelta(seconds=self.lease_s))
         done = await self.store.update_if(job_id, {"status": "running", "attempt": job["attempt"], "worker_id": worker_id}, {"lease_expires_at": lease, "updated_at": _iso(now)})
@@ -268,22 +300,46 @@ class JobService:
                 out[key] = _text(value[key], f"follow_up.{key}", limit)
         return out
 
-    async def result(self, job_id: str, worker_id: str, outcome: str, summary: str | None = None, follow_up: Any = None, pack_version: str | None = None) -> dict[str, Any]:
+    @staticmethod
+    def _inventory(value: Any) -> Optional[dict[str, list[str]]]:
+        """What the worker saw in Keep after its run: the titles in each view. Lets the platform check that every expected note is
+        there once and nothing else is. Optional; a worker that does not send it is still accepted."""
+        if value is None:
+            return None
+        if not isinstance(value, dict) or any(k not in INVENTORY_VIEWS for k in value):
+            raise InvalidJob(f"inventory: an object with {', '.join(INVENTORY_VIEWS)}")
+        out: dict[str, list[str]] = {}
+        for view in INVENTORY_VIEWS:
+            titles = value.get(view, [])
+            if not isinstance(titles, list) or len(titles) > 500 or not all(isinstance(t, str) and len(t) <= 300 for t in titles):
+                raise InvalidJob(f"inventory.{view}: a list of at most 500 titles, each at most 300 characters")
+            out[view] = [t.strip() for t in titles]
+        return out
+
+    async def result(self, job_id: str, worker_id: str, outcome: str, summary: str | None = None, follow_up: Any = None, pack_version: str | None = None,
+                     attempt: Any = None, inventory: Any = None) -> dict[str, Any]:
         if outcome not in OUTCOMES:
             raise InvalidJob(f"outcome: must be one of {', '.join(OUTCOMES)}")
         follow = self._follow_up(follow_up) if outcome != "done" else None
         if summary is not None:
             summary = _text(summary, "summary", 500)
+        if pack_version is not None:
+            pack_version = _text(pack_version, "pack_version", 100)
+        attempt = self._attempt(attempt)
+        inventory = self._inventory(inventory)
         job = await self.store.get(job_id)
         if not job:
             raise NotFound("no such job")
         status = _STATUS_FOR_OUTCOME.get(outcome)
-        if job["worker_id"] == worker_id and job["status"] in (status, "cancelled"):
+        same_attempt = attempt is None or attempt == job["attempt"]
+        if job["worker_id"] == worker_id and job["status"] in (status, "cancelled") and same_attempt:
             return await self._view(job)   # the same report twice (a retried request) changes nothing
-        job = await self._held(job_id, worker_id)
+        job = await self._held(job_id, worker_id, attempt)
         now = self._now()
         stamp = _iso(now)
         fields: dict[str, Any] = {"summary": summary, "pack_version_used": pack_version, "lease_expires_at": None, "updated_at": stamp, "follow_up": follow}
+        if inventory is not None:
+            fields["inventory"] = inventory
         if outcome == "retry":
             status = "queued" if job["attempt"] < job["max_attempts"] else "needs_manual"
         if job["cancel_requested"]:
@@ -307,11 +363,23 @@ class JobService:
             raise NotFound("no such job")
         return await self._view(job)
 
-    async def list_jobs(self, status: str | None = None, reset_session_id: str | None = None) -> list[dict[str, Any]]:
+    async def list_jobs(self, status: str | None = None, reset_session_id: str | None = None, account: str | None = None,
+                        workflow: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
+        """Newest first. Filters run in the store, so a long history never hides recent jobs. "needs_manual" also covers queued jobs
+        nobody could take for too long (shown as needing a person, see _view); "queued" leaves those out for the same reason."""
+        limit = max(1, min(int(limit), 2000))
         workers = await self.store.list_workers()
-        jobs = await self.store.list(reset_session_id=reset_session_id)
-        views = [await self._view(j, workers) for j in jobs]
-        return [v for v in views if status is None or v["status"] == status]
+        account = account.strip().lower() if account else None
+        common = {"reset_session_id": reset_session_id, "account": account, "workflow": workflow, "newest_first": True}
+        if status in ("needs_manual", "queued"):
+            cutoff = _iso(self._now() - timedelta(seconds=self.unroutable_after_s))
+            rows = await self.store.list(status="needs_manual", limit=limit, **common) if status == "needs_manual" else []
+            rows += await self.store.list(status="queued", limit=limit, **common, **({"created_before": cutoff} if status == "needs_manual" else {}))
+            rows.sort(key=lambda j: (j["created_at"], j["job_id"]), reverse=True)
+        else:
+            rows = await self.store.list(status=status, limit=limit, **common)
+        views = [await self._view(j, workers) for j in rows]
+        return [v for v in views if status is None or v["status"] == status][:limit]
 
     async def follow_ups(self) -> list[dict[str, Any]]:
         """Everything a person has to look at: jobs a worker gave up on, and jobs no worker could take."""
