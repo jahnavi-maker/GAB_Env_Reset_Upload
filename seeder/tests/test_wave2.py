@@ -602,6 +602,34 @@ class DriveAttachmentTests(_Wave2Env):
         self.assertNotEqual(b.file_kind(f), "attachment")
 
 
+class RecurringCollapseTests(unittest.TestCase):
+    WEEK = 7 * 24 * 3600 * 1000
+
+    def ev(self, i, t, summary="Long run", rule=("RRULE:FREQ=WEEKLY;BYDAY=SU",), cal="c1", key="recurrence_data"):
+        e = {"id": f"e{i}", "summary": summary, "calendar_id": cal,
+             "start": {"date_time": {"time_ms": t, "offset_ms": -21600000}},
+             "end": {"date_time": {"time_ms": t + 3600000, "offset_ms": -21600000}}}
+        if rule:
+            e[key] = list(rule)
+        return e
+
+    def test_weekly_copies_of_one_series_become_one(self):
+        from wave2.personas import collapse_recurring_events
+        t0 = 1789300800000
+        evs = [self.ev(i, t0 + i * self.WEEK) for i in (3, 0, 1, 2)]           # out of order on purpose
+        evs += [self.ev(9, t0, summary="Dentist", rule=None),                    # one-off: untouched
+                self.ev(10, t0 + 3600000 * 2, key="recurrence")]                 # same rule, other time: own series
+        bc = {"CALENDAR": {"calendar_events_info": {"events": evs}}}
+        self.assertEqual(collapse_recurring_events(bc), 3)
+        kept = [e["id"] for e in bc["CALENDAR"]["calendar_events_info"]["events"]]
+        self.assertEqual(kept, ["e0", "e9", "e10"])                              # the earliest copy is kept
+
+    def test_nothing_to_do(self):
+        from wave2.personas import collapse_recurring_events
+        self.assertEqual(collapse_recurring_events({}), 0)
+        self.assertEqual(collapse_recurring_events({"CALENDAR": {"calendar_events_info": {"events": [self.ev(1, 1, rule=None)]}}}), 0)
+
+
 class DriveDedupeTests(_Wave2Env):
     def test_a_twin_of_our_item_is_removed_and_its_contents_moved(self):
         from wave2 import runner

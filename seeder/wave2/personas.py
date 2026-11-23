@@ -94,6 +94,7 @@ def load_world(folder: str) -> dict[str, Any]:
     normalize_contacts(bc)
     normalize_attendees(bc, ((world.get("persona") or {}).get("persona_email") or ""))
     merge_duplicate_folders(bc)
+    collapse_recurring_events(bc)
     desc = {}
     for v in (world.get("descriptive_contexts") or {}).values():
         d = _as_json(v)
@@ -163,6 +164,57 @@ def _dedupe_event_ids(cal: Any) -> int:
 
     walk(cal)
     return changed
+
+
+def _event_start(e: dict[str, Any]) -> tuple[int, int] | None:
+    """(utc ms, offset ms) of an event's start, or None."""
+    dt = ((e.get("start") or {}).get("date_time") or {}) if isinstance(e.get("start"), dict) else {}
+    if isinstance(dt, dict) and dt.get("time_ms") is not None:
+        return int(dt["time_ms"]), int(dt.get("offset_ms") or 0)
+    return None
+
+
+def collapse_recurring_events(bc: dict[str, Any]) -> int:
+    """One Google series per repeating event, in place.
+
+    The Wave 2 worlds store every weekly/daily occurrence of a repeating event as its own
+    record, each carrying the full RRULE (Adrian's Sunday long run: 8 records, each
+    'RRULE:FREQ=WEEKLY;BYDAY=SU'). Creating each one makes 8 overlapping series, so every
+    Sunday shows 8 copies. Records of the same series (calendar, title, rule, local time of
+    day, length — and weekday when the rule has no BYDAY) keep only the earliest, which
+    already produces all the later occurrences. Returns how many records were dropped."""
+    import datetime as _dt
+
+    cal = bc.get("CALENDAR")
+    events = ((cal or {}).get("calendar_events_info") or {}).get("events") if isinstance(cal, dict) else None
+    if not isinstance(events, list):
+        return 0
+    first: dict[tuple, dict[str, Any]] = {}
+    drop: set[int] = set()
+    for i, e in enumerate(events):
+        if not isinstance(e, dict):
+            continue
+        rules = [r.strip() for r in (e.get("recurrence_data") or e.get("recurrence") or []) if isinstance(r, str) and r.strip()]
+        st = _event_start(e)
+        if not rules or st is None:
+            continue
+        local = _dt.datetime.utcfromtimestamp((st[0] + st[1]) / 1000)
+        en = (e.get("end") or {}).get("date_time") if isinstance(e.get("end"), dict) else None
+        length = (int(en["time_ms"]) - st[0]) if isinstance(en, dict) and en.get("time_ms") is not None else None
+        by_day = any("BYDAY=" in r or "BYMONTHDAY=" in r or "FREQ=DAILY" in r for r in rules)
+        key = (e.get("calendar_id"), " ".join(str(e.get("summary") or "").split()).lower(), tuple(sorted(rules)),
+               local.strftime("%H:%M"), length, None if by_day else local.weekday())
+        keep = first.get(key)
+        if keep is None:
+            first[key] = {"i": i, "t": st[0]}
+        elif st[0] < keep["t"]:
+            drop.add(keep["i"])
+            first[key] = {"i": i, "t": st[0]}
+        else:
+            drop.add(i)
+    if drop:
+        cal["calendar_events_info"]["events"] = [e for i, e in enumerate(events) if i not in drop]
+    return len(drop)
 
 
 def _drive_ctx(bc: dict[str, Any]) -> dict[str, Any]:
