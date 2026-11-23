@@ -535,3 +535,61 @@ class CalendarFormatTests(unittest.TestCase):
         bc = {"CALENDAR": {"events": [mk(1), mk(2), mk(3), {"id": "solo", "summary": "S", "start": {}}]}}
         normalize_attendees(bc)
         self.assertEqual([e["id"] for e in bc["CALENDAR"]["events"]], ["lift", "lift__2", "lift__3", "solo"])
+
+
+class CalendarReuseTests(_Wave2Env):
+    def _ctx_with(self, names):
+        from wave2 import runner
+        from wave2.personas import WorldCtx
+        ctx = WorldCtx("test_person", ACCOUNT)
+        cmap = {"cal_primary": {"id": "cal_primary", "is_primary": True}}
+        cmap.update({f"cal_{i}": {"id": f"cal_{i}", "summary": n} for i, n in enumerate(names)})
+        return runner, ctx, cmap
+
+    def test_same_name_reused_spare_renamed_extra_deleted_none_created(self):
+        runner, ctx, cmap = self._ctx_with(["Family", "Medical"])
+        b = runner.base()
+        S = MagicMock()
+        owned = [{"id": "g_primary", "primary": True, "accessRole": "owner"},
+                 {"id": "g_fam", "summary": "Family", "accessRole": "owner"},
+                 {"id": "g_old1", "summary": "Old persona work", "accessRole": "owner"},
+                 {"id": "g_old2", "summary": "Old persona gym", "accessRole": "owner"},
+                 {"id": "g_hol", "summary": "Holidays", "accessRole": "reader"}]
+        st = {"calendars": {}}
+        with patch.object(b, "calendar_map", return_value=cmap), patch.object(b, "list_calendars", return_value=owned), \
+             patch.object(b, "save_state"):
+            out = runner.prepare_calendars(ctx, S, st, log=lambda m: None)
+        self.assertEqual((out["reused"], out["renamed"], out["created"], out["deleted_spare"], out["fallback"]),
+                         (1, 1, 0, 1, []))
+        self.assertEqual(st["calendars"], {"cal_0": "g_fam", "cal_1": "g_old1"})
+        S.cal.calendars().patch.assert_any_call(calendarId="g_old1", body={"summary": "Medical", "timeZone": ctx.tz_name})
+        S.cal.calendars().delete.assert_called_once_with(calendarId="g_old2")
+        S.cal.calendars().insert.assert_not_called()
+
+    def test_creation_limit_falls_back_to_primary_and_fails_the_run(self):
+        runner, ctx, cmap = self._ctx_with(["A", "B", "C"])
+        b = runner.base()
+        S = MagicMock()
+        S.cal.calendars().insert.return_value.execute.side_effect = RuntimeError(
+            'HttpError 403 "Calendar usage limits exceeded." quotaExceeded')
+        st = {"calendars": {}}
+        with patch.object(b, "calendar_map", return_value=cmap), patch.object(b, "list_calendars", return_value=[]), \
+             patch.object(b, "save_state"):
+            out = runner.prepare_calendars(ctx, S, st, log=lambda m: None)
+        self.assertEqual(out["fallback"], ["A", "B", "C"])
+        self.assertEqual(set(st["calendars"].values()), {"primary"})
+        self.assertEqual(S.cal.calendars().insert.return_value.execute.call_count, 1)   # stops after the first refusal
+
+    def test_reseed_wipe_keeps_and_empties_owned_calendars(self):
+        from wave2 import runner
+        S = MagicMock()
+        S.cal.calendarList().list().execute.return_value = {"items": [
+            {"id": "primary", "primary": True, "accessRole": "owner"}, {"id": "fam", "accessRole": "owner"}]}
+        S.cal.events().list.side_effect = lambda **kw: MagicMock(**{"execute.return_value": {"items": [{"id": "e1"}, {"id": "e2"}]}})
+        b = runner.base()
+        one_page = lambda method, key, **kw: list((method(**kw).execute() or {}).get(key, []) or [])
+        with patch.object(b, "pages", side_effect=one_page):
+            out = runner.extra_wipe(S, lambda m: None, keep_calendars=True)
+        self.assertEqual(out["calendars"]["secondary_kept_emptied"], 1)
+        self.assertEqual(out["calendars"]["events_cleared"], 2)
+        S.cal.calendars().delete.assert_not_called()

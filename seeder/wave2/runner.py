@@ -299,8 +299,13 @@ def _step(label: str, fn: Callable[[], Any], errors: list[str], log: Callable[[s
         return None
 
 
-def extra_wipe(S, log: Callable[[str], None]) -> dict[str, Any]:
-    """The parts of a full wipe the production clean does not cover (all API-reachable)."""
+def extra_wipe(S, log: Callable[[str], None], keep_calendars: bool = False) -> dict[str, Any]:
+    """The parts of a full wipe the production clean does not cover (all API-reachable).
+
+    ``keep_calendars`` (used by a reseed): owned secondary calendars are EMPTIED, not
+    deleted, so the seed can reuse them. Google caps how many calendars an account may
+    create in a short time ("Calendar usage limits exceeded"); personas need 5-16 each,
+    so delete+recreate on every reset hits that cap."""
     b = base()
     out: dict[str, Any] = {"errors": []}
     err = out["errors"]
@@ -322,17 +327,25 @@ def extra_wipe(S, log: Callable[[str], None]) -> dict[str, Any]:
         return n
 
     def calendars() -> dict[str, int]:
-        owned = subs = 0
+        owned = subs = kept = cleared = 0
         for c in b.list_calendars(S):
             if c.get("primary"):
                 continue
-            if c.get("accessRole") == "owner":
+            if c.get("accessRole") == "owner" and keep_calendars:
+                for e in b.pages(S.cal.events().list, "items", calendarId=c["id"], maxResults=2500, showDeleted=False):
+                    b.ex_ok(S.cal.events().delete(calendarId=c["id"], eventId=e["id"], sendUpdates="none"))
+                    cleared += 1
+                kept += 1
+            elif c.get("accessRole") == "owner":
                 b.ex_ok(S.cal.calendars().delete(calendarId=c["id"]))
                 owned += 1
             else:
                 b.ex_ok(S.cal.calendarList().delete(calendarId=c["id"]))
                 subs += 1
-        return {"secondary_deleted": owned, "subscriptions_removed": subs}
+        out = {"secondary_deleted": owned, "subscriptions_removed": subs}
+        if keep_calendars:
+            out.update(secondary_kept_emptied=kept, events_cleared=cleared)
+        return out
 
     def contacts() -> int:
         rns = [p["resourceName"] for p in b.list_contacts(S)]
@@ -384,7 +397,7 @@ def extra_wipe(S, log: Callable[[str], None]) -> dict[str, Any]:
     return out
 
 
-def full_wipe(S, creds, log: Callable[[str], None]) -> dict[str, Any]:
+def full_wipe(S, creds, log: Callable[[str], None], keep_calendars: bool = False) -> dict[str, Any]:
     """Everything API-reachable. Reuses the production full wipes (proven, parallel)."""
     from materialize.calendar_sync import wipe_seeded_events
     from materialize.drive_sync import wipe_seed_folder
@@ -396,7 +409,7 @@ def full_wipe(S, creds, log: Callable[[str], None]) -> dict[str, Any]:
     out["calendar_primary"] = _step("clear primary calendar", lambda: wipe_seeded_events(S.cal, log), errors, log)
     out["drive"] = _step("wipe Drive", lambda: wipe_seed_folder(S.drive, "", log, creds=creds, workers=10), errors, log)
     _step("empty Drive trash", lambda: S.drive.files().emptyTrash().execute(), errors, log)
-    extra = extra_wipe(S, log)
+    extra = extra_wipe(S, log, keep_calendars=keep_calendars)
     errors += extra.pop("errors")
     out.update(extra)
     out["errors"] = errors
@@ -450,9 +463,66 @@ def _archive_state(ctx: WorldCtx) -> None:
         p.rename(p.with_name(p.name + f".wiped-{int(time.time())}"))
 
 
+def _is_calendar_quota(exc: Exception) -> bool:
+    t = str(exc)
+    return "quotaExceeded" in t or "usage limits" in t.lower() or "usageLimits" in t
+
+
+def prepare_calendars(ctx: WorldCtx, S, st: dict[str, Any], log: Callable[[str], None] = LOG.info) -> dict[str, Any]:
+    """Map the persona's secondary calendars onto calendars the account already owns
+    (same name first, then any spare, renamed), create only what is still missing and
+    delete spares. If Google refuses to create one (calendar-creation limit), that
+    calendar's events go on the primary calendar and it is listed in ``fallback``."""
+    b = base()
+    need = [(cid, (c.get("summary") or b.pretty_cal(cid)).strip())
+            for cid, c in b.calendar_map(ctx).items()
+            if not (c.get("is_primary") or cid in ("cal_primary", "primary")) and cid not in st["calendars"]]
+    pool = [{"id": c["id"], "summary": (c.get("summary") or "").strip()} for c in b.list_calendars(S)
+            if not c.get("primary") and c.get("accessRole") == "owner" and c["id"] not in st["calendars"].values()]
+    out: dict[str, Any] = {"reused": 0, "renamed": 0, "created": 0, "deleted_spare": 0, "fallback": []}
+    pending = []
+    for cid, name in need:
+        hit = next((h for h in pool if h["summary"] == name), None)
+        if hit:
+            pool.remove(hit)
+            b.ex(S.cal.calendars().patch(calendarId=hit["id"], body={"timeZone": ctx.tz_name}))
+            st["calendars"][cid] = hit["id"]
+            out["reused"] += 1
+        else:
+            pending.append((cid, name))
+    quota_hit = False
+    for cid, name in pending:
+        if pool:
+            h = pool.pop(0)
+            b.ex(S.cal.calendars().patch(calendarId=h["id"], body={"summary": name, "timeZone": ctx.tz_name}))
+            st["calendars"][cid] = h["id"]
+            out["renamed"] += 1
+            continue
+        if not quota_hit:
+            try:
+                r = b.ex(S.cal.calendars().insert(body={"summary": name, "timeZone": ctx.tz_name}))
+                st["calendars"][cid] = r["id"]
+                out["created"] += 1
+                continue
+            except Exception as exc:  # noqa: BLE001
+                if not _is_calendar_quota(exc):
+                    raise
+                quota_hit = True
+                log(f"wave2: Google calendar-creation limit reached; remaining calendars go on primary")
+        st["calendars"][cid] = "primary"
+        out["fallback"].append(name)
+    for h in pool:
+        b.ex_ok(S.cal.calendars().delete(calendarId=h["id"]))
+        out["deleted_spare"] += 1
+    b.save_state(ctx, st)
+    log(f"wave2 calendars: {out}")
+    return out
+
+
 def seed(ctx: WorldCtx, S, st: dict[str, Any]) -> None:
     b = base()
     st["folder"], st["persona_id"] = ctx.folder, ctx.persona_id
+    st["calendar_setup"] = prepare_calendars(ctx, S, st)
     for stage, fn in (("gmail", b.seed_gmail), ("contacts", b.seed_contacts), ("calendar", b.seed_calendar),
                       ("drive", b.seed_drive), ("tasks", b.seed_tasks)):
         _stage(ctx, stage, st)
@@ -546,7 +616,7 @@ def _run(ctx: WorldCtx, folder: str, mode: str, log: Callable[[str], None]) -> d
         restore(ctx, S, st)
     else:
         _stage(ctx, "wipe")
-        out["wipe"] = full_wipe(S, creds, log)
+        out["wipe"] = full_wipe(S, creds, log, keep_calendars=True)
         _archive_state(ctx)
         st = b.load_state(ctx)
         seed(ctx, S, st)
@@ -565,6 +635,12 @@ def _run(ctx: WorldCtx, folder: str, mode: str, log: Callable[[str], None]) -> d
     out["detail"] = _summary(folder, action, v)
     if wipe_errors:
         out["detail"] += f"; wipe errors: {'; '.join(wipe_errors)[:300]}"
+    cal_setup = st.get("calendar_setup") or {}
+    out["calendars"] = cal_setup
+    if cal_setup.get("fallback"):
+        out["ok"] = False
+        out["detail"] += (f"; {len(cal_setup['fallback'])} persona calendar(s) not created (Google calendar-creation "
+                          f"limit), their events are on the primary calendar - reseed again later to fix")
     out["account_settings"] = {"name": ctx.persona_name, "home_address": ctx.home_address(),
                                "timezone": ctx.tz_name}
     return out
