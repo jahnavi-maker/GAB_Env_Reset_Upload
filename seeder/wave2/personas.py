@@ -92,12 +92,76 @@ def load_world(folder: str) -> dict[str, Any]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
     bc = {k: _as_json(v) for k, v in (world.get("bard_contexts") or {}).items()}
     normalize_contacts(bc)
+    normalize_attendees(bc, ((world.get("persona") or {}).get("persona_email") or ""))
     desc = {}
     for v in (world.get("descriptive_contexts") or {}).values():
         d = _as_json(v)
         if isinstance(d, dict):
             desc.update(d)
     return {"pdir": pdir, "world": world, "manifest": manifest, "bc": bc, "descriptive": desc}
+
+
+def normalize_attendees(bc: dict[str, Any], persona_email: str = "") -> int:
+    """Bring calendar attendees to the shape the reference seeder understands, in place.
+
+    Events use either ``attendee: [{email, display_name, is_self}]`` or (8 of 13 Wave 2
+    personas) ``attendees: ["a@x.com", ...]`` -- plain strings. Strings become
+    ``{"email": s}``; the persona's own address is marked ``is_self`` so it is not invited.
+    Returns how many attendees were converted."""
+    me = (persona_email or "").strip().lower()
+    fixed = 0
+
+    def walk(o: Any) -> None:
+        nonlocal fixed
+        if isinstance(o, dict):
+            for key in ("attendees", "attendee"):
+                lst = o.get(key)
+                if isinstance(lst, list) and any(isinstance(a, str) for a in lst):
+                    out = []
+                    for a in lst:
+                        if isinstance(a, str):
+                            if not a.strip():
+                                continue
+                            a = {"email": a.strip(), **({"is_self": True} if a.strip().lower() == me else {})}
+                            fixed += 1
+                        out.append(a)
+                    o[key] = out
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(bc.get("CALENDAR") or {})
+    _dedupe_event_ids(bc.get("CALENDAR") or {})
+    return fixed
+
+
+def _dedupe_event_ids(cal: Any) -> int:
+    """A few events share an ``id`` but are different events (other date/calendar), e.g.
+    Marcus's three 'Lift - Block 6' sessions. The seeder keys events by id and would keep
+    only the first, so a repeat gets a stable suffix ('<id>__2'). Deterministic (document
+    order), so seed and restore always agree. Returns how many ids were changed."""
+    seen: dict[str, int] = {}
+    changed = 0
+
+    def walk(o: Any) -> None:
+        nonlocal changed
+        if isinstance(o, dict):
+            if isinstance(o.get("id"), str) and "start" in o and "summary" in o:
+                n = seen.get(o["id"], 0) + 1
+                seen[o["id"]] = n
+                if n > 1:
+                    o["id"] = f"{o['id']}__{n}"
+                    changed += 1
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(cal)
+    return changed
 
 
 def normalize_contacts(bc: dict[str, Any]) -> int:

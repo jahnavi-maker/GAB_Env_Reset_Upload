@@ -209,12 +209,84 @@ def seeded_counts(st: dict[str, Any]) -> dict[str, int]:
     }
 
 
-def verify(ctx: WorldCtx, st: dict[str, Any]) -> dict[str, Any]:
+def verify(ctx: WorldCtx, st: dict[str, Any], S=None) -> dict[str, Any]:
+    """Expected vs seeded per surface. With ``S`` (live services) "seeded" is what is
+    actually PRESENT in the account right now (read back from Google), not what the state
+    file recorded, so an item deleted or trashed after seeding is caught."""
     p = plan(ctx)
     got = seeded_counts(st)
-    per = {s: {"expected": p["expected"][s], "seeded": got[s], "ok": got[s] >= p["expected"][s]} for s in SURFACES}
-    return {"surfaces": per, "ok": all(v["ok"] for v in per.values()), "manual": p["manual"],
-            "not_recreatable": p["not_recreatable"]}
+    live = live_counts(S, st) if S is not None else None
+    per = {}
+    for s in SURFACES:
+        seeded = got[s]
+        row = {"expected": p["expected"][s]}
+        if live is not None and s in live["surfaces"]:
+            lv = live["surfaces"][s]
+            seeded = lv["present"]
+            row.update(recorded=lv["recorded"], missing=lv["recorded"] - lv["present"], extra=lv["extra"])
+        row["seeded"] = seeded
+        row["ok"] = seeded >= p["expected"][s]
+        per[s] = row
+    out = {"surfaces": per, "ok": all(v["ok"] for v in per.values()), "manual": p["manual"],
+           "not_recreatable": p["not_recreatable"], "live": live is not None}
+    if live is not None and live["errors"]:
+        out["ok"] = False
+        out["live_errors"] = live["errors"]
+    return out
+
+
+def live_counts(S, st: dict[str, Any]) -> dict[str, Any]:
+    """Read each surface back from Google ONCE (list calls, not one call per item) and count
+    how many recorded items are really there (not trashed/cancelled/deleted). ``extra`` =
+    live items this seed did not make (e.g. a tasker's leftovers, or invites Gmail turned
+    into events); reported only, never a failure."""
+    b = base()
+    errors: list[str] = []
+    res: dict[str, Any] = {}
+
+    def present(surface: str, recs: dict, live_ids: set, key: str = "id") -> None:
+        ids = {r.get(key) for r in recs.values() if isinstance(r, dict)}
+        res[surface] = {"recorded": len(recs), "present": len(ids & live_ids), "extra": len(live_ids - ids)}
+
+    def gmail() -> None:
+        live = {m["id"] for m in b.pages(S.gmail.users().messages().list, "messages", userId="me", maxResults=500)}
+        present("GMAIL", st.get("gmail") or {}, live)
+
+    def calendar() -> None:
+        recs = st.get("events") or {}
+        live: set = set()
+        for cal in {r.get("cal") for r in recs.values() if isinstance(r, dict)} | {"primary"}:
+            live |= {e["id"] for e in b.pages(S.cal.events().list, "items", calendarId=cal, maxResults=2500,
+                                              showDeleted=False) if e.get("status") != "cancelled"}
+        present("CALENDAR", recs, live)
+
+    def drive() -> None:
+        live = {f["id"] for f in b.pages(S.drive.files().list, "files", q="'me' in owners and trashed=false",
+                                         pageSize=1000, fields="nextPageToken,files(id)")}
+        recs = {**{f"d:{k}": v for k, v in (st.get("drive_folders") or {}).items()},
+                **{f"f:{k}": v for k, v in (st.get("drive_files") or {}).items()}}
+        present("DRIVE", recs, live)
+
+    def contacts() -> None:
+        live = {c["resourceName"] for c in b.pages(S.people.people().connections().list, "connections",
+                                                   resourceName="people/me", personFields="names", pageSize=1000)}
+        present("CONTACTS", st.get("contacts") or {}, live, key="resourceName")
+
+    def tasks() -> None:
+        recs = st.get("tasks") or {}
+        live: set = set()
+        for lst in {r.get("list") for r in recs.values() if isinstance(r, dict)} | {"@default"}:
+            live |= {t["id"] for t in b.pages(S.tasks.tasks().list, "items", tasklist=lst, maxResults=100,
+                                              showCompleted=True, showHidden=True) if not t.get("deleted")}
+        present("TASKS", recs, live)
+
+    for name, fn in (("GMAIL", gmail), ("CALENDAR", calendar), ("DRIVE", drive), ("CONTACTS", contacts),
+                     ("TASKS", tasks)):
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 - an unreadable surface is reported, not guessed
+            errors.append(f"read back {name}: {type(exc).__name__}: {exc}")
+    return {"surfaces": res, "errors": errors}
 
 
 # ----------------------------------------------------------------- wipe
@@ -482,7 +554,7 @@ def _run(ctx: WorldCtx, folder: str, mode: str, log: Callable[[str], None]) -> d
     _stage(ctx, "empty trash", st)
     out["trash"] = empty_trash(S, log)
     _stage(ctx, "verify", st)
-    v = verify(ctx, st)
+    v = verify(ctx, st, S)
     out["verify"] = v
     out["skipped"] = dict(st.get("skipped") or {})
     wipe_errors = list((out.get("wipe") or {}).get("errors") or [])

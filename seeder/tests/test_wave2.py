@@ -193,7 +193,8 @@ class RunRoutingTests(_Wave2Env):
              patch.object(runner, "full_wipe", return_value={"errors": list(wipe_errors)}) as wipe, \
              patch.object(runner, "seed", side_effect=fake_seed) as seed, \
              patch.object(runner, "restore") as restore, \
-             patch.object(runner, "empty_trash", return_value=self.trash_result):
+             patch.object(runner, "empty_trash", return_value=self.trash_result), \
+             patch.object(runner, "live_counts", side_effect=lambda S, st: {"surfaces": {}, "errors": []}):
             out = runner.run(ACCOUNT, "test_person", mode)
         return out, wipe, seed, restore
 
@@ -473,3 +474,64 @@ class EmptyTrashTests(_Wave2Env):
         self.assertFalse(out["empty"])
         self.assertEqual(out["left"]["gmail_trash"], 1)
         self.assertTrue(any("Gmail Trash" in e for e in out["errors"]))
+
+
+class LiveVerifyTests(_Wave2Env):
+    def _S(self, gmail, events, drive, contacts, tasks):
+        S = MagicMock()
+        page = lambda key, items: MagicMock(**{"execute.return_value": {key: items}})
+        S.gmail.users().messages().list.side_effect = lambda **kw: page("messages", [{"id": i} for i in gmail])
+        S.cal.events().list.side_effect = lambda **kw: page("items", [{"id": i} for i in events] if kw["calendarId"] == "primary" else [])
+        S.drive.files().list.side_effect = lambda **kw: page("files", [{"id": i} for i in drive])
+        S.people.people().connections().list.side_effect = lambda **kw: page("connections", [{"resourceName": i} for i in contacts])
+        S.tasks.tasks().list.side_effect = lambda **kw: page("items", [{"id": i} for i in tasks])
+        return S
+
+    ST = {"gmail": {"e1": {"id": "m1"}, "e2": {"id": "m2"}}, "events": {"v1": {"cal": "primary", "id": "ev1"}},
+          "drive_folders": {"fo": {"id": "D1"}}, "drive_files": {"fi": {"id": "D2"}},
+          "contacts": {"c1": {"resourceName": "people/1"}, "c2": {"resourceName": "people/2"}},
+          "tasks": {"t1": {"list": "@default", "id": "T1"}}}
+
+    def test_counts_what_is_really_in_the_account(self):
+        from wave2 import runner
+        S = self._S(["m1", "x9"], ["ev1"], ["D1", "D2"], ["people/1"], [])   # m2, people/2, T1 gone; x9 extra
+        live = runner.live_counts(S, self.ST)
+        self.assertEqual(live["errors"], [])
+        self.assertEqual(live["surfaces"]["GMAIL"], {"recorded": 2, "present": 1, "extra": 1})
+        self.assertEqual(live["surfaces"]["DRIVE"]["present"], 2)
+        self.assertEqual(live["surfaces"]["CONTACTS"]["present"], 1)
+        self.assertEqual(live["surfaces"]["TASKS"]["present"], 0)
+
+    def test_verify_fails_when_a_seeded_item_was_deleted(self):
+        from wave2 import runner
+        from wave2.personas import WorldCtx
+        ctx = WorldCtx("test_person", ACCOUNT)
+        with patch.object(runner, "plan", return_value={"expected": {"GMAIL": 2, "CALENDAR": 1, "DRIVE": 2, "CONTACTS": 2, "TASKS": 1},
+                                                         "manual": {}, "not_recreatable": []}):
+            full = runner.verify(ctx, self.ST, self._S(["m1", "m2"], ["ev1"], ["D1", "D2"], ["people/1", "people/2"], ["T1"]))
+            short = runner.verify(ctx, self.ST, self._S(["m1", "m2"], ["ev1"], ["D1", "D2"], ["people/1"], ["T1"]))
+            stateonly = runner.verify(ctx, self.ST)
+        self.assertTrue(full["ok"] and full["live"])
+        self.assertFalse(short["ok"])
+        self.assertEqual(short["surfaces"]["CONTACTS"]["missing"], 1)
+        self.assertTrue(stateonly["ok"])   # the old state-only check could not see the deletion
+
+
+class CalendarFormatTests(unittest.TestCase):
+    def test_string_attendees_become_dicts_and_self_is_marked(self):
+        from wave2.personas import normalize_attendees
+        bc = {"CALENDAR": {"events": [{"id": "e1", "summary": "S", "start": {},
+                                       "attendees": ["Me@X.com", "bob@example.com", ""]},
+                                      {"id": "e2", "summary": "T", "start": {},
+                                       "attendee": [{"email": "a@b.com", "display_name": "A"}]}]}}
+        self.assertEqual(normalize_attendees(bc, "me@x.com"), 2)
+        ev = bc["CALENDAR"]["events"]
+        self.assertEqual(ev[0]["attendees"], [{"email": "Me@X.com", "is_self": True}, {"email": "bob@example.com"}])
+        self.assertEqual(ev[1]["attendee"], [{"email": "a@b.com", "display_name": "A"}])   # untouched
+
+    def test_repeated_event_ids_get_stable_suffixes(self):
+        from wave2.personas import normalize_attendees
+        mk = lambda t: {"id": "lift", "summary": "Lift", "start": {"t": t}}
+        bc = {"CALENDAR": {"events": [mk(1), mk(2), mk(3), {"id": "solo", "summary": "S", "start": {}}]}}
+        normalize_attendees(bc)
+        self.assertEqual([e["id"] for e in bc["CALENDAR"]["events"]], ["lift", "lift__2", "lift__3", "solo"])
