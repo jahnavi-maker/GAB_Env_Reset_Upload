@@ -176,7 +176,8 @@ class WorldCtx:
         ):
             m = re.search(pat, doc)
             if m and m.group(1).strip():
-                return re.sub(r"(\s*\([^)]*\))+\s*$", "", m.group(1).strip())
+                # Street address only: drop "(neighbourhood ...)" notes and anything after them.
+                return m.group(1).split("(")[0].strip().rstrip(".,; ")
         return ""
 
 
