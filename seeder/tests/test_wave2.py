@@ -813,3 +813,40 @@ class DocConversionFallbackTests(unittest.TestCase):
         from googleapiclient.errors import HttpError
         with self.assertRaises(HttpError):
             b.make_google_file(S, b.DOC, "hello", {"name": "denied"})
+
+
+class DroppedConnectionRetryTests(unittest.TestCase):
+    def _req(self, method, failures):
+        class Req:
+            calls = 0
+            def __init__(self): self.method = method; self.uri = "https://www.googleapis.com/drive/v3/files"
+            def execute(self, **_):
+                Req.calls += 1
+                if Req.calls <= failures: raise BrokenPipeError(32, "Broken pipe")
+                return {"files": []}
+        return Req()
+
+    def setUp(self):
+        from wave2 import runner  # noqa: PLC0415
+        self.runner = runner
+        self._sleep = patch.object(runner.time, "sleep", lambda *_: None)
+        self._sleep.start()
+
+    def tearDown(self):
+        self._sleep.stop()
+
+    def test_a_read_whose_connection_dropped_is_retried(self):
+        ex = self.runner._retry_dropped_reads(lambda req: req.execute())
+        req = self._req("GET", 2)
+        self.assertEqual(ex(req), {"files": []})
+        self.assertEqual(type(req).calls, 3)
+
+    def test_a_write_is_not_retried(self):
+        ex = self.runner._retry_dropped_reads(lambda req: req.execute())
+        with self.assertRaises(BrokenPipeError):
+            ex(self._req("POST", 1))
+
+    def test_it_gives_up_after_a_few_tries(self):
+        ex = self.runner._retry_dropped_reads(lambda req: req.execute())
+        with self.assertRaises(BrokenPipeError):
+            ex(self._req("GET", 10))

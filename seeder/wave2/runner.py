@@ -179,6 +179,7 @@ def base():
 
             gab_seed.save_state = _save_and_tick
             gab_seed.ex = _tolerant_readback(gab_seed.ex)
+            gab_seed.ex = _retry_dropped_reads(gab_seed.ex)
             _orig_insert = gab_seed.insert_email
 
             def _insert_email(*a, **kw):
@@ -272,6 +273,29 @@ def services(creds) -> types.SimpleNamespace:
 
 # ----------------------------------------------------------------- plan / verify
 _READBACK = threading.local()
+
+
+_DROPPED = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError)
+
+
+def _retry_dropped_reads(orig_ex: Callable[..., Any]) -> Callable[..., Any]:
+    """Retry a READ (GET) whose connection to Google dropped (BrokenPipe / reset / timeout).
+    The reference seeder's ``ex`` only retries Google's own HTTP errors, so a stale keep-alive
+    socket during the final Drive twin check failed whole seeds (user849/851/861/864) after
+    everything had been written. Writes are not retried here: re-sending an insert could add a
+    duplicate."""
+    def ex(req, *a, **kw):
+        if getattr(req, "method", "GET") != "GET":
+            return orig_ex(req, *a, **kw)
+        for delay in (2, 5, 10, 0):
+            try:
+                return orig_ex(req, *a, **kw)
+            except _DROPPED as exc:
+                if not delay:
+                    raise
+                LOG.warning("wave2: connection to Google dropped on a read (%s); retrying in %ss", type(exc).__name__, delay)
+                time.sleep(delay)
+    return ex
 
 
 def _tolerant_readback(orig_ex: Callable[..., Any]) -> Callable[..., Any]:
