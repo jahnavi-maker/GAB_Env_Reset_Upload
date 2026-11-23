@@ -537,6 +537,31 @@ class CalendarFormatTests(unittest.TestCase):
         self.assertEqual([e["id"] for e in bc["CALENDAR"]["events"]], ["lift", "lift__2", "lift__3", "solo"])
 
 
+class DriveFolderMergeTests(unittest.TestCase):
+    def test_same_name_folders_in_the_same_place_become_one(self):
+        from wave2.personas import merge_duplicate_folders
+        fld = lambda i, n, p="": {"folder_id": i, "name": n, "parent_folder_id": p}
+        bc = {"DRIVE": {"mock_context": {"drive_mock_context": {
+            "folders": [fld("fld_11", "Client Marketing"), fld("fld_13", "TrustedPeps", "fld_11"),
+                        fld("t73:cm", "Client Marketing"), fld("t73:tp", "TrustedPeps", "t73:cm"),
+                        fld("t47:cm", "Client Marketing"), fld("t47:co", "Coaching", "t47:cm"),
+                        fld("fld_20", "TrustedPeps")],   # same name, different place: kept
+            "files": [{"file_id": "f1", "name": "vial.png", "parent_folder_id": "t73:tp"},
+                      {"file_id": "f2", "name": "ad.png", "parent_folder_id": "t47:co"},
+                      {"file_id": "f3", "name": "root.txt"}]}}}}
+        self.assertEqual(merge_duplicate_folders(bc), 3)
+        ctx = bc["DRIVE"]["mock_context"]["drive_mock_context"]
+        self.assertEqual([(f["folder_id"], f["parent_folder_id"]) for f in ctx["folders"]],
+                         [("fld_11", ""), ("fld_13", "fld_11"), ("t47:co", "fld_11"), ("fld_20", "")])
+        self.assertEqual([f.get("parent_folder_id") for f in ctx["files"]], ["fld_13", "t47:co", None])
+
+    def test_no_duplicates_changes_nothing(self):
+        from wave2.personas import merge_duplicate_folders
+        bc = {"DRIVE": {"mock_context": {"drive_mock_context": {"folders": [{"folder_id": "a", "name": "A"}], "files": []}}}}
+        self.assertEqual(merge_duplicate_folders(bc), 0)
+        self.assertEqual(merge_duplicate_folders({}), 0)
+
+
 class CalendarReuseTests(_Wave2Env):
     def _ctx_with(self, names):
         from wave2 import runner

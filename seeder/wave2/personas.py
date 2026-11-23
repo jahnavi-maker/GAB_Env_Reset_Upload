@@ -93,6 +93,7 @@ def load_world(folder: str) -> dict[str, Any]:
     bc = {k: _as_json(v) for k, v in (world.get("bard_contexts") or {}).items()}
     normalize_contacts(bc)
     normalize_attendees(bc, ((world.get("persona") or {}).get("persona_email") or ""))
+    merge_duplicate_folders(bc)
     desc = {}
     for v in (world.get("descriptive_contexts") or {}).values():
         d = _as_json(v)
@@ -162,6 +163,60 @@ def _dedupe_event_ids(cal: Any) -> int:
 
     walk(cal)
     return changed
+
+
+def _drive_ctx(bc: dict[str, Any]) -> dict[str, Any]:
+    d = bc.get("DRIVE") or {}
+    if not isinstance(d, dict):
+        return {}
+    ctx = (d.get("mock_context") or {}).get("drive_mock_context") or d.get("drive_mock_context") or d
+    return ctx if isinstance(ctx, dict) else {}
+
+
+def folder_merge_map(folders: list[dict[str, Any]]) -> dict[str, str]:
+    """{duplicate folder_id: kept folder_id} for folders with the same name under the same
+    parent path (e.g. Adrian's 'Client Marketing' x3: the persona's fld_11 plus a copy from
+    each of two task files). The first folder in document order is kept, so the persona's own
+    folders win and the result is the same on every run (seed, restore and verify agree)."""
+    by_id = {f.get("folder_id"): f for f in folders if isinstance(f, dict) and f.get("folder_id")}
+
+    def path(fid: str, depth: int = 0) -> str:
+        f = by_id.get(fid)
+        if f is None or depth > 50:
+            return ""
+        parent = f.get("parent_folder_id")
+        return f"{path(parent, depth + 1) if parent in by_id else ''}/{(f.get('name') or '').strip().lower()}"
+
+    kept: dict[str, str] = {}
+    out: dict[str, str] = {}
+    for f in folders:
+        fid = f.get("folder_id") if isinstance(f, dict) else None
+        if not fid:
+            continue
+        p = path(fid)
+        if p in kept:
+            out[fid] = kept[p]
+        else:
+            kept[p] = fid
+    return out
+
+
+def merge_duplicate_folders(bc: dict[str, Any]) -> int:
+    """One Drive folder per name and place, in place. Files and subfolders of a duplicate move
+    to the kept folder; the duplicate is dropped. Folder and file names are unchanged.
+    Returns how many folders were dropped."""
+    ctx = _drive_ctx(bc)
+    folders = ctx.get("folders")
+    if not isinstance(folders, list):
+        return 0
+    merge = folder_merge_map(folders)
+    if not merge:
+        return 0
+    ctx["folders"] = [f for f in folders if not (isinstance(f, dict) and f.get("folder_id") in merge)]
+    for item in ctx["folders"] + [f for f in (ctx.get("files") or []) if isinstance(f, dict)]:
+        if isinstance(item, dict) and item.get("parent_folder_id") in merge:
+            item["parent_folder_id"] = merge[item["parent_folder_id"]]
+    return len(merge)
 
 
 def normalize_contacts(bc: dict[str, Any]) -> int:
