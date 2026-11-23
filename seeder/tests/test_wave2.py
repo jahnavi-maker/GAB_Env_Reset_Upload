@@ -602,6 +602,34 @@ class DriveAttachmentTests(_Wave2Env):
         self.assertNotEqual(b.file_kind(f), "attachment")
 
 
+class DriveDedupeTests(_Wave2Env):
+    def test_a_twin_of_our_item_is_removed_and_its_contents_moved(self):
+        from wave2 import runner
+        b = runner.base()
+        st = {"drive_folders": {"fld_1": {"id": "KEEP_F"}}, "drive_files": {"file_1": {"id": "KEEP_D"}}}
+        live = [{"id": "KEEP_F", "mimeType": b.FOLDER, "appProperties": {"gab_id": b.gid("fld_1")}},
+                {"id": "TWIN_F", "mimeType": b.FOLDER, "appProperties": {"gab_id": b.gid("fld_1")}},
+                {"id": "KEEP_D", "mimeType": "text/plain", "appProperties": {"gab_id": b.gid("file_1")}},
+                {"id": "TWIN_D", "mimeType": "text/plain", "appProperties": {"gab_id": b.gid("file_1")}},
+                {"id": "TASKER", "mimeType": "text/plain"}]                       # not ours: never touched
+        def pages(method, key, **kw):
+            return [{"id": "CHILD"}] if "'TWIN_F' in parents" in kw.get("q", "") else (live if "owners" in kw.get("q", "") else [])
+        S = MagicMock()
+        with patch.object(b, "pages", side_effect=pages), patch.object(b, "ex"), patch.object(b, "ex_ok"):
+            out = runner.dedupe_drive(MagicMock(), S, st, log=lambda m: None)
+        self.assertEqual(out, {"duplicates": 2, "moved": 1})
+        deleted = {c.kwargs["fileId"] for c in S.drive.files().delete.call_args_list}
+        self.assertEqual(deleted, {"TWIN_F", "TWIN_D"})
+        moved = S.drive.files().update.call_args.kwargs
+        self.assertEqual((moved["fileId"], moved["addParents"], moved["removeParents"]), ("CHILD", "KEEP_F", "TWIN_F"))
+
+    def test_nothing_recorded_means_nothing_touched(self):
+        from wave2 import runner
+        S = MagicMock()
+        self.assertEqual(runner.dedupe_drive(MagicMock(), S, {}, log=lambda m: None), {"duplicates": 0, "moved": 0})
+        S.drive.files().list.assert_not_called()
+
+
 class CalendarReuseTests(_Wave2Env):
     def _ctx_with(self, names):
         from wave2 import runner

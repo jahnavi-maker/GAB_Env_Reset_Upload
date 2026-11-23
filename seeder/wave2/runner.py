@@ -624,6 +624,43 @@ def prepare_calendars(ctx: WorldCtx, S, st: dict[str, Any], log: Callable[[str],
     return out
 
 
+def dedupe_drive(ctx: WorldCtx, S, st: dict[str, Any], log: Callable[[str], None] | None = None) -> dict[str, int]:
+    """Remove second copies of OUR Drive items before the baseline snapshot.
+
+    Every item the seeder creates carries appProperties.gab_id. A create that Google
+    completed but answered with a 5xx is retried by ``ex`` and leaves a twin with the same
+    gab_id; the snapshot would then bless it. Keep the copy the record points to, move
+    anything inside a twin folder into the kept folder, delete the twin. Items without a
+    gab_id (not ours) are never touched here."""
+    b = base()
+    log = log or (lambda m: LOG.info("%s", m))
+    keep_by_gid = {}
+    for group in ("drive_folders", "drive_files"):
+        for key, rec in (st.get(group) or {}).items():
+            if isinstance(rec, dict) and rec.get("id"):
+                keep_by_gid[b.gid(key)] = rec["id"]
+    out = {"duplicates": 0, "moved": 0}
+    if not keep_by_gid:
+        return out
+    live = b.pages(S.drive.files().list, "files", q="'me' in owners and trashed=false", pageSize=1000,
+                   fields="nextPageToken,files(id,name,mimeType,appProperties)")
+    for f in live:
+        g = (f.get("appProperties") or {}).get("gab_id")
+        keep = keep_by_gid.get(g)
+        if not keep or f["id"] == keep:
+            continue
+        if f.get("mimeType") == b.FOLDER:
+            for child in b.pages(S.drive.files().list, "files", q=f"'{f['id']}' in parents and trashed=false",
+                                 pageSize=1000, fields="nextPageToken,files(id)"):
+                b.ex(S.drive.files().update(fileId=child["id"], addParents=keep, removeParents=f["id"], fields="id"))
+                out["moved"] += 1
+        b.ex_ok(S.drive.files().delete(fileId=f["id"]))
+        out["duplicates"] += 1
+    if out["duplicates"]:
+        log(f"wave2 drive: removed {out['duplicates']} duplicate item(s), moved {out['moved']} item(s) into the kept folders")
+    return out
+
+
 def seed(ctx: WorldCtx, S, st: dict[str, Any]) -> None:
     b = base()
     st["folder"], st["persona_id"] = ctx.folder, ctx.persona_id
@@ -638,6 +675,7 @@ def seed(ctx: WorldCtx, S, st: dict[str, Any]) -> None:
     except Exception as exc:  # noqa: BLE001 - cosmetic, never fail the seed on it
         LOG.warning("wave2: could not remove security-alert mail: %s", exc)
     time.sleep(10)  # let Contacts/Drive settle before the baseline snapshot
+    st["drive_dedupe"] = dedupe_drive(ctx, S, st)
     b.snapshot(ctx, S, st)
 
 
@@ -650,6 +688,7 @@ def restore(ctx: WorldCtx, S, st: dict[str, Any]) -> None:
         b.save_state(ctx, st)
     _stage(ctx, "baseline", st)
     time.sleep(5)
+    st["drive_dedupe"] = dedupe_drive(ctx, S, st)
     b.snapshot(ctx, S, st)
 
 
