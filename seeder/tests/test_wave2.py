@@ -562,6 +562,46 @@ class DriveFolderMergeTests(unittest.TestCase):
         self.assertEqual(merge_duplicate_folders({}), 0)
 
 
+class DriveAttachmentTests(_Wave2Env):
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 10
+
+    def rec(self, att, mime="image/png"):
+        return {"file_id": "t:img", "name": "logo.png", "mime_type": mime, "parent_folder_id": "fld",
+                "content_summary": "LOGO", "file_attachment": att, "modified_time": "2026-10-28T14:21:00Z"}
+
+    def test_bytes_are_read_from_a_dict_or_its_python_repr(self):
+        import base64
+        from wave2.runner import attachment_bytes
+        b64 = base64.b64encode(self.PNG).decode()
+        self.assertEqual(attachment_bytes(self.rec({"inline_bytes": b64})), self.PNG)
+        self.assertEqual(attachment_bytes(self.rec(str({"inline_bytes": b64}))), self.PNG)   # stored as a repr string
+        self.assertIsNone(attachment_bytes(self.rec(None)))
+        self.assertIsNone(attachment_bytes(self.rec({"inline_bytes": b64}, mime="application/vnd.google-apps.spreadsheet")))
+
+    def test_a_file_with_bytes_is_uploaded_as_is_not_skipped(self):
+        import base64
+        from wave2 import runner
+        b = runner.base()
+        f = self.rec({"inline_bytes": base64.b64encode(self.PNG).decode()})
+        self.assertEqual(b.file_kind(f), "attachment")
+        S = MagicMock()
+        S.drive.files().create().execute.return_value = {"id": "NEW"}
+        S.drive.files().get().execute.return_value = {"id": "NEW", "version": "3"}
+        st = {"drive_folders": {"fld": {"id": "FOLDER"}}}
+        with patch("googleapiclient.http.MediaInMemoryUpload") as up:
+            out = b.create_drive_file(MagicMock(), S, st, f)
+        self.assertEqual(out, {"id": "NEW", "version": "3"})
+        self.assertEqual(up.call_args.args[0], self.PNG)
+        body = S.drive.files().create.call_args.kwargs["body"]
+        self.assertEqual((body["name"], body["mimeType"], body["parents"]), ("logo.png", "image/png", ["FOLDER"]))
+
+    def test_a_file_without_bytes_keeps_the_old_path(self):
+        from wave2 import runner
+        b = runner.base()
+        f = self.rec(None, mime="text/plain")
+        self.assertNotEqual(b.file_kind(f), "attachment")
+
+
 class CalendarReuseTests(_Wave2Env):
     def _ctx_with(self, names):
         from wave2 import runner

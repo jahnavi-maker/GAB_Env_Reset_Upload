@@ -58,6 +58,58 @@ def state_root() -> Path:
     return root
 
 
+def _attachment_raw(f: dict) -> str | None:
+    a = f.get("file_attachment") if isinstance(f, dict) else None
+    if isinstance(a, str):
+        import ast  # noqa: PLC0415
+        try:
+            a = json.loads(a)
+        except ValueError:
+            try:
+                a = ast.literal_eval(a)
+            except (ValueError, SyntaxError):
+                return None
+    if not isinstance(a, dict):
+        return None
+    raw = a.get("inline_bytes")
+    return raw if isinstance(raw, str) and raw.strip() else None
+
+
+def _has_attachment(f: dict) -> bool:
+    return not str(f.get("mime_type") or "").startswith("application/vnd.google-apps") and _attachment_raw(f) is not None
+
+
+def attachment_bytes(f: dict) -> bytes | None:
+    """The real file a Drive record carries (base64 in file_attachment.inline_bytes), or None."""
+    if not _has_attachment(f):
+        return None
+    import base64, binascii  # noqa: E401, PLC0415
+    raw = "".join(_attachment_raw(f).split())
+    raw += "=" * (-len(raw) % 4)
+    for decode in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            data = decode(raw)
+            return data or None
+        except (binascii.Error, ValueError):
+            continue
+    return None
+
+
+def _upload_attachment(b, S, st: dict, f: dict, data: bytes) -> dict:
+    from googleapiclient.http import MediaInMemoryUpload  # noqa: PLC0415
+    mime = f.get("mime_type") or "application/octet-stream"
+    meta = {"name": f.get("name") or "Untitled", "mimeType": mime, "appProperties": {"gab_id": b.gid(f["file_id"])}}
+    par = f.get("parent_folder_id") or ""
+    if par in st["drive_folders"]:
+        meta["parents"] = [st["drive_folders"][par]["id"]]
+    media = MediaInMemoryUpload(data, mimetype=mime, resumable=len(data) > 5 * 1024 * 1024)
+    fid = b.ex(S.drive.files().create(body=meta, media_body=media, fields="id"))["id"]
+    if f.get("modified_time"):
+        b.ex(S.drive.files().update(fileId=fid, body={"modifiedTime": f["modified_time"]}))
+    got = b.ex(S.drive.files().get(fileId=fid, fields="id,version")) or {}
+    return {"id": fid, "version": got.get("version")}
+
+
 def base():
     """The pilot seeder module, configured once for in-process use.
 
@@ -78,10 +130,24 @@ def base():
             _orig_kind = gab_seed.file_kind
 
             def _file_kind(f):
+                if _has_attachment(f):
+                    return "attachment"
                 kind = _orig_kind(f)
                 return "text" if kind == "skip" and f.get("mime_type") in _TEXTISH else kind
 
             gab_seed.file_kind = _file_kind
+            # Files that carry their real bytes (file_attachment.inline_bytes: the PNGs, PDFs and
+            # XLSX the tasks use) are uploaded as-is instead of being rebuilt from content_summary
+            # (PDF/XLSX) or skipped (images).
+            _orig_create = gab_seed.create_drive_file
+
+            def _create_drive_file(ctx, S, st, f):
+                data = attachment_bytes(f)
+                if data is None:
+                    return _orig_create(ctx, S, st, f)
+                return _upload_attachment(gab_seed, S, st, f, data)
+
+            gab_seed.create_drive_file = _create_drive_file
             # Every seeded/restored item ends with save_state(ctx, st); piggy-back on it to
             # publish live per-surface counts for the Wave 2 page (throttled, per account).
             _orig_save = gab_seed.save_state
