@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -618,13 +619,28 @@ def _is_calendar_quota(exc: Exception) -> bool:
     return "quotaExceeded" in t or "usage limits" in t.lower() or "usageLimits" in t
 
 
+_CAL_NAME_MAX = 255   # Google refuses longer calendar names ("A provided value exceeds the allowed size limit")
+
+
+def calendar_name(name: str) -> str:
+    """A calendar name Google accepts. Some persona data puts a whole description in the name
+    (Denise's work calendar: 975 characters); keep the name part, before " (" or ";"."""
+    name = re.sub(r"\s+", " ", str(name or "")).strip()
+    if len(name) <= _CAL_NAME_MAX:
+        return name
+    cut = min((i for i in (name.find(" ("), name.find(";")) if i >= 3), default=-1)
+    if 3 <= cut <= _CAL_NAME_MAX:
+        return name[:cut].strip()
+    return name[:_CAL_NAME_MAX - 1].rstrip() + "…"
+
+
 def prepare_calendars(ctx: WorldCtx, S, st: dict[str, Any], log: Callable[[str], None] = LOG.info) -> dict[str, Any]:
     """Map the persona's secondary calendars onto calendars the account already owns
     (same name first, then any spare, renamed), create only what is still missing and
     delete spares. If Google refuses to create one (calendar-creation limit), that
     calendar's events go on the primary calendar and it is listed in ``fallback``."""
     b = base()
-    need = [(cid, (c.get("summary") or b.pretty_cal(cid)).strip())
+    need = [(cid, calendar_name(c.get("summary") or b.pretty_cal(cid)))
             for cid, c in b.calendar_map(ctx).items()
             if not (c.get("is_primary") or cid in ("cal_primary", "primary")) and cid not in st["calendars"]]
     pool = [{"id": c["id"], "summary": (c.get("summary") or "").strip()} for c in b.list_calendars(S)

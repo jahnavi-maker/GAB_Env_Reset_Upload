@@ -850,3 +850,13 @@ class DroppedConnectionRetryTests(unittest.TestCase):
         ex = self.runner._retry_dropped_reads(lambda req: req.execute())
         with self.assertRaises(BrokenPipeError):
             ex(self._req("GET", 10))
+
+
+class CalendarNameTests(unittest.TestCase):
+    def test_long_names_keep_the_name_part(self):
+        from wave2.runner import calendar_name  # noqa: PLC0415
+        long = "Lone Oak Home Health - HR (Employer workplace@example.com, EIN 74-2894105; " + "x" * 900 + ")"
+        self.assertEqual(calendar_name(long), "Lone Oak Home Health - HR")
+        self.assertEqual(calendar_name("  Family   calendar "), "Family calendar")
+        self.assertEqual(calendar_name("y" * 255), "y" * 255)
+        self.assertEqual(len(calendar_name("z" * 400)), 255)
