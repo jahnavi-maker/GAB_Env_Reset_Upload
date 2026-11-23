@@ -97,6 +97,18 @@ class Settings:
     # If empty, auth is disabled (dev only) and a warning is logged.
     api_key: str = os.environ.get("RESET_API_KEY", "")
 
+    # --- Module jobs (browser-driven workflows run by a worker machine) -----
+    # Separate secret for the worker machine's routes (/api/worker/*). Empty = those routes are off (503), never open.
+    worker_api_key: str = os.environ.get("WORKER_API_KEY", "")
+    jobs_table: str = os.environ.get("JOBS_TABLE", "module_jobs")
+    workers_table: str = os.environ.get("WORKERS_TABLE", "module_workers")
+    job_lease_s: int = _int_env("JOB_LEASE_S", 600)                      # a worker must heartbeat within this or the job returns to the queue
+    job_worker_live_s: int = _int_env("JOB_WORKER_LIVE_S", 60)           # a worker polled within this is "live"
+    job_unroutable_after_s: int = _int_env("JOB_UNROUTABLE_AFTER_S", 600)  # queued this long with no capable live worker = needs a person
+    # Screenshots a worker uploads when a job needs a person. Point JOB_FILES_DIR at a persistent folder in production.
+    job_files_dir: str = os.environ.get("JOB_FILES_DIR", str(Path(__file__).resolve().parent.parent / ".job-files"))
+    job_screenshot_max_bytes: int = _int_env("JOB_SCREENSHOT_MAX_BYTES", 2_000_000)
+
     # --- Supabase (audit + session store) -----------------------------------
     # SUPABASE_KEY should be a service-role or an insert/update-scoped key.
     supabase_url: str = os.environ.get("SUPABASE_URL", "")

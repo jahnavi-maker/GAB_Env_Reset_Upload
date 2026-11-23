@@ -184,3 +184,54 @@ create trigger trg_freelancer_blocklist_normalize_email before insert or update 
 -- gab_logins was an unused duplicate. Drop it if a legacy deployment still has it.
 -- ---------------------------------------------------------------------------
 drop table if exists gab_logins cascade;
+
+
+-- ---------------------------------------------------------------------------
+-- module_jobs : a queue of browser-driven workflow jobs (Keep seed / wipe, later Chat). A worker machine that holds the
+-- signed-in browser profiles claims them through /api/worker/*; callers enqueue through /api/jobs. See docs/MODULE_JOBS.md.
+-- A job only NAMES things (workflow, account, persona): no passwords, no persona data.
+-- ---------------------------------------------------------------------------
+create table if not exists module_jobs (
+    job_id             uuid primary key,
+    request_id         text        not null unique,      -- caller's idempotency key
+    workflow           text        not null,             -- keep-seed | keep-wipe
+    account            text        not null,             -- lowercased email
+    persona            text,                             -- seed only; must exist in the worker's own data
+    mode               text,                             -- keep-seed: clean | reseed
+    correlation        jsonb,                            -- { reset_session_id, task_allocation_id }
+    max_attempts       int         not null default 3,
+    pack_version       text,                             -- optional pin: only a worker with this data version may take it
+    request            jsonb       not null,             -- the normalised request, to tell a retry from a conflicting reuse
+    status             text        not null default 'queued',  -- queued|running|done|needs_manual|failed|cancelled|resolved
+    attempt            int         not null default 0,
+    worker_id          text,
+    lease_expires_at   timestamptz,
+    created_at         timestamptz not null default now(),
+    updated_at         timestamptz not null default now(),
+    started_at         timestamptz,
+    finished_at        timestamptz,
+    summary            text,
+    follow_up          jsonb,                            -- { code, reason, needs, step, screenshot } when a person has to act
+    resolution_note    text,
+    pack_version_used  text,
+    cancel_requested   boolean     not null default false,
+    events             jsonb       not null default '[]'
+);
+create index if not exists idx_module_jobs_status_created on module_jobs (status, created_at);
+create index if not exists idx_module_jobs_account        on module_jobs (account);
+create index if not exists idx_module_jobs_correlation    on module_jobs ((correlation->>'reset_session_id'));
+
+-- One running job per account, enforced by the database: two workers racing for the same account cannot both win.
+create unique index if not exists uniq_running_job_per_account
+    on module_jobs (account)
+    where status = 'running';
+
+-- module_workers : who has polled, and what they can do. Used to say "no worker has this account" / "the worker is offline".
+create table if not exists module_workers (
+    worker_id     text primary key,
+    accounts      jsonb       not null default '[]',
+    workflows     jsonb       not null default '[]',
+    personas      jsonb       not null default '[]',
+    pack_version  text,
+    last_seen     timestamptz not null
+);

@@ -45,3 +45,6 @@ _old_clone_backup_*/
 
 # runtime activity logs (activity.csv, by-email/, errors.log, summary.log)
 logs/
+
+# Screenshots uploaded by job workers (see docs/MODULE_JOBS.md)
+api/.job-files/
