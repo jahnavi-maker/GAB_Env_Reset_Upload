@@ -91,12 +91,42 @@ def load_world(folder: str) -> dict[str, Any]:
     manifest_path = pdir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
     bc = {k: _as_json(v) for k, v in (world.get("bard_contexts") or {}).items()}
+    normalize_contacts(bc)
     desc = {}
     for v in (world.get("descriptive_contexts") or {}).values():
         d = _as_json(v)
         if isinstance(d, dict):
             desc.update(d)
     return {"pdir": pdir, "world": world, "manifest": manifest, "bc": bc, "descriptive": desc}
+
+
+def normalize_contacts(bc: dict[str, Any]) -> int:
+    """Bring every contact to the shape the reference seeder understands, in place.
+
+    Most Wave 2 contacts are ``{contact_id, name, endpoints:[{value,label}]}``, but a few use
+    ``{name, emails:[], phone_numbers:[], relationship}`` with no id (6 across 3 personas).
+    Those get a STABLE id derived from their content (so re-runs and restores match the same
+    contact), their emails/phones become endpoints, and the relationship becomes the note.
+    Returns how many contacts were converted.
+    """
+    import hashlib
+
+    contacts = ((bc.get("CONTACTS") or {}).get("contact_lookup_result") or {}).get("contacts") or []
+    fixed = 0
+    for c in contacts:
+        if not isinstance(c, dict) or c.get("contact_id"):
+            continue
+        emails = [str(e).strip() for e in (c.get("emails") or []) if str(e).strip()]
+        phones = [str(p).strip() for p in (c.get("phone_numbers") or []) if str(p).strip()]
+        if not c.get("endpoints"):
+            c["endpoints"] = ([{"value": e, "label": "email"} for e in emails]
+                              + [{"value": p, "label": "mobile"} for p in phones])
+        if c.get("relationship") and not c.get("notes"):
+            c["notes"] = f"Relationship: {c['relationship']}"
+        key = json.dumps([c.get("name", ""), emails, phones], sort_keys=True)
+        c["contact_id"] = "w2_contact_" + hashlib.sha1(key.encode()).hexdigest()[:12]
+        fixed += 1
+    return fixed
 
 
 class WorldCtx:

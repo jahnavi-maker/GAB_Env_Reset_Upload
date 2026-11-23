@@ -111,6 +111,26 @@ class PersonaTests(_Wave2Env):
         self.assertIn(ACCOUNT.replace("@", "_").replace(".", "_"), c.persona)  # per-account state key
         self.assertIn("GMAIL", c.bc)
 
+    def test_contacts_in_the_alternate_format_are_normalized(self):
+        from wave2.personas import normalize_contacts
+        bc = {"CONTACTS": {"contact_lookup_result": {"contacts": [
+            {"contact_id": "c1", "name": "Std", "endpoints": [{"value": "s@example.com", "label": "email"}]},
+            {"name": "Buckeye Well", "emails": ["svc@example.com"], "phone_numbers": ["+1-614-555-0164"],
+             "relationship": "Local installer"},
+        ]}}}
+        self.assertEqual(normalize_contacts(bc), 1)
+        alt = bc["CONTACTS"]["contact_lookup_result"]["contacts"][1]
+        self.assertTrue(alt["contact_id"].startswith("w2_contact_"))
+        self.assertEqual(alt["endpoints"], [{"value": "svc@example.com", "label": "email"},
+                                            {"value": "+1-614-555-0164", "label": "mobile"}])
+        self.assertEqual(alt["notes"], "Relationship: Local installer")
+        first_id = alt["contact_id"]
+        again = {"CONTACTS": {"contact_lookup_result": {"contacts": [
+            {"name": "Buckeye Well", "emails": ["svc@example.com"], "phone_numbers": ["+1-614-555-0164"]}]}}}
+        normalize_contacts(again)
+        self.assertEqual(again["CONTACTS"]["contact_lookup_result"]["contacts"][0]["contact_id"], first_id)  # stable
+        self.assertEqual(normalize_contacts(bc), 0)  # idempotent
+
     def test_profile_name_variants(self):
         from wave2.personas import _profile_name
         self.assertEqual(_profile_name("# Adrian Castellanos: The Operations Consultant"), "Adrian Castellanos")
