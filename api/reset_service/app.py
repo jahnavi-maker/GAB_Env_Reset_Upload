@@ -461,7 +461,15 @@ async def _decide_mode(store: Store, email: str, persona: str, explicit: str | N
     last = await _last_reset_persona(store, email)
     if not last:
         return "reseed"
-    return "reconcile" if _persona_key(last) == _persona_key(persona) else "reseed"
+    if _persona_key(last) == _persona_key(persona):
+        return "reconcile"
+    # Wave 2 names arrive in several spellings ("Dr. Marcus Vance : The ..." from the
+    # tasking sheet, "Marcus Vance" from the CSV, "marcus_vance"); the same Wave 2 persona
+    # is a reconcile, not a 15-minute wipe + reseed.
+    wave2_now = engine._wave2_persona(persona)
+    if wave2_now and engine._wave2_persona(last) == wave2_now:
+        return "reconcile"
+    return "reseed"
 
 
 async def _safe_update(store: Store, reset_session_id: str, fields: dict) -> None:

@@ -130,3 +130,23 @@ class ScopeTests(_Root):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DecideModeTests(_Root):
+    """A Cosmo reset sends the tasking-sheet name; the account was recorded under the CSV name.
+    The same Wave 2 persona must reconcile (restore), never wipe + reseed."""
+
+    def _mode(self, last, requested):
+        import asyncio
+        from reset_service import app
+        with patch.object(app, "_last_reset_persona", return_value=last), \
+             patch.object(app, "settings", dataclasses.replace(app.settings, reset_auto_route=True)):
+            return asyncio.run(app._decide_mode(None, "a@b.com", requested, None))
+
+    def test_same_wave2_persona_in_another_spelling_reconciles(self):
+        self.assertEqual(self._mode("Arthur Pendelton", "Dr. Arthur Pendelton : The Retired Principal"), "reconcile")
+        self.assertEqual(self._mode("arthur_pendelton", "Arthur Pendelton"), "reconcile")
+
+    def test_a_different_persona_still_reseeds(self):
+        self.assertEqual(self._mode("Arthur Pendelton", "Student"), "reseed")
+        self.assertEqual(self._mode("Student", "Arthur Pendelton"), "reseed")
