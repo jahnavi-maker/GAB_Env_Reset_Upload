@@ -399,3 +399,22 @@ class BirthdayTests(unittest.TestCase):
         self.assertEqual(profile_birthday(doc), "1958-04-22")
         self.assertEqual(profile_birthday("| **Date of Birth & Age** | Sept. 4, 1986 (Age 40) |"), "1986-09-04")
         self.assertEqual(profile_birthday("no table here; Born September 14, 1960"), "")
+
+
+class HomeAddressUnitTests(unittest.TestCase):
+    def test_unit_from_the_personas_own_data_is_added(self):
+        from wave2.personas import with_unit
+        data = "Lease: 285 Lafayette St, Apt 4B, New York, NY 10012 | rent"
+        self.assertEqual(with_unit("285 Lafayette St, New York, NY 10012", data),
+                         "285 Lafayette St, Apt 4B, New York, NY 10012")
+        self.assertEqual(with_unit("1180 Peachtree St NE, Atlanta, GA 30309",
+                                   "statement 1180 Peachtree St NE, Unit 2408, Atlanta"),
+                         "1180 Peachtree St NE, Unit 2408, Atlanta, GA 30309")
+
+    def test_no_unit_or_already_has_one_is_unchanged(self):
+        from wave2.personas import with_unit
+        self.assertEqual(with_unit("1420 Oakridge Dr, Columbus, OH 43221", "1420 Oakridge Dr, Columbus"),
+                         "1420 Oakridge Dr, Columbus, OH 43221")
+        self.assertEqual(with_unit("9 Elm St, Apt 2, Austin", "9 Elm St, Unit 7"), "9 Elm St, Apt 2, Austin")
+        # another street's unit is never borrowed
+        self.assertEqual(with_unit("9 Elm St, Austin", "19 Elm St, Unit 7"), "9 Elm St, Austin")

@@ -180,8 +180,27 @@ class WorldCtx:
             m = re.search(pat, doc)
             if m and m.group(1).strip():
                 # Street address only: drop "(neighbourhood ...)" notes and anything after them.
-                return m.group(1).split("(")[0].strip().rstrip(".,; ")
+                addr = m.group(1).split("(")[0].strip().rstrip(".,; ")
+                return with_unit(addr, json.dumps(self.world.get("bard_contexts") or {}))
         return ""
+
+
+_UNIT_RE = r"(?:Apt|Apartment|Unit|Suite|Ste|#)\.?\s*[A-Za-z0-9-]+"
+
+
+def with_unit(addr: str, text: str) -> str:
+    """Add the apartment/unit the profile row leaves out but the persona's own data uses
+    ('285 Lafayette St, Apt 4B, New York, NY 10012' in bills and leases). The unit is taken
+    only when it directly follows this exact street; an address that already has one, or
+    whose street never appears with a unit, is returned unchanged."""
+    if not addr or re.search(r"\b" + _UNIT_RE + r"\b", addr):
+        return addr
+    street, sep, rest = addr.partition(",")
+    m = re.search(r"(?<![\w-])" + re.escape(street.strip()) + r",?\s+(" + _UNIT_RE + r")\b", text or "")
+    if not m:
+        return addr
+    unit = re.sub(r"\s+", " ", m.group(1)).strip()
+    return f"{street.strip()}, {unit}{sep}{rest}" if sep else f"{street.strip()}, {unit}"
 
 
 _MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september",
