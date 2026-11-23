@@ -1878,6 +1878,36 @@ async def ui_onboard_page() -> HTMLResponse:
     return HTMLResponse((STATIC_DIR / "onboard.html").read_text(encoding="utf-8"))
 
 
+# --------------------------------------------------------------------------- #
+# Wave 2 page (GAB v2 turn-split personas). Read-only additions: authorize, upload and  #
+# reset reuse /ui/authorize, /ui/seed, /ui/batch-status exactly as /onboard does.       #
+# --------------------------------------------------------------------------- #
+@app.get("/wave2", response_class=HTMLResponse)
+async def ui_wave2_page() -> HTMLResponse:
+    return HTMLResponse((STATIC_DIR / "wave2.html").read_text(encoding="utf-8"))
+
+
+@app.get("/ui/wave2/personas")
+async def ui_wave2_personas() -> dict:
+    return await asyncio.to_thread(engine.wave2_personas)
+
+
+@app.get("/ui/wave2/account")
+async def ui_wave2_account(email: str) -> dict:
+    email = (email or "").strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="email required")
+    return {"email": email, **(await asyncio.to_thread(engine.wave2_account, email))}
+
+
+@app.get("/ui/wave2/progress")
+async def ui_wave2_progress(email: str, persona: str = "") -> dict:
+    email = (email or "").strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="email required")
+    return {"email": email, "progress": await asyncio.to_thread(engine.wave2_progress, email, persona)}
+
+
 @app.get("/onboard/authorize")
 async def ui_authorize_workspace() -> RedirectResponse:
     """Legacy path: authorization is now part of the single onboarding page. Keep the

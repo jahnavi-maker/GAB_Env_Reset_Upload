@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GAB Wave 2</title>
+<style>
+  :root { --bg:#f6f3f0; --card:#fff; --ink:#111113; --muted:#6b6b70; --brand:#175fff;
+    --ok:#12855a; --err:#c0392b; --warn:#b8860b; --line:#e6e2dd; --chip:#eef1f6; --soft:#faf9f7; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#111113; --card:#1b1b1e; --ink:#f6f3f0; --muted:#9a9aa0;
+      --line:#2c2c30; --chip:#23232a; --soft:#17171a; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); padding:24px 16px;
+    font-family:-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",sans-serif; }
+  .wrap { max-width:1120px; margin:0 auto; }
+  h1 { font-size:22px; margin:0 0 4px; letter-spacing:-.01em; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:18px; }
+  .sub a { color:inherit; font-weight:600; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; margin-bottom:16px; }
+  .step { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin-bottom:10px; }
+  label.file, button { appearance:none; border:0; cursor:pointer; border-radius:10px; font-weight:600; }
+  button.primary, label.file { background:var(--brand); color:#fff; padding:11px 16px; font-size:14px; display:inline-block; }
+  button.ghost { background:var(--chip); color:var(--ink); padding:9px 14px; font-size:13px; }
+  button.mini { padding:6px 11px; font-size:12px; }
+  button:disabled { opacity:.45; cursor:default; }
+  textarea { width:100%; min-height:100px; border:1px solid var(--line); border-radius:10px; padding:10px 12px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; background:var(--bg); color:var(--ink); resize:vertical; }
+  .hint { color:var(--muted); font-size:12px; }
+  .note { font-size:12px; margin-top:8px; }
+  .note.ok{color:var(--ok);} .note.err{color:var(--err);} .note.warn{color:var(--warn);}
+  .banner { border-radius:10px; padding:12px 14px; font-size:13px; margin-bottom:16px; display:none; }
+  .banner.err { display:block; background:#fdecea; color:#8a1c12; border:1px solid #f5c6c0; }
+  .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .counts { font-size:13px; color:var(--muted); margin-left:auto; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; }
+  .chip { background:var(--chip); border-radius:999px; padding:4px 10px; font-size:12px; }
+  .chip b { font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.03em; }
+  td.email { word-break:break-all; max-width:230px; }
+  .bad { color:var(--err); font-weight:600; }
+  .perm { font-size:12px; }
+  .perm.ok { color:var(--ok); } .perm.no { color:var(--warn); } .perm.unk { color:var(--muted); }
+  .st { font-weight:700; display:inline-flex; align-items:center; gap:6px; }
+  .st.running{color:var(--brand);} .st.completed{color:var(--ok);} .st.failed{color:var(--err);} .st.idle{color:var(--muted);}
+  .spin { width:12px;height:12px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;
+    animation:spin .7s linear infinite;display:inline-block; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .pwwrap { display:flex; gap:6px; align-items:center; }
+  .pwval { font-family:ui-monospace,Menlo,monospace; font-size:13px; }
+  .svc { margin-top:6px; display:grid; grid-template-columns:auto 1fr; gap:1px 10px; font-size:11px;
+    font-family:ui-monospace,monospace; color:var(--muted); max-width:360px; }
+  .svc .ok { color:var(--ok); } .svc .run { color:var(--brand); } .svc .bad { color:var(--err); font-weight:400; }
+  .svc .man { color:var(--warn); }
+  .stage { font-size:11px; color:var(--muted); margin-top:4px; }
+  .manual { margin-top:8px; padding:8px 10px; border-left:3px solid var(--warn); background:var(--soft);
+    border-radius:4px; font-size:12px; line-height:1.5; max-width:420px; }
+  .manual b { font-weight:600; }
+  .dropzone { display:block; border:2px dashed var(--line); border-radius:12px; padding:18px; text-align:center;
+    cursor:pointer; background:var(--bg); }
+  .dropzone:hover, .dropzone.drag { border-color:var(--brand); background:var(--chip); }
+  .rid { font-family:ui-monospace,monospace; font-size:10px; color:var(--muted); word-break:break-all; margin-top:4px; }
+  .diag { margin-top:8px; padding:8px 10px; border-left:3px solid var(--err); background:var(--soft); border-radius:4px;
+    font-size:12px; line-height:1.5; max-width:420px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>GAB Wave 2</h1>
+  <div class="sub">Phase 9 · Wave 2 personas: seeds <b>Gmail, Calendar, Drive, Contacts, Tasks</b> (and Keep once its API is connected).
+    Classic personas and empty-universe accounts stay on <a href="/onboard">/onboard →</a></div>
+
+  <div class="banner" id="banner"></div>
+
+  <div class="card">
+    <div class="step">Wave 2 personas on this server</div>
+    <div class="chips" id="personaChips"><span class="hint">Loading…</span></div>
+  </div>
+
+  <div class="card">
+    <div class="step">1 · Accounts (CSV: email, persona, password, mode)</div>
+    <textarea id="csv" placeholder="email, persona, password, mode&#10;geminiapp.gab.demo.user836@gmail.com, Arthur Pendelton, p4ssw0rd, upload&#10;geminiapp.gab.demo.user837@gmail.com, Dr. Marcus Vance, s3cret, reconcile"></textarea>
+    <div class="bar" style="margin-top:10px">
+      <label class="file">Choose CSV<input id="csvFile" type="file" accept=".csv,text/csv,text/plain" hidden></label>
+      <button class="ghost" id="loadBtn">Load accounts</button>
+      <span class="hint">Persona can be the name from the tasking sheet ("Dr. Marcus Vance : The …") or the id (<code>marcus_vance</code>).
+        <b>mode</b> is optional: <b>upload</b>, <b>reconcile</b>, <b>reseed</b>, <b>delta</b>; blank = automatic. Passwords stay in this browser.</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="step">2 · OAuth client (client.json)</div>
+    <label class="dropzone" id="clientDrop">
+      <input id="clientFile" type="file" accept=".json,application/json" hidden>
+      <div style="font-weight:600;font-size:14px;margin-bottom:4px">Drop the project's <b>client.json</b> here</div>
+      <div class="hint">Its Google Cloud project needs the People API and Google Tasks API enabled, and the Contacts + Tasks scopes added.</div>
+      <div id="clientName" class="hint" style="margin-top:6px">Checking…</div>
+    </label>
+    <div id="clientNote" class="note"></div>
+  </div>
+
+  <div class="card" id="tableCard" style="display:none">
+    <div class="step">3 · Authorize &amp; run</div>
+    <div class="bar" style="margin-bottom:12px">
+      <button class="ghost" id="authAll">Authorize all (one by one)</button>
+      <button class="primary" id="runAll">Run all ready</button>
+      <button class="ghost" id="refreshAll">Refresh</button>
+      <button class="ghost" id="hardReset">Hard reset</button>
+      <span class="counts" id="counts"></span>
+    </div>
+    <div style="overflow:auto">
+      <table>
+        <thead><tr><th>Account</th><th>Persona</th><th>Password</th><th>Permissions</th><th>Actions</th><th>Status &amp; progress</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <div class="hint" style="margin-top:10px">
+      <b>Authorize</b> opens Google's consent in a new tab. Sign in, tick <b>Select all</b> (Gmail, Drive, Calendar, Contacts, Tasks) and Continue.
+      An account authorized before Wave 2 shows <b>needs Wave 2 sign-in</b> until it is re-authorized here.
+      <b>Run</b> = first upload (wipe + seed) or, for an account already on this persona, a reconcile back to its baseline.
+    </div>
+  </div>
+</div>
+
+<script>
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s==null?"":s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const TITLES = ["dr","chief","mr","mrs","ms","miss","prof","professor","rev","pastor"];
+  // Same rule as the server (seeder/wave2/personas.py normalize): drop ": archetype", titles, punctuation.
+  function normalize(name){
+    let words = String(name||"").split(":")[0].trim().toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    while (words.length && TITLES.includes(words[0])) words = words.slice(1);
+    return words.join("_");
+  }
+  const SURFACES = [["GMAIL","Gmail"],["CALENDAR","Calendar"],["DRIVE","Drive"],["CONTACTS","Contacts"],["TASKS","Tasks"]];
+  const STAGES = {starting:"starting", "checking access":"checking access", wipe:"wiping account", gmail:"seeding Gmail",
+    contacts:"seeding Contacts", calendar:"seeding Calendar", drive:"seeding Drive", tasks:"seeding Tasks",
+    restore_gmail:"restoring Gmail", restore_contacts:"restoring Contacts", restore_calendar:"restoring Calendar",
+    restore_drive:"restoring Drive", restore_tasks:"restoring Tasks", baseline:"recording baseline", verify:"verifying",
+    done:"done", failed:"failed"};
+
+  let personas = [];            // [{folder,name,timezone,expected,manual}]
+  let byKey = {};               // normalized alias -> persona
+  let clientReady = false;
+  const rows = [];              // {email, rawP, folder, password, mode, authorized, wave2Ready, permReason, status, uid, error, progress, diag}
+  const ROWS_KEY = "gab_wave2_rows", CSV_KEY = "gab_wave2_csv";
+
+  function persist(){
+    try {
+      localStorage.setItem(ROWS_KEY, JSON.stringify(rows.map(r => ({email:r.email, rawP:r.rawP, folder:r.folder,
+        password:r.password||null, mode:r.mode||null, status:r.status, uid:r.uid||null, error:r.error||null}))));
+      localStorage.setItem(CSV_KEY, $("csv").value || "");
+    } catch(e){}
+  }
+
+  // ---------- personas ----------
+  async function loadPersonas(){
+    try {
+      const r = await fetch("/ui/wave2/personas"); const d = await r.json();
+      personas = d.personas || [];
+      byKey = {};
+      personas.forEach(p => { byKey[normalize(p.folder)] = p; byKey[normalize(p.name)] = p; });
+      if (!d.enabled){
+        $("banner").className = "banner err";
+        $("banner").textContent = "Wave 2 is not enabled on this server (GAB_WAVE2_ROOT is not set)." + (d.error ? " " + d.error : "");
+      }
+      $("personaChips").innerHTML = personas.length ? personas.map(p =>
+        `<span class="chip" title="${esc(p.timezone)}"><b>${esc(p.name)}</b> · ${p.expected.GMAIL} mail · ${p.expected.CALENDAR} events · ${p.expected.CONTACTS} contacts · ${p.expected.TASKS} tasks · ${p.manual.keep_items} Keep</span>`
+      ).join("") : '<span class="hint">None.</span>';
+    } catch(e){ $("personaChips").innerHTML = '<span class="bad">Could not load Wave 2 personas.</span>'; }
+  }
+  const personaOf = row => personas.find(p => p.folder === row.folder) || null;
+
+  // ---------- client.json ----------
+  async function checkClient(){
+    try {
+      const d = await (await fetch("/ui/client")).json();
+      clientReady = !!(d && (d.present || d.delegation));
+      $("clientName").innerHTML = clientReady
+        ? "🔒 Authorizing with client.json ✓" + (d.project_id ? " — project <b>" + esc(d.project_id) + "</b>" : "")
+        : "No client configured — drop client.json.";
+    } catch(e){ clientReady = false; $("clientName").textContent = "No client configured — drop client.json."; }
+    render();
+  }
+  async function uploadClient(f){
+    if (!f) return;
+    $("clientNote").className = "note"; $("clientNote").textContent = "Uploading…";
+    const fd = new FormData(); fd.append("file", f);
+    try {
+      const r = await fetch("/ui/client", {method:"POST", body:fd}); const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || ("HTTP " + r.status));
+      const miss = d.missing_redirects || [];
+      $("clientNote").className = "note " + (miss.length ? "warn" : "ok");
+      $("clientNote").textContent = miss.length ? "Saved. Also register these redirect URIs in Google: " + miss.join(", ") : "client.json saved ✓";
+      await checkClient();
+    } catch(e){ $("clientNote").className = "note err"; $("clientNote").textContent = "Rejected: " + e.message; }
+  }
+  $("clientFile").addEventListener("change", e => uploadClient(e.target.files[0]));
+  const dz = $("clientDrop");
+  ["dragenter","dragover"].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add("drag"); }));
+  ["dragleave","dragend"].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove("drag"); }));
+  dz.addEventListener("drop", e => { e.preventDefault(); dz.classList.remove("drag"); const f = e.dataTransfer.files[0]; if (f) uploadClient(f); });
+
+  // ---------- CSV ----------
+  $("csvFile").addEventListener("change", e => { const f = e.target.files[0]; if (!f) return;
+    const rd = new FileReader(); rd.onload = () => { $("csv").value = rd.result; persist(); }; rd.readAsText(f); });
+  $("loadBtn").addEventListener("click", loadCsv);
+  const MODES = ["upload","reconcile","reseed","delta"];
+  function loadCsv(){
+    rows.length = 0;
+    for (const line of $("csv").value.split(/\r?\n/)){
+      const t = line.trim(); if (!t) continue;
+      const parts = t.split(/[,\t]/).map(x => x.trim()).filter(Boolean);
+      const email = parts.find(p => p.includes("@")); if (!email || /^e?mail$/i.test(email)) continue;
+      let cols = parts.filter(p => p !== email && !/^(e?mail|persona|password|mode)$/i.test(p));
+      let mode = null; const mi = cols.findIndex(c => MODES.includes(c.toLowerCase()));
+      if (mi >= 0){ mode = cols[mi].toLowerCase(); cols = cols.filter((_, j) => j !== mi); }
+      let folder = null, rawP = null, pi = -1;
+      for (let j = 0; j < cols.length; j++){ const p = byKey[normalize(cols[j])]; if (p){ folder = p.folder; rawP = cols[j]; pi = j; break; } }
+      const password = pi >= 0 ? (cols.find((c, j) => j !== pi) || null) : (cols[1] || null);
+      if (pi < 0) rawP = cols[0] || null;
+      rows.push({email:email.toLowerCase(), rawP, folder, password, mode, status:"idle"});
+    }
+    $("tableCard").style.display = rows.length ? "block" : "none";
+    render(); persist();
+    rows.forEach((r, i) => setTimeout(() => refreshAccount(i), i * 200));
+    syncStatuses();
+  }
+
+  // ---------- account state ----------
+  async function refreshAccount(i){
+    const row = rows[i]; if (!row || !row.folder) return;
+    try {
+      const a = await (await fetch("/ui/account?email=" + encodeURIComponent(row.email))).json();
+      row.authorized = !!a.authorized;
+      if (row.authorized){
+        const w = await (await fetch("/ui/wave2/account?email=" + encodeURIComponent(row.email))).json();
+        row.wave2Ready = w.wave2_ready; row.permReason = w.reason || null;
+      } else { row.wave2Ready = false; row.permReason = null; }
+    } catch(e){ row.wave2Ready = null; }
+    render();
+  }
+
+  // ---------- authorize ----------
+  async function authorize(i){
+    const row = rows[i]; if (!clientReady || !row.folder) return;
+    row.authorizing = true; render();
+    try {
+      const r = await fetch("/ui/authorize", {method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({email: row.email, persona: row.folder, return_to: "/authorized"})});
+      const d = await r.json(); if (!r.ok) throw new Error(d.detail || ("HTTP " + r.status));
+      window.open(d.auth_url, "_blank");
+      pollAuthorize(i, 0);
+    } catch(e){ row.authorizing = false; row.error = e.message; row.status = "failed"; render(); }
+  }
+  async function pollAuthorize(i, n){
+    const row = rows[i];
+    await refreshAccount(i);
+    if (row.wave2Ready === true || n > 100){ row.authorizing = false; render(); return; }
+    setTimeout(() => pollAuthorize(i, n + 1), 3000);
+  }
+  async function authorizeAll(){
+    for (let i = 0; i < rows.length; i++){
+      const r = rows[i]; if (!r.folder || r.wave2Ready === true) continue;
+      await authorize(i);
+      for (let k = 0; k < 120 && rows[i].authorizing; k++) await new Promise(res => setTimeout(res, 2500));
+    }
+  }
+
+  // ---------- run (upload / reconcile / reseed / delta) ----------
+  async function run(i, forceMode){
+    const row = rows[i]; if (!row.folder || row.wave2Ready !== true) return;
+    row.status = "running"; row.error = null; row.diag = null; row.progress = null; render();
+    try {
+      const body = {email: row.email, persona: row.folder};
+      const mode = forceMode || row.mode; if (mode) body.mode = mode;
+      const r = await fetch("/ui/seed", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+      const d = await r.json(); if (!r.ok) throw new Error(d.detail || ("HTTP " + r.status));
+      row.uid = d.reset_session_id; row.opMode = d.mode || mode || null; render(); persist();
+      ensurePolling();
+    } catch(e){ row.status = "failed"; row.error = e.message; render(); }
+  }
+  async function runAll(){
+    for (let i = 0; i < rows.length; i++){
+      const r = rows[i];
+      if (r.folder && r.wave2Ready === true && r.status !== "running"){ await run(i); await new Promise(res => setTimeout(res, 400)); }
+    }
+  }
+
+  // ---------- status + progress polling ----------
+  let pollTimer = null;
+  function ensurePolling(){ if (!pollTimer) pollTimer = setTimeout(pollOnce, 2500); }
+  async function syncStatuses(){
+    const emails = rows.map(r => r.email); if (!emails.length) return;
+    try {
+      const d = await (await fetch("/ui/batch-status?emails=" + encodeURIComponent(emails.join(",")))).json();
+      const st = d.statuses || {};
+      rows.forEach(r => {
+        const s = st[r.email]; if (!s || !s.status) return;
+        const ns = s.status === "completed" ? "completed" : s.status === "failed" ? "failed" : "running";
+        if (r.status === "running" || !r.uid || r.uid === s.reset_session_id){
+          r.status = ns; r.uid = s.reset_session_id; r.error = s.status === "failed" ? s.error : null; r.opMode = s.mode || r.opMode;
+        }
+      });
+    } catch(e){}
+  }
+  async function pollProgress(){
+    const live = rows.filter(r => r.folder && (r.status === "running" || (r.status !== "idle" && !r.progress))).slice(0, 12);
+    await Promise.all(live.map(async r => {
+      try {
+        const d = await (await fetch("/ui/wave2/progress?email=" + encodeURIComponent(r.email) + "&persona=" + encodeURIComponent(r.folder))).json();
+        if (d.progress) r.progress = d.progress;
+      } catch(e){}
+    }));
+  }
+  async function pollOnce(){
+    pollTimer = null;
+    await syncStatuses(); await pollProgress(); render(); persist();
+    if (rows.some(r => r.status === "running")) pollTimer = setTimeout(pollOnce, 3000);
+  }
+  async function refreshAll(){ rows.forEach((r, i) => setTimeout(() => refreshAccount(i), i * 150)); await pollOnce(); }
+
+  async function explain(i){
+    const row = rows[i]; if (!row.uid) return;
+    row.diag = {headline:"Explaining…"}; render();
+    try {
+      const d = await (await fetch("/ui/upload/" + encodeURIComponent(row.uid) + "/diagnose")).json();
+      row.diag = d.diagnosis || {headline:"No diagnosis available"};
+    } catch(e){ row.diag = {headline:"Couldn't load diagnosis", detail:String(e.message || e)}; }
+    render();
+  }
+
+  // ---------- render ----------
+  function permCell(row){
+    if (!row.folder) return '<span class="perm unk">—</span>';
+    if (row.authorizing) return '<span class="perm unk"><span class="spin"></span> awaiting consent</span>';
+    if (row.wave2Ready === true) return '<span class="perm ok">✓ Gmail · Calendar · Drive · Contacts · Tasks</span>';
+    if (row.authorized && row.wave2Ready === false) return '<span class="perm no" title="' + esc(row.permReason || "") + '">⚠ needs Wave 2 sign-in (Contacts + Tasks)</span>';
+    if (row.wave2Ready === null && row.authorized) return '<span class="perm unk">? could not check</span>';
+    if (row.authorized === undefined) return '<span class="perm unk">checking…</span>';
+    return '<span class="perm no">not authorized</span>';
+  }
+  function statusCell(row){
+    const p = row.progress, persona = personaOf(row);
+    let label = "";
+    if (row.status === "running") label = '<span class="st running"><span class="spin"></span> ' + esc(STAGES[p && p.stage] || "running") + "</span>";
+    else if (row.status === "completed") label = '<span class="st completed">✅ ' + esc((p && p.action === "restore") || row.opMode === "reconcile" ? "reset to baseline" : "seeded") + "</span>";
+    else if (row.status === "failed") label = '<span class="st failed">❌ ' + esc((row.error || "failed").slice(0, 140)) + "</span>";
+    else label = '<span class="st idle">' + (row.wave2Ready === true ? "ready" : "—") + "</span>";
+
+    let svc = "";
+    const exp = (p && p.expected) || (persona && persona.expected);
+    if (exp && (p || row.status !== "idle")){
+      const counts = (p && p.counts) || {}, ver = (p && p.verify) || null;
+      svc = '<div class="svc">' + SURFACES.map(([k, label]) => {
+        const got = counts[k], want = exp[k];
+        let cls = "", txt = (got == null ? "–" : got) + " / " + want;
+        if (ver && ver[k]) { cls = ver[k].ok ? "ok" : "bad"; txt = ver[k].seeded + " / " + ver[k].expected + (ver[k].ok ? " ✓" : " ✗"); }
+        else if (row.status === "running" && p && p.stage && p.stage.endsWith(k.toLowerCase())) cls = "run";
+        return `<span>${label}</span><span class="${cls}">${esc(txt)}</span>`;
+      }).join("") + `<span>Keep</span><span class="man">manual · ${(p && p.manual ? p.manual.keep_items : persona ? persona.manual.keep_items : "?")} items (Keep API pending)</span></div>`;
+    }
+    let manual = "";
+    if (row.status === "completed"){
+      const s = (p && p.account_settings) || {name: persona && persona.name, timezone: persona && persona.timezone};
+      manual = `<div class="manual"><b>Still manual on this account</b><br>
+        • Name: <b>${esc(s.name || "?")}</b>${s.home_address ? ` · Home address: <b>${esc(s.home_address)}</b>` : ""}${s.timezone ? ` · Time zone: ${esc(s.timezone)}` : ""}<br>
+        • Keep: ${(p && p.manual ? p.manual.keep_items : "?")} lists/notes (until the Keep API is connected)<br>
+        • Gemini: clear chats, activity, Saved info before each run</div>`;
+    }
+    const diag = row.diag ? `<div class="diag"><b>${esc(row.diag.headline || "")}</b>${row.diag.detail ? "<br>" + esc(row.diag.detail) : ""}${row.diag.action ? "<br>→ " + esc(row.diag.action) : ""}</div>` : "";
+    const rid = row.uid ? `<div class="rid">${esc(row.uid)}</div>` : "";
+    return label + svc + manual + diag + rid;
+  }
+  function render(){
+    const tb = $("rows"); tb.innerHTML = "";
+    rows.forEach((row, i) => {
+      const tr = document.createElement("tr");
+      const persona = personaOf(row);
+      tr.innerHTML = `<td class="email">${esc(row.email)}</td>` +
+        `<td>${persona ? esc(persona.name) + (row.mode ? ` <span class="hint">· ${esc(row.mode)}</span>` : "") : `<span class="bad">? ${esc(row.rawP || "missing")}</span><div class="hint">not a Wave 2 persona</div>`}</td>` +
+        `<td class="pw"></td><td>${permCell(row)}</td><td class="act"></td><td>${statusCell(row)}</td>`;
+      const pw = tr.querySelector(".pw");
+      if (row.password){
+        const w = document.createElement("div"); w.className = "pwwrap";
+        const v = document.createElement("span"); v.className = "pwval"; v.textContent = "••••••••";
+        const s = document.createElement("button"); s.className = "ghost mini"; s.textContent = "Show";
+        s.onclick = () => { const on = v.textContent !== "••••••••"; v.textContent = on ? "••••••••" : row.password; s.textContent = on ? "Show" : "Hide"; };
+        const c = document.createElement("button"); c.className = "ghost mini"; c.textContent = "Copy";
+        c.onclick = () => navigator.clipboard && navigator.clipboard.writeText(row.password).then(() => { c.textContent = "Copied ✓"; setTimeout(() => c.textContent = "Copy", 1200); });
+        w.append(v, s, c); pw.appendChild(w);
+      } else pw.innerHTML = '<span class="hint">—</span>';
+      const box = document.createElement("div"); box.className = "actions"; tr.querySelector(".act").appendChild(box);
+      const add = (label, fn, disabled, title) => { const b = document.createElement("button"); b.className = "ghost mini"; b.textContent = label;
+        b.disabled = !!disabled; if (title) b.title = title; b.onclick = fn; box.appendChild(b); };
+      const running = row.status === "running";
+      if (row.wave2Ready !== true) add(row.authorized ? "Re-authorize for Wave 2" : "Authorize", () => authorize(i), !clientReady || !row.folder || row.authorizing);
+      add(row.mode ? "Run " + row.mode : "Run", () => run(i), row.wave2Ready !== true || running, "Upload, or reset to baseline if already on this persona");
+      add("Reseed", () => run(i, "reseed"), row.wave2Ready !== true || running, "Wipe the account and seed this persona from scratch");
+      if (row.status === "failed" && row.uid) add("Explain", () => explain(i));
+      tb.appendChild(tr);
+    });
+    const ready = rows.filter(r => r.wave2Ready === true).length, done = rows.filter(r => r.status === "completed").length,
+          failed = rows.filter(r => r.status === "failed").length, running = rows.filter(r => r.status === "running").length;
+    $("counts").textContent = `${ready} ready · ${running} running · ${done} done · ${failed} failed · ${rows.length} total`;
+  }
+
+  $("authAll").addEventListener("click", authorizeAll);
+  $("runAll").addEventListener("click", runAll);
+  $("refreshAll").addEventListener("click", refreshAll);
+  $("hardReset").addEventListener("click", async () => {
+    if (!confirm("Clear the loaded accounts, passwords and CSV from this page? Nothing on the accounts is touched.")) return;
+    try { localStorage.removeItem(ROWS_KEY); localStorage.removeItem(CSV_KEY); } catch(e){}
+    rows.length = 0; $("csv").value = ""; $("tableCard").style.display = "none"; render();
+  });
+
+  (async function init(){
+    await loadPersonas();
+    await checkClient();
+    try {
+      const csv = localStorage.getItem(CSV_KEY); if (csv) $("csv").value = csv;
+      const saved = JSON.parse(localStorage.getItem(ROWS_KEY) || "[]");
+      if (saved.length){
+        saved.forEach(r => rows.push(r)); $("tableCard").style.display = "block"; render();
+        rows.forEach((r, i) => setTimeout(() => refreshAccount(i), i * 150));
+        pollOnce();
+      }
+    } catch(e){}
+  })();
+</script>
+</body>
+</html>

@@ -387,6 +387,45 @@ def _run_wave2(email: str, folder: str, mode: str, progress_id: str | None = Non
     return ResetResult(ok, str(out.get("detail") or ""), effective, returncode=0 if ok else 1, raw=out)
 
 
+def wave2_personas() -> dict:
+    """For the /wave2 page: is Wave 2 enabled here, and which personas (with counts)."""
+    _ensure_seeder_path()
+    try:
+        from wave2.personas import enabled  # type: ignore
+
+        if not enabled():
+            return {"enabled": False, "personas": []}
+        from wave2.runner import persona_summaries  # type: ignore
+
+        return {"enabled": True, "personas": persona_summaries()}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("wave2 persona listing failed: %s", exc)
+        return {"enabled": False, "personas": [], "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def wave2_account(email: str) -> dict:
+    """For the /wave2 page: does the saved grant include Contacts + Tasks?"""
+    _ensure_seeder_path()
+    try:
+        from wave2.runner import account_status  # type: ignore
+
+        return account_status(email)
+    except Exception as exc:  # noqa: BLE001
+        return {"wave2_ready": None, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def wave2_progress(email: str, persona: str) -> dict | None:
+    """For the /wave2 page: live per-surface progress written by the Wave 2 runner."""
+    _ensure_seeder_path()
+    try:
+        from wave2.runner import progress_for  # type: ignore
+
+        return progress_for(email, persona)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("wave2 progress read failed for %s: %s", email, exc)
+        return None
+
+
 def _wave2_clean_extras(email: str) -> dict | None:
     """Wipe Contacts/Tasks/labels/drafts/extra calendars on a clean, for accounts that hold
     a Wave 2 grant. None (skipped) when Wave 2 is not configured or the account was never

@@ -225,6 +225,51 @@ class RunRoutingTests(_Wave2Env):
         self.assertFalse(out["ok"])
         self.assertIn("wipe errors", out["detail"])
 
+    def test_progress_file_tracks_the_run(self):
+        from wave2 import runner
+        from wave2.personas import state_key
+        out, *_ = self._run("seed")
+        p = runner.read_progress_file(state_key("test_person", ACCOUNT))
+        self.assertEqual(p["stage"], "done")
+        self.assertTrue(p["ok"])
+        self.assertEqual(p["email"], ACCOUNT)
+        self.assertEqual(p["expected"]["CONTACTS"], 1)
+        self.assertEqual(p["counts"]["GMAIL"], 2)
+        self.assertEqual(p["manual"]["keep_items"], 2)
+        self.assertIn("name", p["account_settings"])
+        self.assertEqual(runner.progress_for(ACCOUNT, "Test Person")["stage"], "done")
+
+    def test_progress_file_marks_a_crash_as_failed(self):
+        from wave2 import runner
+        from wave2.personas import state_key
+        with patch.object(runner, "wave2_credentials", side_effect=RuntimeError("network down")):
+            with self.assertRaises(RuntimeError):
+                runner.run(ACCOUNT, "test_person", "seed")
+        p = runner.read_progress_file(state_key("test_person", ACCOUNT))
+        self.assertEqual(p["stage"], "failed")
+        self.assertFalse(p["ok"])
+        self.assertIn("network down", p["detail"])
+
+    def test_persona_summaries_for_the_page(self):
+        from wave2 import runner
+        s = runner.persona_summaries()
+        self.assertEqual([x["folder"] for x in s], ["test_person"])
+        self.assertEqual(s[0]["name"], "Test Person")
+        self.assertEqual(s[0]["expected"]["CONTACTS"], 1)
+        self.assertEqual(s[0]["manual"]["chat_messages"], 2)
+
+    def test_account_status(self):
+        from wave2 import runner
+        from wave2.creds import Wave2AuthError
+        with patch.object(runner, "wave2_credentials", return_value=object()):
+            self.assertTrue(runner.account_status(ACCOUNT)["wave2_ready"])
+        with patch.object(runner, "wave2_credentials", side_effect=Wave2AuthError("without Wave 2 permissions")):
+            st = runner.account_status(ACCOUNT)
+            self.assertFalse(st["wave2_ready"])
+            self.assertIn("Wave 2", st["reason"])
+        with patch.object(runner, "wave2_credentials", side_effect=OSError("timeout")):
+            self.assertIsNone(runner.account_status(ACCOUNT)["wave2_ready"])
+
     def test_token_for_another_account_is_refused(self):
         from wave2 import runner
         from wave2.creds import Wave2AuthError

@@ -20,6 +20,7 @@ one file per (persona, account).
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -81,11 +82,79 @@ def base():
                 return "text" if kind == "skip" and f.get("mime_type") in _TEXTISH else kind
 
             gab_seed.file_kind = _file_kind
+            # Every seeded/restored item ends with save_state(ctx, st); piggy-back on it to
+            # publish live per-surface counts for the Wave 2 page (throttled, per account).
+            _orig_save = gab_seed.save_state
+
+            def _save_and_tick(ctx, st):
+                _orig_save(ctx, st)
+                _tick(ctx, st)
+
+            gab_seed.save_state = _save_and_tick
             _base_mod = gab_seed
         # Re-read every time (same value in production) so the state dir always follows
         # the current configuration instead of whatever it was at first import.
         _base_mod.ROOT = str(state_root())
         return _base_mod
+
+
+# ----------------------------------------------------------------- live progress
+# One small JSON per (persona, account) under <state root>/progress/, read by the Wave 2
+# page. Written at stage changes and (throttled) after every seeded item. Never affects
+# the reset itself: any write error is swallowed.
+_LIVE: dict[str, dict[str, Any]] = {}
+_TICK_EVERY_S = 1.5
+
+
+def progress_path(key: str) -> Path:
+    return state_root() / "progress" / f"{key}.json"
+
+
+def write_progress(key: str, **fields: Any) -> None:
+    try:
+        p = progress_path(key)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        cur = {}
+        if p.exists():
+            try:
+                cur = json.loads(p.read_text(encoding="utf-8"))
+            except ValueError:
+                cur = {}
+        cur.update(fields)
+        cur["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cur, default=str), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:  # noqa: BLE001 - progress is cosmetic; never break a reset over it
+        LOG.debug("wave2 progress write failed", exc_info=True)
+
+
+def read_progress_file(key: str) -> dict[str, Any] | None:
+    p = progress_path(key)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except ValueError:
+        return None
+
+
+def _tick(ctx, st) -> None:
+    live = _LIVE.get(getattr(ctx, "persona", ""))
+    if not live:
+        return
+    now = time.monotonic()
+    if now - live.get("last", 0.0) < _TICK_EVERY_S:
+        return
+    live["last"] = now
+    write_progress(ctx.persona, counts=seeded_counts(st))
+
+
+def _stage(ctx, stage: str, st: dict[str, Any] | None = None) -> None:
+    fields: dict[str, Any] = {"stage": stage}
+    if st is not None:
+        fields["counts"] = seeded_counts(st)
+    write_progress(ctx.persona, **fields)
 
 
 def services(creds) -> types.SimpleNamespace:
@@ -272,11 +341,11 @@ def _archive_state(ctx: WorldCtx) -> None:
 def seed(ctx: WorldCtx, S, st: dict[str, Any]) -> None:
     b = base()
     st["folder"], st["persona_id"] = ctx.folder, ctx.persona_id
-    b.seed_gmail(ctx, S, st)
-    b.seed_contacts(ctx, S, st)
-    b.seed_calendar(ctx, S, st)
-    b.seed_drive(ctx, S, st)
-    b.seed_tasks(ctx, S, st)
+    for stage, fn in (("gmail", b.seed_gmail), ("contacts", b.seed_contacts), ("calendar", b.seed_calendar),
+                      ("drive", b.seed_drive), ("tasks", b.seed_tasks)):
+        _stage(ctx, stage, st)
+        fn(ctx, S, st)
+    _stage(ctx, "baseline", st)
     try:
         b.delete_security_alerts(S)  # the seeding sign-in triggers Google "Security alert" mail
     except Exception as exc:  # noqa: BLE001 - cosmetic, never fail the seed on it
@@ -287,9 +356,12 @@ def seed(ctx: WorldCtx, S, st: dict[str, Any]) -> None:
 
 def restore(ctx: WorldCtx, S, st: dict[str, Any]) -> None:
     b = base()
-    for fn in (b.restore_gmail, b.restore_contacts, b.restore_calendar, b.restore_drive, b.restore_tasks):
+    for stage, fn in (("gmail", b.restore_gmail), ("contacts", b.restore_contacts),
+                      ("calendar", b.restore_calendar), ("drive", b.restore_drive), ("tasks", b.restore_tasks)):
+        _stage(ctx, "restore_" + stage, st)
         fn(ctx, S, st)
         b.save_state(ctx, st)
+    _stage(ctx, "baseline", st)
     time.sleep(5)
     b.snapshot(ctx, S, st)
 
@@ -313,7 +385,37 @@ def run(email: str, folder: str, mode: str, log: Callable[[str], None] | None = 
     log = log or (lambda m: LOG.info("%s", m))
     b = base()
     ctx = WorldCtx(folder, email)
-    creds = wave2_credentials(email)
+    p = plan(ctx)
+    settings_hint = {"name": ctx.persona_name, "home_address": ctx.home_address(), "timezone": ctx.tz_name}
+    # Fresh progress file for this run (replaces the previous run's).
+    try:
+        progress_path(ctx.persona).unlink(missing_ok=True)
+    except OSError:
+        pass
+    write_progress(ctx.persona, email=ctx.account, persona=folder, mode=mode, stage="starting",
+                   expected=p["expected"], manual=p["manual"], account_settings=settings_hint,
+                   started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), ok=None, detail=None)
+    _LIVE[ctx.persona] = {"last": 0.0}
+    try:
+        out = _run(ctx, folder, mode, log)
+    except Exception as exc:
+        write_progress(ctx.persona, stage="failed", ok=False, detail=f"{type(exc).__name__}: {exc}"[:400])
+        raise
+    finally:
+        _LIVE.pop(ctx.persona, None)
+    write_progress(ctx.persona, stage="done" if out["ok"] else "failed", ok=out["ok"], detail=out["detail"],
+                   action=out["action"], counts=seeded_counts_from(out), verify=out["verify"]["surfaces"])
+    return out
+
+
+def seeded_counts_from(out: dict[str, Any]) -> dict[str, int]:
+    return {s: v["seeded"] for s, v in ((out.get("verify") or {}).get("surfaces") or {}).items()}
+
+
+def _run(ctx: WorldCtx, folder: str, mode: str, log: Callable[[str], None]) -> dict[str, Any]:
+    b = base()
+    _stage(ctx, "checking access")
+    creds = wave2_credentials(ctx.account)
     S = services(creds)
     prof = b.ex(S.gmail.users().getProfile(userId="me")) or {}
     got = (prof.get("emailAddress") or "").lower()
@@ -323,6 +425,7 @@ def run(email: str, folder: str, mode: str, log: Callable[[str], None] | None = 
     st = b.load_state(ctx)
     has_baseline = bool(st.get("baseline")) and st.get("folder") == folder
     action = "restore" if mode in ("delta", "reconcile") and has_baseline else "reseed"
+    write_progress(ctx.persona, action=action)
     log(f"wave2 {action} start email={ctx.account} persona={folder} mode={mode} tz={ctx.tz_name} "
         f"persona_email={ctx.persona_email or '-'} -> rewritten to account email")
 
@@ -330,11 +433,13 @@ def run(email: str, folder: str, mode: str, log: Callable[[str], None] | None = 
     if action == "restore":
         restore(ctx, S, st)
     else:
+        _stage(ctx, "wipe")
         out["wipe"] = full_wipe(S, creds, log)
         _archive_state(ctx)
         st = b.load_state(ctx)
         seed(ctx, S, st)
 
+    _stage(ctx, "verify", st)
     v = verify(ctx, st)
     out["verify"] = v
     out["skipped"] = dict(st.get("skipped") or {})
@@ -358,3 +463,50 @@ def clean_extras(email: str, log: Callable[[str], None] | None = None) -> dict[s
         return None
     S = services(creds)
     return extra_wipe(S, log)
+
+
+# ----------------------------------------------------------------- page helpers (read-only)
+_SUMMARY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def persona_summaries() -> list[dict[str, Any]]:
+    """Per Wave 2 persona: display name, timezone, what will be seeded, what is manual.
+    Cached per persona until its world file changes."""
+    from wave2.personas import WORLD_REL, persona_folders, wave2_root
+
+    root = wave2_root()
+    if root is None:
+        return []
+    out = []
+    for folder in persona_folders():
+        mtime = (root / folder / WORLD_REL).stat().st_mtime
+        hit = _SUMMARY_CACHE.get(folder)
+        if not hit or hit[0] != mtime:
+            ctx = WorldCtx(folder, "")
+            p = plan(ctx)
+            hit = (mtime, {"folder": folder, "name": ctx.persona_name, "timezone": ctx.tz_name,
+                           "expected": p["expected"], "manual": p["manual"],
+                           "drive_not_recreatable": len(p["not_recreatable"]["drive_files"])})
+            _SUMMARY_CACHE[folder] = hit
+        out.append(hit[1])
+    return out
+
+
+def account_status(email: str) -> dict[str, Any]:
+    """Does this account's saved grant include the Wave 2 scopes (Contacts + Tasks)?"""
+    try:
+        wave2_credentials(email)
+        return {"wave2_ready": True, "reason": None}
+    except Wave2AuthError as exc:
+        return {"wave2_ready": False, "reason": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - network hiccup: unknown, not "not ready"
+        return {"wave2_ready": None, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def progress_for(email: str, persona: str) -> dict[str, Any] | None:
+    from wave2.personas import match, state_key
+
+    folder = match(persona)
+    if not folder:
+        return None
+    return read_progress_file(state_key(folder, email.strip().lower()))
