@@ -63,6 +63,14 @@
     cursor:pointer; background:var(--bg); }
   .dropzone:hover, .dropzone.drag { border-color:var(--brand); background:var(--chip); }
   .rid { font-family:ui-monospace,monospace; font-size:10px; color:var(--muted); word-break:break-all; margin-top:4px; }
+  .keep { font-size:12px; line-height:1.45; max-width:260px; }
+  .keep .h { font-weight:700; display:inline-flex; align-items:center; gap:6px; }
+  .keep.ok .h { color:var(--ok); } .keep.warn .h { color:var(--warn); } .keep.bad .h { color:var(--err); }
+  .keep.run .h { color:var(--brand); } .keep.idle .h { color:var(--muted); }
+  .keep .d { color:var(--muted); margin-top:2px; }
+  .keep ul { margin:4px 0 0; padding-left:16px; color:var(--ink); }
+  .keep .acts { margin-top:6px; display:flex; gap:6px; flex-wrap:wrap; }
+  label.chk { font-size:12px; color:var(--muted); display:inline-flex; gap:6px; align-items:center; cursor:pointer; }
   .diag { margin-top:8px; padding:8px 10px; border-left:3px solid var(--err); background:var(--soft); border-radius:4px;
     font-size:12px; line-height:1.5; max-width:420px; }
 </style>
@@ -70,7 +78,8 @@
 <body>
 <div class="wrap">
   <h1>GAB Wave 2</h1>
-  <div class="sub">Phase 9 · Wave 2 personas: seeds <b>Gmail, Calendar, Drive, Contacts, Tasks</b> (and Keep once its API is connected).
+  <div class="sub">Phase 9 · Wave 2 personas. Order per account: <b>1 Authorize</b> → <b>2 Keep</b> (worker machine, checked against the persona's notes)
+    → <b>3 Run</b> (Gmail, Calendar, Drive, Contacts, Tasks).
     Classic personas and empty-universe accounts stay on <a href="/onboard">/onboard →</a></div>
 
   <div class="banner" id="banner"></div>
@@ -105,21 +114,26 @@
   <div class="card" id="tableCard" style="display:none">
     <div class="step">3 · Authorize &amp; run</div>
     <div class="bar" style="margin-bottom:12px">
-      <button class="ghost" id="authAll">Authorize all (one by one)</button>
-      <button class="primary" id="runAll">Run all ready</button>
+      <button class="ghost" id="authAll">1 · Authorize all (one by one)</button>
+      <button class="ghost" id="keepAll" title="Queue Keep (reseed: empty Keep, then write the persona's notes) for every authorized account">2 · Keep all</button>
+      <button class="primary" id="runAll">3 · Run all ready</button>
+      <label class="chk" title="Run all ready skips accounts whose Keep is not checked yet"><input type="checkbox" id="needKeep" checked> only accounts with Keep ✓</label>
       <button class="ghost" id="refreshAll">Refresh</button>
       <button class="ghost" id="hardReset">Hard reset</button>
       <span class="counts" id="counts"></span>
     </div>
     <div style="overflow:auto">
       <table>
-        <thead><tr><th>Account</th><th>Persona</th><th>Password</th><th>Permissions</th><th>Actions</th><th>Status &amp; progress</th></tr></thead>
+        <thead><tr><th>Account</th><th>Persona</th><th>Password</th><th>Permissions</th><th>Keep</th><th>Actions</th><th>Status &amp; progress</th></tr></thead>
         <tbody id="rows"></tbody>
       </table>
     </div>
     <div class="hint" style="margin-top:10px">
       <b>Authorize</b> opens Google's consent in a new tab. Sign in, tick <b>Select all</b> (Gmail, Drive, Calendar, Contacts, Tasks) and Continue.
       An account authorized before Wave 2 shows <b>needs Wave 2 sign-in</b> until it is re-authorized here.
+      <b>Keep</b> (right after authorizing) queues a job for the Keep worker (Clickless on the worker machine): it empties Keep (notes, Archive, Trash),
+      writes the persona's notes, and the result is checked here: <b>✓ verified</b> = every note there once and nothing else;
+      <b>✓ done</b> = every note confirmed, extras not checked (the worker didn't report what it saw).
       <b>Run</b> = first upload (wipe + seed) or, for an account already on this persona, a reconcile back to its baseline.
     </div>
   </div>
@@ -145,7 +159,7 @@
   let personas = [];            // [{folder,name,timezone,expected,manual}]
   let byKey = {};               // normalized alias -> persona
   let clientReady = false;
-  const rows = [];              // {email, rawP, folder, password, mode, authorized, wave2Ready, permReason, status, uid, error, progress, diag}
+  const rows = [];              // {email, rawP, folder, password, mode, authorized, wave2Ready, permReason, status, uid, error, progress, diag, keep}
   const ROWS_KEY = "gab_wave2_rows", CSV_KEY = "gab_wave2_csv";
 
   function persist(){
@@ -228,6 +242,7 @@
     render(); persist();
     rows.forEach((r, i) => setTimeout(() => refreshAccount(i), i * 200));
     syncStatuses();
+    syncKeep();
   }
 
   // ---------- account state ----------
@@ -286,6 +301,7 @@
   async function runAll(){
     for (let i = 0; i < rows.length; i++){
       const r = rows[i];
+      if ($("needKeep").checked && !keepOk(r)) continue;   // Keep first (step 2)
       if (r.folder && r.wave2Ready === true && r.status !== "running"){ await run(i); await new Promise(res => setTimeout(res, 400)); }
     }
   }
@@ -321,7 +337,7 @@
     await syncStatuses(); await pollProgress(); render(); persist();
     if (rows.some(r => r.status === "running")) pollTimer = setTimeout(pollOnce, 3000);
   }
-  async function refreshAll(){ rows.forEach((r, i) => setTimeout(() => refreshAccount(i), i * 150)); await pollOnce(); }
+  async function refreshAll(){ rows.forEach((r, i) => setTimeout(() => refreshAccount(i), i * 150)); await pollOnce(); await syncKeep(); }
 
   async function explain(i){
     const row = rows[i]; if (!row.uid) return;
@@ -331,6 +347,79 @@
       row.diag = d.diagnosis || {headline:"No diagnosis available"};
     } catch(e){ row.diag = {headline:"Couldn't load diagnosis", detail:String(e.message || e)}; }
     render();
+  }
+
+  // ---------- Keep (step 2: right after authorizing, before Run) ----------
+  const KEEP_OPEN = ["queued", "running"];
+  let keepTimer = null;
+  async function syncKeep(){
+    const list = rows.filter(r => r.folder).map(r => ({email: r.email, persona: r.folder}));
+    for (let k = 0; k < list.length; k += 200){
+      try {
+        const r = await fetch("/ui/wave2/keep/status", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({rows: list.slice(k, k + 200)})});
+        if (!r.ok) continue;
+        const st = (await r.json()).states || {};
+        rows.forEach(row => { const s = st[row.email]; if (s) { row.keep = s.check; row.keepErr = s.check ? null : s.error; } });
+      } catch(e){}
+    }
+    render();
+    clearTimeout(keepTimer);
+    if (rows.some(r => r.keep && KEEP_OPEN.includes(r.keep.state))) keepTimer = setTimeout(syncKeep, 5000);
+  }
+  async function keepRun(i){
+    const row = rows[i]; if (!row.folder) return;
+    row.keepBusy = true; render();
+    try {
+      const r = await fetch("/ui/wave2/keep", {method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({email: row.email, persona: row.folder, mode: "reseed"})});
+      const d = await r.json(); if (!r.ok) throw new Error(d.detail || ("HTTP " + r.status));
+      row.keep = d.check; row.keepErr = null; row.keepNote = d.routing_note || null;
+    } catch(e){ row.keepErr = e.message; }
+    row.keepBusy = false; render();
+    clearTimeout(keepTimer); keepTimer = setTimeout(syncKeep, 4000);
+  }
+  async function keepRetry(i){
+    const row = rows[i];
+    try {
+      const r = await fetch("/ui/wave2/keep/retry", {method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({email: row.email, persona: row.folder})});
+      const d = await r.json(); if (!r.ok) throw new Error(d.detail || ("HTTP " + r.status));
+      row.keep = d.check; row.keepErr = null;
+    } catch(e){ row.keepErr = e.message; }
+    render(); clearTimeout(keepTimer); keepTimer = setTimeout(syncKeep, 4000);
+  }
+  async function keepAll(){
+    for (let i = 0; i < rows.length; i++){
+      const r = rows[i];
+      if (!r.folder || r.wave2Ready !== true) continue;                       // authorize first
+      if (r.keep && (KEEP_OPEN.includes(r.keep.state) || r.keep.ok)) continue;  // already queued, running or checked
+      await keepRun(i); await new Promise(res => setTimeout(res, 200));
+    }
+  }
+  const keepOk = row => !!(row.keep && row.keep.ok);
+  function keepCell(row, i){
+    if (!row.folder) return '<span class="hint">—</span>';
+    const k = row.keep;
+    let cls = "idle", icon = "", h = "", d = "", list = "";
+    if (row.keepBusy){ cls = "run"; h = '<span class="spin"></span> queuing…'; }
+    else if (!k){ h = row.keepErr ? "? could not check" : "checking…"; d = esc(row.keepErr || ""); }
+    else {
+      const map = {verified:["ok","✓"], confirmed:["ok","✓"], queued:["run",'<span class="spin"></span>'], running:["run",'<span class="spin"></span>'],
+                   needs_manual:["warn","⚠"], problem:["bad","✗"], failed:["bad","✗"], cancelled:["idle","–"], resolved:["warn","✓?"], none:["idle",""]};
+      [cls, icon] = map[k.state] || ["idle", ""];
+      h = (icon ? icon + " " : "") + esc(k.headline);
+      if (row.keepErr) d = esc(row.keepErr) + "<br>";
+      d += esc(k.detail || "") + (row.keepNote && KEEP_OPEN.includes(k.state) ? "<br>" + esc(row.keepNote) : "");
+      const bits = [];
+      if (k.missing && k.missing.length) bits.push("<li>Missing: " + k.missing.map(esc).join("; ") + "</li>");
+      if (k.duplicates && k.duplicates.length) bits.push("<li>Twice: " + k.duplicates.map(esc).join("; ") + "</li>");
+      if (k.extra && k.extra.length) bits.push("<li>Shouldn't be there: " + k.extra.map(esc).join("; ") + "</li>");
+      if (k.archive && k.archive.length) bits.push("<li>Archive: " + k.archive.map(esc).join("; ") + "</li>");
+      if (k.trash && k.trash.length) bits.push("<li>Trash: " + k.trash.map(esc).join("; ") + "</li>");
+      if (bits.length) list = "<ul>" + bits.join("") + "</ul>";
+      if (k.state === "none") d = (k.expected || 0) + " note(s): " + esc((k.titles || []).join(" · "));
+    }
+    return `<div class="keep ${cls}" data-i="${i}"><div class="h">${h}</div>${d ? `<div class="d">${d}</div>` : ""}${list}<div class="acts"></div></div>`;
   }
 
   // ---------- render ----------
@@ -361,14 +450,15 @@
         if (ver && ver[k]) { cls = ver[k].ok ? "ok" : "bad"; txt = ver[k].seeded + " / " + ver[k].expected + (ver[k].ok ? " ✓" : " ✗"); }
         else if (row.status === "running" && p && p.stage && p.stage.endsWith(k.toLowerCase())) cls = "run";
         return `<span>${label}</span><span class="${cls}">${esc(txt)}</span>`;
-      }).join("") + `<span>Keep</span><span class="man">manual · ${(p && p.manual ? p.manual.keep_items : persona ? persona.manual.keep_items : "?")} items (Keep API pending)</span></div>`;
+      }).join("") + `<span>Keep</span><span class="${keepOk(row) ? "ok" : "man"}">${row.keep && row.keep.state !== "none"
+          ? esc(row.keep.headline) : "not run · " + (p && p.manual ? p.manual.keep_items : persona ? persona.manual.keep_items : "?") + " notes"}</span></div>`;
     }
     let manual = "";
     if (row.status === "completed"){
       const s = (p && p.account_settings) || {name: persona && persona.name, timezone: persona && persona.timezone};
       manual = `<div class="manual"><b>Still manual on this account</b><br>
         • Name: <b>${esc(s.name || "?")}</b>${s.home_address ? ` · Home address: <b>${esc(s.home_address)}</b>` : ""}${s.timezone ? ` · Time zone: ${esc(s.timezone)}` : ""}<br>
-        • Keep: ${(p && p.manual ? p.manual.keep_items : "?")} lists/notes (until the Keep API is connected)<br>
+        • Keep: ${keepOk(row) ? "✓ " + esc(row.keep.headline) : (p && p.manual ? p.manual.keep_items : "?") + " lists/notes: run Keep (step 2) if not done"}<br>
         • Gemini: clear chats, activity, Saved info before each run</div>`;
     }
     const diag = row.diag ? `<div class="diag"><b>${esc(row.diag.headline || "")}</b>${row.diag.detail ? "<br>" + esc(row.diag.detail) : ""}${row.diag.action ? "<br>→ " + esc(row.diag.action) : ""}</div>` : "";
@@ -382,7 +472,17 @@
       const persona = personaOf(row);
       tr.innerHTML = `<td class="email">${esc(row.email)}</td>` +
         `<td>${persona ? esc(persona.name) + (row.mode ? ` <span class="hint">· ${esc(row.mode)}</span>` : "") : `<span class="bad">? ${esc(row.rawP || "missing")}</span><div class="hint">not a Wave 2 persona</div>`}</td>` +
-        `<td class="pw"></td><td>${permCell(row)}</td><td class="act"></td><td>${statusCell(row)}</td>`;
+        `<td class="pw"></td><td>${permCell(row)}</td><td>${keepCell(row, i)}</td><td class="act"></td><td>${statusCell(row)}</td>`;
+      const kacts = tr.querySelector(".keep .acts");
+      if (kacts){
+        const kb = (label, fn, disabled, title) => { const b = document.createElement("button"); b.className = "ghost mini"; b.textContent = label;
+          b.disabled = !!disabled; if (title) b.title = title; b.onclick = fn; kacts.appendChild(b); };
+        const kopen = row.keep && KEEP_OPEN.includes(row.keep.state);
+        kb(row.keep && row.keep.state !== "none" ? "Keep again" : "Keep", () => keepRun(i), row.keepBusy || kopen,
+           "Empty Keep (notes, Archive, Trash) and write this persona's notes, on the worker machine");
+        if (row.keep && row.keep.state === "needs_manual" && !(row.keep.job && row.keep.job.derived))
+          kb("Retry", () => keepRetry(i), false, "After fixing it on the worker machine (e.g. signing the account in), send the job back to the queue");
+      }
       const pw = tr.querySelector(".pw");
       if (row.password){
         const w = document.createElement("div"); w.className = "pwwrap";
@@ -405,11 +505,13 @@
     });
     const ready = rows.filter(r => r.wave2Ready === true).length, done = rows.filter(r => r.status === "completed").length,
           failed = rows.filter(r => r.status === "failed").length, running = rows.filter(r => r.status === "running").length;
-    $("counts").textContent = `${ready} ready · ${running} running · ${done} done · ${failed} failed · ${rows.length} total`;
+    const keepDone = rows.filter(keepOk).length;
+    $("counts").textContent = `${ready} authorized · ${keepDone} Keep ✓ · ${running} running · ${done} done · ${failed} failed · ${rows.length} total`;
   }
 
   $("authAll").addEventListener("click", authorizeAll);
   $("runAll").addEventListener("click", runAll);
+  $("keepAll").addEventListener("click", keepAll);
   $("refreshAll").addEventListener("click", refreshAll);
   $("hardReset").addEventListener("click", async () => {
     if (!confirm("Clear the loaded accounts, passwords and CSV from this page? Nothing on the accounts is touched.")) return;
@@ -427,6 +529,7 @@
         saved.forEach(r => rows.push(r)); $("tableCard").style.display = "block"; render();
         rows.forEach((r, i) => setTimeout(() => refreshAccount(i), i * 150));
         pollOnce();
+        syncKeep();
       }
     } catch(e){}
   })();

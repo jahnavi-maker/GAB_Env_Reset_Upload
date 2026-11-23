@@ -27,7 +27,7 @@ from typing import Any
 
 from pathlib import Path
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile, status
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
@@ -49,7 +49,8 @@ from .config import (
 from .runlog import RunLog, purge_old_logs
 from .db import Store, make_store
 from . import links
-from .jobs import JobService
+from .jobs import InvalidJob, JobError, JobService
+from . import wave2_keep
 from .jobs_api import build_router, make_bearer_dependency
 from .jobs_files import LocalFileStore
 from .jobs_store import make_job_store
@@ -1949,6 +1950,93 @@ async def ui_wave2_progress(email: str, persona: str = "") -> dict:
     if "@" not in email:
         raise HTTPException(status_code=400, detail="email required")
     return {"email": email, "progress": await asyncio.to_thread(engine.wave2_progress, email, persona)}
+
+
+# --------------------------------------------------------------------------- #
+# Wave 2 · Keep: the first step after authorizing. Keep has no API for consumer accounts, so a #
+# keep-seed job goes to the module job queue (jobs.py) and a worker machine (Clickless) runs it.  #
+# The page then checks the result against the persona's notes (wave2_keep.py).                   #
+# --------------------------------------------------------------------------- #
+def _wave2_keep_email(value: Any) -> str:
+    email = str(value or "").strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="email required")
+    return email
+
+
+async def _wave2_keep_latest(email: str) -> dict | None:
+    jobs = await _get_jobs_service().list_jobs(account=email, workflow="keep-seed", limit=1)
+    return jobs[0] if jobs else None
+
+
+async def _wave2_keep_state(email: str, persona: str) -> dict:
+    want = await asyncio.to_thread(engine.wave2_keep_expected, persona)
+    if not want.get("folder"):
+        return {"email": email, "persona": None, "check": None, "error": want.get("error") or "not a Wave 2 persona"}
+    job = await _wave2_keep_latest(email)
+    return {"email": email, "persona": want["folder"], "check": wave2_keep.check(want["notes"], want["folder"], job)}
+
+
+@app.get("/ui/wave2/keep")
+async def ui_wave2_keep(email: str, persona: str = "") -> dict:
+    return await _wave2_keep_state(_wave2_keep_email(email), persona)
+
+
+@app.post("/ui/wave2/keep/status")
+async def ui_wave2_keep_status(payload: dict = Body(...)) -> dict:
+    """Keep state for many rows at once: {"rows": [{"email", "persona"}, ...]} (at most 200)."""
+    rows = payload.get("rows") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or len(rows) > 200:
+        raise HTTPException(status_code=422, detail="rows: a list of at most 200 {email, persona}")
+    out = {}
+    for row in rows:
+        if not isinstance(row, dict) or "@" not in str(row.get("email") or ""):
+            continue
+        email = _wave2_keep_email(row.get("email"))
+        try:
+            out[email] = await _wave2_keep_state(email, str(row.get("persona") or ""))
+        except Exception as exc:  # noqa: BLE001 - one bad row must not hide the others
+            out[email] = {"email": email, "check": None, "error": f"{type(exc).__name__}: {exc}"[:200]}
+    return {"states": out}
+
+
+@app.post("/ui/wave2/keep")
+async def ui_wave2_keep_run(payload: dict = Body(...)) -> dict:
+    """Queue Keep for an account: {"email", "persona", "mode": "reseed" | "clean"}. reseed (default) empties Keep first,
+    so nothing from an earlier persona or run is left. An account that already has a Keep job queued or running gets
+    that job back instead of a second one."""
+    email = _wave2_keep_email(payload.get("email"))
+    persona = str(payload.get("persona") or "")
+    mode = str(payload.get("mode") or "reseed")
+    want = await asyncio.to_thread(engine.wave2_keep_expected, persona)
+    if not want.get("folder"):
+        raise HTTPException(status_code=422, detail=want.get("error") or "persona: not a Wave 2 persona")
+    service = _get_jobs_service()
+    latest = await _wave2_keep_latest(email)
+    if latest and latest["status"] in wave2_keep.OPEN and latest.get("persona") == want["folder"]:
+        return {**(await _wave2_keep_state(email, want["folder"])), "created": False, "routing_note": None}
+    try:
+        out = await service.enqueue({"request_id": f"wave2-keep-{uuid.uuid4().hex}", "workflow": "keep-seed", "account": email,
+                                     "persona": want["folder"], "mode": mode})
+    except JobError as exc:
+        raise HTTPException(status_code=422 if isinstance(exc, InvalidJob) else 409, detail=str(exc)) from None
+    return {**(await _wave2_keep_state(email, want["folder"])), "created": out["created"], "routable": out["routable"],
+            "routing_note": out["routing_note"]}
+
+
+@app.post("/ui/wave2/keep/retry")
+async def ui_wave2_keep_retry(payload: dict = Body(...)) -> dict:
+    """Send the account's Keep job that needs a person back to the queue (after signing the account in on the worker)."""
+    email = _wave2_keep_email(payload.get("email"))
+    latest = await _wave2_keep_latest(email)
+    if not latest:
+        raise HTTPException(status_code=404, detail="no Keep job for this account")
+    if latest["status"] == "needs_manual" and not latest.get("derived"):
+        try:
+            await _get_jobs_service().retry(latest["job_id"])
+        except JobError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+    return await _wave2_keep_state(email, str(payload.get("persona") or latest.get("persona") or ""))
 
 
 @app.get("/onboard/authorize")

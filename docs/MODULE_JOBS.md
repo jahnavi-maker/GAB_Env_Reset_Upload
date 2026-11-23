@@ -66,9 +66,27 @@ Unknown fields are refused (422, naming the field and never echoing the value), 
 | caller | `POST /api/jobs/{id}/resolve` `{note}` · `/retry` · `/cancel` | a person's actions |
 | worker | `POST /api/worker/claim` | get a job (200) or nothing (204) |
 | worker | `POST /api/worker/jobs/{id}/heartbeat` `{worker_id}` | keep the lease; the reply says if a cancel was requested |
-| worker | `POST /api/worker/jobs/{id}/result` `{worker_id, outcome, summary, follow_up, pack_version}` | report |
+| worker | `POST /api/worker/jobs/{id}/result` `{worker_id, attempt, outcome, summary, follow_up, pack_version, inventory}` | report |
 | worker | `POST /api/worker/jobs/{id}/screenshot` (raw PNG, header `X-Worker-Id`) | upload what the window showed; returns `{url}` |
 | caller | `GET /api/jobs/{id}/screenshot` | the image (PNG, `no-store`); 404 if none |
+
+### Attempt number and Keep inventory (worker → platform)
+
+* **`attempt`** (heartbeat and result): send back the `attempt` the claim returned. A report for an earlier attempt is refused (409),
+  so a late or retried report can never close a newer attempt, even from the same worker. Optional: a worker that leaves it out
+  still works, without that protection.
+* **`inventory`** (result of `keep-seed` / `keep-wipe`): what Keep showed after the run, one title per note or list (the title, or its
+  first line / first item when it has none), per view: `{"home": [...], "archive": [...], "trash": [...]}` (at most 500 titles per view,
+  300 characters each). The `/wave2` page compares it with the persona's notes: every note there **once**, nothing extra, Archive and
+  Trash empty → "Keep verified". Without it the page can only check the note count in `summary` and shows extras as not checked.
+
+## Wave 2 page: Keep is step 2
+
+`/wave2` runs, per account: **1 Authorize → 2 Keep → 3 Run** (Gmail, Calendar, Drive, Contacts, Tasks). "Keep all" queues a `keep-seed`
+job in mode `reseed` for every authorized account (an account with a Keep job already queued or running gets that job back, not a second
+one); "Run all ready" only runs accounts whose Keep is ✓ unless that box is unticked. Same-origin routes: `GET /ui/wave2/keep`,
+`POST /ui/wave2/keep` (queue), `POST /ui/wave2/keep/status` (many rows), `POST /ui/wave2/keep/retry`. The check is in
+`api/reset_service/wave2_keep.py`; the expected notes come from the persona world with the same rules as Clickless's `pack.js`.
 
 ## Keys and security
 

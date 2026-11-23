@@ -426,6 +426,20 @@ def wave2_progress(email: str, persona: str) -> dict | None:
         return None
 
 
+def wave2_keep_expected(persona: str) -> dict:
+    """For the /wave2 page: the persona's folder and the Keep notes its account should hold."""
+    _ensure_seeder_path()
+    try:
+        from wave2.personas import match  # type: ignore
+        from wave2.runner import keep_expected  # type: ignore
+
+        folder = match(persona)
+        return {"folder": folder, "notes": keep_expected(folder) if folder else []}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("wave2 keep expectations failed for %s: %s", persona, exc)
+        return {"folder": None, "notes": [], "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 def _wave2_clean_extras(email: str) -> dict | None:
     """Wipe Contacts/Tasks/labels/drafts/extra calendars on a clean, for accounts that hold
     a Wave 2 grant. None (skipped) when Wave 2 is not configured or the account was never

@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -829,6 +830,43 @@ def persona_summaries() -> list[dict[str, Any]]:
                            "drive_not_recreatable": len(p["not_recreatable"]["drive_files"])})
             _SUMMARY_CACHE[folder] = hit
         out.append(hit[1])
+    return out
+
+
+_KEEP_KEY_LEN, _KEEP_MATCH_LEN = 60, 40   # same as Clickless recipes/keep/pack.js (noteKey / matchKey)
+
+
+def keep_title_key(title: Any) -> str:
+    """How a Keep note is recognised: its title squashed, cut to 60 then 40 characters, lowercased (Clickless pack.js rules).
+    Used for both the expected notes and the titles a worker reports, so the two compare like for like."""
+    squashed = re.sub(r"\s+", " ", str(title if title is not None else "")).strip()
+    return squashed[:_KEEP_KEY_LEN][:_KEEP_MATCH_LEN].strip().lower()
+
+
+def keep_expected(folder: str) -> list[dict[str, Any]]:
+    """The Keep notes and lists a persona's account should hold: [{title, key, kind}]. The title is what Keep shows
+    (the note's title, or its first line / first list item when it has none)."""
+    from wave2.personas import match
+
+    found = match(folder)
+    if not found:
+        return []
+    b = base()
+    lists, notes = b.w_keep(WorldCtx(found, "").bc)
+    out = []
+    for kind, rows in (("note", notes), ("list", lists)):
+        for row in rows:
+            title = re.sub(r"\s+", " ", str(row.get("title") or "")).strip()
+            if not title:
+                if kind == "list":
+                    items = row.get("items") or []
+                    first = items[0] if items else ""
+                    title = first if isinstance(first, str) else str(first.get("text") or first.get("content") or "")
+                else:
+                    title = str(row.get("content") or row.get("text") or "").split("\n")[0]
+                title = re.sub(r"\s+", " ", title).strip()
+            if title:
+                out.append({"title": title[:_KEEP_KEY_LEN], "key": keep_title_key(title), "kind": kind})
     return out
 
 
