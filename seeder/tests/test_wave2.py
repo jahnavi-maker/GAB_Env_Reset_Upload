@@ -593,3 +593,24 @@ class CalendarReuseTests(_Wave2Env):
         self.assertEqual(out["calendars"]["secondary_kept_emptied"], 1)
         self.assertEqual(out["calendars"]["events_cleared"], 2)
         S.cal.calendars().delete.assert_not_called()
+
+
+class GmailReadbackTests(unittest.TestCase):
+    def test_404_tolerated_only_inside_insert(self):
+        from wave2 import runner
+        calls = {"n": 0}
+
+        def orig(req, *a, **k):
+            calls["n"] += 1
+            raise RuntimeError("HttpError 404 notFound")
+        req = MagicMock(uri="https://gmail.googleapis.com/gmail/v1/users/me/messages/abc?format=minimal&alt=json", method="GET")
+        ex = runner._tolerant_readback(orig)
+        with self.assertRaises(RuntimeError):          # outside insert_email: unchanged
+            ex(req)
+        runner._READBACK.on = True
+        try:
+            with patch.object(runner.time, "sleep"):
+                self.assertIsNone(ex(req))             # inside: retried, then None
+        finally:
+            runner._READBACK.on = False
+        self.assertEqual(calls["n"], 1 + 4)

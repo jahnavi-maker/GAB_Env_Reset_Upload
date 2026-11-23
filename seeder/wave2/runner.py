@@ -91,6 +91,17 @@ def base():
                 _tick(ctx, st)
 
             gab_seed.save_state = _save_and_tick
+            gab_seed.ex = _tolerant_readback(gab_seed.ex)
+            _orig_insert = gab_seed.insert_email
+
+            def _insert_email(*a, **kw):
+                _READBACK.on = True
+                try:
+                    return _orig_insert(*a, **kw)
+                finally:
+                    _READBACK.on = False
+
+            gab_seed.insert_email = _insert_email
             _base_mod = gab_seed
         # Re-read every time (same value in production) so the state dir always follows
         # the current configuration instead of whatever it was at first import.
@@ -173,6 +184,34 @@ def services(creds) -> types.SimpleNamespace:
 
 
 # ----------------------------------------------------------------- plan / verify
+_READBACK = threading.local()
+
+
+def _tolerant_readback(orig_ex: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap the reference seeder's ``ex`` for ONE call only: the Gmail read-back
+    ``messages.get(format=minimal)`` inside ``insert_email`` (elsewhere, e.g. live_check, a
+    404 still means "missing" and is passed through unchanged). Live, Gmail sometimes answers
+    404 for a message it just accepted (seen right after a large wipe), which crashed the
+    whole seed. That read only supplies the threadId, which the insert response already
+    has, so retry briefly and then return None (the caller falls back to the insert's
+    threadId). A message that really is missing is still caught by the live verify."""
+    def ex(req, *a, **kw):
+        uri = getattr(req, "uri", "") or ""
+        if not getattr(_READBACK, "on", False) or "/gmail/v1/users/me/messages/" not in uri or "format=minimal" not in uri or getattr(req, "method", "GET") != "GET":
+            return orig_ex(req, *a, **kw)
+        for delay in (1, 2, 4, 0):
+            try:
+                return orig_ex(req, *a, **kw)
+            except Exception as exc:  # noqa: BLE001
+                if "404" not in str(exc) and "notFound" not in str(exc):
+                    raise
+                if not delay:
+                    LOG.warning("wave2: Gmail read-back still 404 after retries (%s); using the insert's threadId", uri.split("?")[0])
+                    return None
+                time.sleep(delay)
+    return ex
+
+
 def plan(ctx: WorldCtx) -> dict[str, Any]:
     """Offline: what the world holds and how much of it is recreatable per surface."""
     b = base()
