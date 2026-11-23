@@ -331,6 +331,46 @@ def full_wipe(S, creds, log: Callable[[str], None]) -> dict[str, Any]:
     return out
 
 
+def empty_trash(S, log: Callable[[str], None]) -> dict[str, Any]:
+    """Leave nothing in Gmail Trash/Spam or Drive Trash, so neither Gemini nor ChatGPT
+    connectors (nor a tasker) can find the old persona or a previous task's deletions there.
+
+    The production Gmail wipe lists with includeSpamTrash=False (mail trashed during a task
+    survives it) and falls back to Trash on gmail.modify-only accounts; this sweeps both up.
+    No Wave 2 persona seeds anything into Trash or Spam, so emptying them is always safe.
+    Calendar's bin and Contacts' trash are not returned by their APIs (so connectors cannot
+    read them) and cannot be emptied by API either; they auto-purge after 30 days.
+    """
+    b = base()
+    errors: list[str] = []
+    removed = {"gmail_trash": 0, "gmail_spam": 0}
+    g = S.gmail.users()
+
+    def ids_in(label: str) -> list[str]:
+        return [m["id"] for m in b.pages(g.messages().list, "messages", userId="me", labelIds=[label],
+                                         includeSpamTrash=True, maxResults=500)]
+
+    for label, key in (("TRASH", "gmail_trash"), ("SPAM", "gmail_spam")):
+        def sweep(label=label, key=key) -> int:
+            ids = ids_in(label)
+            for i in range(0, len(ids), 1000):
+                b.ex(g.messages().batchDelete(userId="me", body={"ids": ids[i:i + 1000]}))
+            removed[key] = len(ids)
+            return len(ids)
+        _step(f"empty Gmail {label.title()} (needs the mail.google.com permission)", sweep, errors, log)
+    _step("empty Drive trash", lambda: S.drive.files().emptyTrash().execute(), errors, log)
+
+    left: dict[str, Any] = {}
+    left["gmail_trash"] = _step("count Gmail Trash", lambda: len(ids_in("TRASH")), errors, log)
+    left["gmail_spam"] = _step("count Gmail Spam", lambda: len(ids_in("SPAM")), errors, log)
+    left["drive_trash"] = _step("count Drive trash", lambda: len(b.pages(
+        S.drive.files().list, "files", q="trashed=true and 'me' in owners", fields="nextPageToken,files(id)",
+        pageSize=1000)), errors, log)
+    empty = all(v == 0 for v in left.values())
+    log(f"wave2 trash: removed {removed}, left {left} -> {'empty' if empty else 'NOT EMPTY'}")
+    return {"removed": removed, "left": left, "empty": empty, "errors": errors}
+
+
 # ----------------------------------------------------------------- seed / restore
 def _archive_state(ctx: WorldCtx) -> None:
     p = Path(base().state_dir()) / f"{ctx.persona}.json"
@@ -439,11 +479,16 @@ def _run(ctx: WorldCtx, folder: str, mode: str, log: Callable[[str], None]) -> d
         st = b.load_state(ctx)
         seed(ctx, S, st)
 
+    _stage(ctx, "empty trash", st)
+    out["trash"] = empty_trash(S, log)
     _stage(ctx, "verify", st)
     v = verify(ctx, st)
     out["verify"] = v
     out["skipped"] = dict(st.get("skipped") or {})
-    wipe_errors = (out.get("wipe") or {}).get("errors") or []
+    wipe_errors = list((out.get("wipe") or {}).get("errors") or [])
+    if not out["trash"]["empty"]:
+        wipe_errors.append(f"trash not empty: {out['trash']['left']}"
+                           + (f" ({'; '.join(out['trash']['errors'])[:200]})" if out["trash"]["errors"] else ""))
     out["ok"] = v["ok"] and not wipe_errors
     out["detail"] = _summary(folder, action, v)
     if wipe_errors:
@@ -462,7 +507,9 @@ def clean_extras(email: str, log: Callable[[str], None] | None = None) -> dict[s
     except Wave2AuthError:
         return None
     S = services(creds)
-    return extra_wipe(S, log)
+    out = extra_wipe(S, log)
+    out["trash"] = empty_trash(S, log)
+    return out
 
 
 # ----------------------------------------------------------------- page helpers (read-only)

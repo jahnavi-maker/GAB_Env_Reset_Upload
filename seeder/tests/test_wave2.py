@@ -179,6 +179,8 @@ class RunRoutingTests(_Wave2Env):
                        "gmail": {"a": 1, "b": 1}, "events": {"e": 1}, "drive_folders": {"f": 1},
                        "drive_files": {"d": 1}, "contacts": {"c": 1}, "tasks": {"t": 1}})
             b.save_state(ctx, st)
+        if not hasattr(self, "trash_result"):
+            self.trash_result = {"removed": {}, "left": {}, "empty": True, "errors": []}
         S = MagicMock()
         S.gmail.users().getProfile().execute.return_value = {"emailAddress": ACCOUNT}
 
@@ -190,7 +192,8 @@ class RunRoutingTests(_Wave2Env):
              patch.object(runner, "services", return_value=S), \
              patch.object(runner, "full_wipe", return_value={"errors": list(wipe_errors)}) as wipe, \
              patch.object(runner, "seed", side_effect=fake_seed) as seed, \
-             patch.object(runner, "restore") as restore:
+             patch.object(runner, "restore") as restore, \
+             patch.object(runner, "empty_trash", return_value=self.trash_result):
             out = runner.run(ACCOUNT, "test_person", mode)
         return out, wipe, seed, restore
 
@@ -224,6 +227,13 @@ class RunRoutingTests(_Wave2Env):
         out, *_ = self._run("reseed", wipe_errors=["delete contacts: HttpError 500"])
         self.assertFalse(out["ok"])
         self.assertIn("wipe errors", out["detail"])
+
+    def test_trash_left_behind_makes_the_run_not_ok(self):
+        self.trash_result = {"removed": {}, "left": {"gmail_trash": 4, "gmail_spam": 0, "drive_trash": 0},
+                             "empty": False, "errors": []}
+        out, *_ = self._run("reseed")
+        self.assertFalse(out["ok"])
+        self.assertIn("trash not empty", out["detail"])
 
     def test_progress_file_tracks_the_run(self):
         from wave2 import runner
@@ -418,3 +428,48 @@ class HomeAddressUnitTests(unittest.TestCase):
         self.assertEqual(with_unit("9 Elm St, Apt 2, Austin", "9 Elm St, Unit 7"), "9 Elm St, Apt 2, Austin")
         # another street's unit is never borrowed
         self.assertEqual(with_unit("9 Elm St, Austin", "19 Elm St, Unit 7"), "9 Elm St, Austin")
+
+
+class EmptyTrashTests(_Wave2Env):
+    def _S(self, trash, spam, drive_trashed):
+        """Fake services whose Trash/Spam empty once batchDelete is called."""
+        S = MagicMock()
+        g = S.gmail.users()
+        box = {"TRASH": list(trash), "SPAM": list(spam)}
+
+        def lst(**kw):
+            req = MagicMock()
+            label = (kw.get("labelIds") or [""])[0]
+            req.execute.return_value = {"messages": [{"id": i} for i in box.get(label, [])]}
+            return req
+
+        def bdel(userId, body):
+            for k in box:
+                box[k] = [i for i in box[k] if i not in body["ids"]]
+            return MagicMock()
+
+        g.messages().list.side_effect = lst
+        g.messages().batchDelete.side_effect = bdel
+        drive = {"n": drive_trashed}
+        S.drive.files().emptyTrash().execute.side_effect = lambda: drive.update(n=0)
+        S.drive.files().list.side_effect = lambda **kw: MagicMock(**{"execute.return_value": {
+            "files": [{"id": f"f{i}"} for i in range(drive["n"])]}})
+        return S, box
+
+    def test_trash_spam_and_drive_trash_are_emptied(self):
+        from wave2 import runner
+        S, box = self._S(["t1", "t2"], ["s1"], 3)
+        out = runner.empty_trash(S, lambda m: None)
+        self.assertEqual(out["removed"], {"gmail_trash": 2, "gmail_spam": 1})
+        self.assertEqual(out["left"], {"gmail_trash": 0, "gmail_spam": 0, "drive_trash": 0})
+        self.assertTrue(out["empty"])
+        self.assertEqual(out["errors"], [])
+
+    def test_trash_that_cannot_be_emptied_is_reported(self):
+        from wave2 import runner
+        S, box = self._S(["t1"], [], 0)
+        S.gmail.users().messages().batchDelete.side_effect = RuntimeError("403 insufficient permission")
+        out = runner.empty_trash(S, lambda m: None)
+        self.assertFalse(out["empty"])
+        self.assertEqual(out["left"]["gmail_trash"], 1)
+        self.assertTrue(any("Gmail Trash" in e for e in out["errors"]))
