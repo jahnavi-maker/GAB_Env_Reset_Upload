@@ -49,6 +49,10 @@ from .config import (
 from .runlog import RunLog, purge_old_logs
 from .db import Store, make_store
 from . import links
+from .jobs import JobService
+from .jobs_api import build_router, make_bearer_dependency
+from .jobs_files import LocalFileStore
+from .jobs_store import make_job_store
 from .models import (
     AccountLoginRequest,
     AccountLoginResponse,
@@ -241,6 +245,37 @@ async def require_api_key(authorization: str | None = Header(default=None)) -> N
             detail="missing or invalid bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+# --------------------------------------------------------------------------- #
+# Module jobs: a queue of browser-driven workflows (Keep seed/wipe) that a worker   #
+# machine claims. Callers use RESET_API_KEY; workers use their own WORKER_API_KEY.  #
+# See docs/MODULE_JOBS.md.                                                          #
+# --------------------------------------------------------------------------- #
+_jobs_service: JobService | None = None
+
+
+def _get_jobs_service() -> JobService:
+    global _jobs_service
+    if _jobs_service is None:
+        _jobs_service = JobService(
+            make_job_store(), lease_s=settings.job_lease_s,
+            worker_live_s=settings.job_worker_live_s, unroutable_after_s=settings.job_unroutable_after_s,
+        )
+    return _jobs_service
+
+
+_job_files: LocalFileStore | None = None
+
+
+def _get_job_files() -> LocalFileStore:
+    global _job_files
+    if _job_files is None:
+        _job_files = LocalFileStore(settings.job_files_dir, max_bytes=settings.job_screenshot_max_bytes)
+    return _job_files
+
+
+app.include_router(build_router(_get_jobs_service, require_api_key, make_bearer_dependency(lambda: settings.worker_api_key), _get_job_files))
 
 
 # --------------------------------------------------------------------------- #
