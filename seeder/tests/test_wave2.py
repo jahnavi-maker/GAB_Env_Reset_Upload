@@ -389,3 +389,13 @@ class ScopeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BirthdayTests(unittest.TestCase):
+    def test_reads_only_the_personas_own_row(self):
+        from wave2.personas import profile_birthday
+        doc = ("| **Name** | Arthur Pendelton |\n| **Date of Birth & Age** | April 22, 1958 (Age 68) |\n"
+               "- **Evelyn Pendelton (Wife, Age 66):** Born September 14, 1960")
+        self.assertEqual(profile_birthday(doc), "1958-04-22")
+        self.assertEqual(profile_birthday("| **Date of Birth & Age** | Sept. 4, 1986 (Age 40) |"), "1986-09-04")
+        self.assertEqual(profile_birthday("no table here; Born September 14, 1960"), "")

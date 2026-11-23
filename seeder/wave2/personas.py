@@ -167,6 +167,9 @@ class WorldCtx:
             return s
         return re.sub(re.escape(self.persona_email), self.account, s, flags=re.I)
 
+    def birthday(self) -> str:
+        return profile_birthday((self.world.get("persona") or {}).get("profile_doc") or "")
+
     def home_address(self) -> str:
         doc = (self.world.get("persona") or {}).get("profile_doc") or ""
         for pat in (
@@ -179,6 +182,21 @@ class WorldCtx:
                 # Street address only: drop "(neighbourhood ...)" notes and anything after them.
                 return m.group(1).split("(")[0].strip().rstrip(".,; ")
         return ""
+
+
+_MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september",
+           "october", "november", "december"]
+
+
+def profile_birthday(doc: str) -> str:
+    """The persona's OWN birth date from the profile table row
+    '| **Date of Birth & Age** | April 22, 1958 (Age 68) |' as ISO 'YYYY-MM-DD' ('' if absent).
+    Only that row is read, so family members' ages/dates elsewhere are never picked up."""
+    m = re.search(r"\*\*Date of Birth[^*|]*\*\*\s*\|\s*([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})", doc or "")
+    if not m or m.group(1).lower()[:3] not in [x[:3] for x in _MONTHS]:
+        return ""
+    month = [x[:3] for x in _MONTHS].index(m.group(1).lower()[:3]) + 1
+    return f"{int(m.group(3)):04d}-{month:02d}-{int(m.group(2)):02d}"
 
 
 def _profile_name(doc: str) -> str:

@@ -485,7 +485,7 @@ def persona_summaries() -> list[dict[str, Any]]:
             ctx = WorldCtx(folder, "")
             p = plan(ctx)
             hit = (mtime, {"folder": folder, "name": ctx.persona_name, "timezone": ctx.tz_name,
-                           "home_address": ctx.home_address(),
+                           "home_address": ctx.home_address(), "birthday": ctx.birthday(),
                            "expected": p["expected"], "manual": p["manual"],
                            "drive_not_recreatable": len(p["not_recreatable"]["drive_files"])})
             _SUMMARY_CACHE[folder] = hit
