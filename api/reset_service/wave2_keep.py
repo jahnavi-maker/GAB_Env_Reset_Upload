@@ -35,6 +35,11 @@ def summary_counts(summary: Optional[str]) -> dict[str, int]:
     out = {"created": 0, "already there": 0, "deleted first": 0}
     for number, what in _SUMMARY.findall(summary or ""):
         out[what] = int(number)
+    # Newer Clickless (2026-11-24) reports "persona: 11/11 notes verified in Keep (…)": the first number is what it confirmed in
+    # Keep after its run, counting notes that were already right as well as the ones it wrote.
+    m = re.search(r":\s*(\d+)/(\d+) notes verified", summary or "")
+    if m:
+        out["created"], out["already there"] = 0, int(m.group(1))
     return out
 
 
