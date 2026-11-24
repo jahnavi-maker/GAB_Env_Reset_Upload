@@ -896,6 +896,37 @@ async def _launch_reset(
 _KEEP_ENQUEUE_TASKS: set = set()   # keeps a reference so a running enqueue is not garbage-collected
 
 
+@app.get("/ui/reset/{reset_session_id}/services")
+async def ui_reset_services(reset_session_id: str, store: Store = Depends(get_store)) -> dict:
+    """For the reset page: per-service live counts of a Wave 2 reset (Gmail, Contacts, Calendar, Drive, Tasks) plus the Keep
+    job's state. Read-only; counts only, no content. {"wave2": false} for a classic persona (the page keeps its old steps)."""
+    record = await store.get(reset_session_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="unknown reset_session_id")
+    email, persona = (record.get("email") or "").lower(), record.get("persona") or ""
+    want = await asyncio.to_thread(engine.wave2_keep_expected, persona)
+    if not want.get("folder"):
+        return {"wave2": False}
+    progress = await asyncio.to_thread(engine.wave2_progress, email, persona) or {}
+    # The progress file is per account, not per reset: ignore one left by an earlier run.
+    created = str(record.get("created_at") or "")
+    if progress and created and str(progress.get("started_at") or "") < created[:19].replace("+00:00", ""):
+        progress = {}
+    keep = None
+    try:
+        jobs = await _get_jobs_service().list_jobs(reset_session_id=reset_session_id, workflow="keep-seed", limit=1)
+        if jobs:
+            j = jobs[0]
+            keep = {"status": j.get("status"), "summary": j.get("summary"),
+                    "reason": ((j.get("follow_up") or {}).get("reason") if isinstance(j.get("follow_up"), dict) else None),
+                    "expected": len(want.get("notes") or [])}
+    except Exception:  # noqa: BLE001 - Keep status is best effort on this page
+        log.debug("keep status read failed for %s", reset_session_id, exc_info=True)
+    return {"wave2": True, "stage": progress.get("stage"), "expected": progress.get("expected") or {},
+            "counts": progress.get("counts") or {}, "verify": progress.get("verify") or {}, "keep": keep,
+            "keep_expected": len(want.get("notes") or [])}
+
+
 async def _enqueue_keep_reset(email: str, persona: str, reset_session_id: str, task_allocation_id: str) -> None:
     try:
         want = await asyncio.to_thread(engine.wave2_keep_expected, persona)

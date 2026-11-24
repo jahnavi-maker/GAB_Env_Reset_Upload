@@ -55,6 +55,7 @@
   .dot.active { border-color:var(--brand); color:var(--brand); }
   .dot.failed { border-color:var(--err); background:var(--err); color:#fff; }
   li.pending { color:var(--muted); } li.done, li.active { color:var(--ink); } li.failed { color:var(--err); }
+  .steps .count { margin-left:auto; font-size:13px; color:var(--muted); font-variant-numeric:tabular-nums; }
   .spin { width:12px; height:12px; border:2px solid currentColor; border-right-color:transparent; border-radius:50%; animation:spin .7s linear infinite; }
   @keyframes spin { to { transform:rotate(360deg); } }
   .foot { font-size:13px; color:var(--muted); }
@@ -233,16 +234,84 @@
   }
   function pctFor(status){ return status==="completed"?100 : status==="failed"?55 : (status==="running"||status==="in_progress")?60 : 0; }
 
-  function renderSteps(states){
+  function renderSteps(states, names, notes){
     const ul = $("pSteps"); ul.innerHTML = "";
-    STEPS.forEach((name,i)=>{
+    (names || STEPS).forEach((name,i)=>{
       const st = states[i] || "pending";
       const li = document.createElement("li"); li.className = st;
       const dot = document.createElement("span"); dot.className = "dot " + st;
       dot.innerHTML = st==="done" ? "✓" : st==="failed" ? "✕" : st==="active" ? '<span class="spin"></span>' : "·";
       const label = document.createElement("span"); label.textContent = name;
-      li.appendChild(dot); li.appendChild(label); ul.appendChild(li);
+      li.appendChild(dot); li.appendChild(label);
+      if (notes && notes[i]){ const n = document.createElement("span"); n.className = "count"; n.textContent = notes[i]; li.appendChild(n); }
+      ul.appendChild(li);
     });
+  }
+
+  // Wave 2 personas: one step per service with live counts, plus Keep (restored by the Clickless worker). The Session ID is only
+  // shown once the five services AND Keep are back, so Cosmo never gets an account whose Keep is still being fixed.
+  const W2 = [["GMAIL","Restore Gmail"],["CONTACTS","Restore Contacts"],["CALENDAR","Restore Calendar"],["DRIVE","Restore Drive"],["TASKS","Restore Tasks"]];
+  let SVC = null;
+  function keepState(svc){
+    const k = svc && svc.keep;
+    if (!k) return "none";
+    if (k.status === "done") return "done";
+    if (k.status === "queued" || k.status === "running") return "active";
+    return "failed";
+  }
+  function renderWave2(status, error, svc){
+    const s = (status||"queued").toLowerCase();
+    const apiDone = s==="completed", apiFailed = s==="failed";
+    const stage = String(svc.stage || ""), exp = svc.expected || {}, cnt = svc.counts || {}, ver = svc.verify || {};
+    const at = W2.findIndex(([k]) => stage.endsWith(k.toLowerCase()));
+    const late = ["baseline","verify","done"].includes(stage);
+    const names = ["Authenticate"], states = [s==="queued" ? "pending" : "done"], notes = [""];
+    W2.forEach(([k,label], i) => {
+      names.push(label);
+      let st = "pending";
+      if (ver[k]) st = ver[k].ok ? "done" : "failed";
+      else if (apiDone || late || (at >= 0 && i < at)) st = "done";
+      else if (at === i) st = "active";
+      else if (apiFailed) st = "failed";
+      states.push(st);
+      const want = ver[k] ? ver[k].expected : exp[k], got = ver[k] ? ver[k].seeded : cnt[k];
+      notes.push(want == null ? "" : ((got == null ? "–" : got) + " / " + want));
+    });
+    const ks = keepState(svc);
+    names.push("Restore Keep");
+    states.push(ks==="done" ? "done" : ks==="failed" ? "failed" : ks==="active" ? "active" : (apiDone ? "done" : "pending"));
+    notes.push(ks==="done" ? (svc.keep_expected + " / " + svc.keep_expected) : ks==="active" ? (svc.keep.status==="queued" ? "waiting for worker" : "worker running")
+               : ks==="failed" ? "needs a person" : (svc.keep_expected ? "– / " + svc.keep_expected : ""));
+    const allDone = apiDone && (ks==="done" || ks==="none");
+    const failed = apiFailed || ks==="failed";
+    names.push("Verify baseline"); states.push(allDone ? "done" : failed ? "pending" : (apiDone || late) ? "active" : "pending"); notes.push("");
+    names.push("Complete"); states.push(allDone ? "done" : "pending"); notes.push("");
+
+    const disp = failed ? "failed" : allDone ? "completed" : (s==="queued" ? "queued" : "running");
+    const pillMap = { queued:"Queued", running:"Running", completed:"Completed", failed:"Failed" };
+    $("pPill").className = "pill " + disp; $("pPill").textContent = pillMap[disp];
+    const doneSteps = states.filter(x => x==="done").length, pct = disp==="completed" ? 100 : Math.round(doneSteps / states.length * 100);
+    $("pFill").style.width = pct + "%";
+    $("pTrack").className = "track " + disp;
+    $("pStatusLabel").textContent = pillMap[disp]; $("pPct").textContent = pct + "%";
+    renderSteps(states, names, notes);
+    if (disp==="completed"){ $("pFoot").textContent = "Environment restored to baseline (Gmail, Contacts, Calendar, Drive, Tasks and Keep)."; }
+    else if (disp==="failed"){
+      const why = apiFailed ? (humanError(error) || "please try again.") : ("Keep could not be restored automatically" + (svc.keep && svc.keep.reason ? " (" + svc.keep.reason + ")" : "") + ". Tell your QM; don't start the task yet.");
+      $("pFoot").textContent = "Reset did not complete — " + why;
+    }
+    else if (apiDone){ $("pFoot").textContent = "Gmail, Contacts, Calendar, Drive and Tasks are back. Restoring Keep…"; }
+    else if (disp==="running"){ $("pFoot").textContent = "Restoring environment…"; }
+    else { $("pFoot").textContent = "Waiting for the central reset worker."; }
+    if (disp==="completed" || disp==="failed"){ $("againBtn").classList.remove("hidden"); }
+    return { done: allDone, failed: failed };
+  }
+  async function fetchServices(id){
+    try {
+      const r = await fetch("/ui/reset/" + encodeURIComponent(id) + "/services", { headers: { Accept: "application/json" } });
+      if (r.ok) SVC = await r.json();
+    } catch(_){ /* keep the last one */ }
+    return SVC;
   }
 
   function renderProgress(status, error){
@@ -279,9 +348,16 @@
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
-      renderProgress(d.status, d.error);
-      if (d.status === "completed"){ revealSessionId(d.reset_session_id || RESET_ID || id); return; }
-      if (d.status === "failed") return;
+      const svc = await fetchServices(id);
+      if (svc && svc.wave2){
+        const out = renderWave2(d.status, d.error, svc);
+        if (out.done){ revealSessionId(d.reset_session_id || RESET_ID || id); return; }
+        if (out.failed) return;
+      } else {
+        renderProgress(d.status, d.error);
+        if (d.status === "completed"){ revealSessionId(d.reset_session_id || RESET_ID || id); return; }
+        if (d.status === "failed") return;
+      }
     } catch(e){ /* transient; keep polling */ }
     setTimeout(()=>poll(id), 2000);
   }
