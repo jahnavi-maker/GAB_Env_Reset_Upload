@@ -187,6 +187,7 @@
     } catch(e){ $("personaChips").innerHTML = '<span class="bad">Could not load Wave 2 personas.</span>'; }
   }
   const personaOf = row => personas.find(p => p.folder === row.folder) || null;
+  const personasReady = loadPersonas();
 
   // ---------- client.json ----------
   async function checkClient(){
@@ -223,7 +224,8 @@
     const rd = new FileReader(); rd.onload = () => { $("csv").value = rd.result; persist(); }; rd.readAsText(f); });
   $("loadBtn").addEventListener("click", loadCsv);
   const MODES = ["upload","reconcile","reseed","delta"];
-  function loadCsv(){
+  async function loadCsv(){
+    await personasReady;            // rows are matched to personas; don't match against an empty list
     rows.length = 0;
     for (const line of $("csv").value.split(/\r?\n/)){
       const t = line.trim(); if (!t) continue;
@@ -551,12 +553,14 @@
   });
 
   (async function init(){
-    await loadPersonas();
+    await personasReady;
     await checkClient();
     try {
-      const csv = localStorage.getItem(CSV_KEY); if (csv) $("csv").value = csv;
+      if (rows.length) return;      // accounts were loaded while the page was starting: keep those, don't add the saved ones too
+      const csv = localStorage.getItem(CSV_KEY); if (csv && !$("csv").value) $("csv").value = csv;
       const saved = JSON.parse(localStorage.getItem(ROWS_KEY) || "[]");
       if (saved.length){
+        saved.forEach(r => { if (r.folder && !personas.some(p => p.folder === r.folder)) r.folder = null; });
         saved.forEach(r => rows.push(r)); $("tableCard").style.display = "block"; render();
         rows.forEach((r, i) => setTimeout(() => refreshAccount(i), i * 150));
         pollOnce();
