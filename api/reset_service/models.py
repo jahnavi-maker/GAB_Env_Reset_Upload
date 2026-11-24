@@ -85,7 +85,6 @@ class TaskLookupRequest(BaseModel):
     Everything is in the body, never the query string."""
     token: Optional[str] = Field(default=None, description="Signed reset link token (preferred).")
     task_allocation_id: Optional[str] = Field(default=None, description="Legacy raw id (dev only).")
-    include_keep: Optional[bool] = Field(default=None, description="The tasker's answer: did this task use Google Keep? false = background check only")
     email: Optional[str] = Field(default=None, description="Legacy raw email (dev only).")
 
 
@@ -97,6 +96,7 @@ class FreelancerResetRequest(BaseModel):
     token: Optional[str] = Field(default=None, description="Signed reset link token (preferred).")
     email: Optional[str] = Field(default=None, description="Legacy raw email (dev only).")
     task_allocation_id: Optional[str] = Field(default=None, description="Legacy raw id (dev only).")
+    include_keep: Optional[bool] = Field(default=None, description="The tasker's answer: did this task use Google Keep? false = background check only")
 
     @field_validator("email")
     @classmethod
