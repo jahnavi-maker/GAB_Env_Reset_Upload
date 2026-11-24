@@ -134,6 +134,14 @@ class ClaimTests(JobsTestBase):
         self.assertEqual((job["job_id"], job["status"], job["attempt"], job["worker_id"]), (queued["job_id"], "running", 1, "mac-1"))
         self.assertEqual(job["lease_expires_at"], (self.clock.now + timedelta(seconds=600)).isoformat())
 
+    async def test_a_reset_job_goes_before_older_bulk_jobs(self):
+        await self.svc.enqueue(seed_payload(request_id="req-bulk-0001", account=A1))
+        self.clock.advance(60)
+        reset = (await self.svc.enqueue(seed_payload(request_id="req-reset-0002", account=A2,
+                                                     correlation={"reset_session_id": "rs-1", "task_allocation_id": "t-1"})))["job"]
+        job = await self.svc.claim(worker())
+        self.assertEqual(job["job_id"], reset["job_id"])
+
     async def test_the_oldest_matching_job_goes_first(self):
         first = (await self.svc.enqueue(seed_payload(request_id="req-0001-aaaa", account=A1)))["job"]
         self.clock.advance(5)

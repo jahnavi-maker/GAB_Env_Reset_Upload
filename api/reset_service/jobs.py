@@ -240,7 +240,11 @@ class JobService:
         await self.store.upsert_worker({**spec, "last_seen": _iso(now)})
         await self._expire_leases()
         busy = {j["account"] for j in await self._all(status="running")}
-        async for job in self._pages(status="queued"):
+        # A tasker's reset jobs (they carry the reset_session_id) go before bulk seeding / cleanup jobs, oldest first within each,
+        # so a reset never waits behind a long batch on the same worker.
+        queued = [job async for job in self._pages(status="queued")]
+        queued.sort(key=lambda j: (0 if ((j.get("correlation") or {}).get("reset_session_id")) else 1, j["created_at"], j["job_id"]))
+        for job in queued:
             if job["account"] in busy or job.get("cancel_requested") or not self._capable(spec, job):
                 continue
             stamp = _iso(now)
