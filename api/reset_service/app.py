@@ -886,8 +886,14 @@ async def _launch_reset(
     # A tasker's reset (Cosmo link or Cosmo API) also resets Keep: Keep has no API, so a keep-seed job goes to the module
     # job queue and the Clickless worker restores the persona's notes. Wave 2 personas only; never blocks the reset.
     if triggered_by in ("freelancer", "cosmo"):
-        background.add_task(_enqueue_keep_reset, email, persona, reset_session_id, task_allocation_id)
+        # Not a BackgroundTask: those run one after another, so the job would only be posted once the API reset ended.
+        task = asyncio.create_task(_enqueue_keep_reset(email, persona, reset_session_id, task_allocation_id))
+        _KEEP_ENQUEUE_TASKS.add(task)
+        task.add_done_callback(_KEEP_ENQUEUE_TASKS.discard)
     return reset_session_id, op_mode
+
+
+_KEEP_ENQUEUE_TASKS: set = set()   # keeps a reference so a running enqueue is not garbage-collected
 
 
 async def _enqueue_keep_reset(email: str, persona: str, reset_session_id: str, task_allocation_id: str) -> None:
