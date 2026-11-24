@@ -138,6 +138,10 @@ async def _qc_retention_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # The default thread pool is min(32, CPUs + 4) = 6 on this 2-CPU box. Uploads, resets and page checks all wait on Google (I/O),
+    # not CPU, so 6 threads let a large upload starve tasker resets (seen: resets at 7+ min, Keep jobs not posted for 5 min).
+    from concurrent.futures import ThreadPoolExecutor
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=int(os.environ.get("GAB_THREAD_POOL", "64"))))
     store = _ensure_store(app)
     if not settings.api_key:
         log.warning("RESET_API_KEY not set -> API authentication is DISABLED (dev only)")
@@ -947,7 +951,9 @@ async def ui_reset_services(reset_session_id: str, store: Store = Depends(get_st
 
 async def _enqueue_keep_reset(email: str, persona: str, reset_session_id: str, task_allocation_id: str, reset_keep: bool = True) -> None:
     try:
-        want = await asyncio.to_thread(engine.wave2_keep_expected, persona)
+        want = _KEEP_EXPECTED_CACHE.get(persona) or engine.wave2_keep_expected(persona)   # inline (~50 ms): never wait for a thread
+        if want.get("folder"):
+            _KEEP_EXPECTED_CACHE[persona] = want
         if not want.get("folder"):
             return  # not a Wave 2 persona: no Keep to reset
         if reset_keep:
