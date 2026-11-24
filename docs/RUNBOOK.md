@@ -90,6 +90,10 @@ Details (hosts, where keys are kept, who grants each) are in the team's private 
 6. Check Keep on accounts read-only with `tools/keep_count.mjs` (found / missing / extra / Archive / Trash).
 
 ## 6. Verify and mark the sheet
+0. Coverage check:
+   - Count tasks per persona in the Wave 2 task sheet (`[Internal][Wave 2] GAB v2`, column "Synthetic person").
+   - Count accounts per persona in the accounts sheet. They must match.
+   - On 24 Nov this found Samuel Okafor (3 tasks) with no accounts and Nadia Kapoor with 3 too many.
 1. Services check on the host: `scripts/verify_wave2_accounts.py <email>:<persona> …` (read-only). Expect `ok: true`: nothing missing or extra, Trash/Spam empty.
 2. Keep check: `tools/keep_count.mjs`. Expect found = want, extra 0, Archive 0, Trash empty.
 3. Profile check: `tools/profile_read.mjs` (name, birthday, home address from myaccount.google.com).
