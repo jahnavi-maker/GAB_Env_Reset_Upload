@@ -36,7 +36,7 @@
   .chips { display:flex; flex-wrap:wrap; gap:6px; }
   .chip { background:var(--chip); border-radius:999px; padding:4px 10px; font-size:12px; }
   .chip b { font-weight:600; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
+  table { width:100%; min-width:1000px; border-collapse:collapse; font-size:13px; }
   th,td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
   th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.03em; }
   td.email { word-break:break-all; max-width:230px; }
@@ -68,6 +68,7 @@
   .keep.ok .h { color:var(--ok); } .keep.warn .h { color:var(--warn); } .keep.bad .h { color:var(--err); }
   .keep.run .h { color:var(--brand); } .keep.idle .h { color:var(--muted); }
   .keep .d { color:var(--muted); margin-top:2px; }
+  .keep details summary { cursor:pointer; }
   .keep ul { margin:4px 0 0; padding-left:16px; color:var(--ink); }
   .keep .acts { margin-top:6px; display:flex; gap:6px; flex-wrap:wrap; }
   label.chk { font-size:12px; color:var(--muted); display:inline-flex; gap:6px; align-items:center; cursor:pointer; }
@@ -446,7 +447,11 @@
       if (k.archive && k.archive.length) bits.push("<li>Archive: " + k.archive.map(esc).join("; ") + "</li>");
       if (k.trash && k.trash.length) bits.push("<li>Trash: " + k.trash.map(esc).join("; ") + "</li>");
       if (bits.length) list = "<ul>" + bits.join("") + "</ul>";
-      if (k.state === "none") d = (k.expected || 0) + " note(s): " + esc((k.titles || []).join(" · "));
+      if (k.state === "none"){
+        // No Keep job from this page on record (Keep may have been done directly in Clickless): say so, list titles folded.
+        h = "No Keep job on record";
+        d = `<details><summary>${k.expected || 0} note(s) expected</summary>${esc((k.titles || []).join(" · "))}</details>`;
+      }
     }
     return `<div class="keep ${cls}" data-i="${i}"><div class="h">${h}</div>${d ? `<div class="d">${d}</div>` : ""}${list}<div class="acts"></div></div>`;
   }
