@@ -912,7 +912,7 @@ async def ui_reset_services(reset_session_id: str, store: Store = Depends(get_st
     # Keep list is computed once per persona and kept; the progress file is a small JSON read.
     want = _KEEP_EXPECTED_CACHE.get(persona)
     if want is None:
-        want = await asyncio.to_thread(engine.wave2_keep_expected, persona)
+        want = engine.wave2_keep_expected(persona)   # ~50 ms once per persona; inline so it never queues behind uploads
         if want.get("folder") is not None or not want.get("error"):
             _KEEP_EXPECTED_CACHE[persona] = want
     if not want.get("folder"):
