@@ -296,9 +296,12 @@ class JobService:
             # past max_run_s. The worker stops at its next heartbeat and the job ends as cancelled (bulk work can be queued again).
             why = None
             started = _parse(job["started_at"]) if job.get("started_at") else now
-            if self.max_run_s and now - started > timedelta(seconds=self.max_run_s):
+            is_reset = bool((job.get("correlation") or {}).get("reset_session_id"))
+            # The time limit is for a tasker's reset only (small, must finish fast). Bulk seeding/cleanup can take longer: it never
+            # blocks a reset anyway, because it steps aside the moment a reset is waiting (below).
+            if self.max_run_s and is_reset and now - started > timedelta(seconds=self.max_run_s):
                 why = f"ran longer than {self.max_run_s // 60} min"
-            elif not (job.get("correlation") or {}).get("reset_session_id") and any(
+            elif not is_reset and any(
                     (q.get("correlation") or {}).get("reset_session_id") for q in await self._all(status="queued")):
                 why = "a tasker's reset is waiting"
             if why:

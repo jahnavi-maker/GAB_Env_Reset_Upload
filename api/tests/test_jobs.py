@@ -147,6 +147,13 @@ class ClaimTests(JobsTestBase):
         await self.svc.enqueue(seed_payload(request_id="req-reset-0002", account=A2, correlation={"reset_session_id": "rs-2"}))
         self.assertFalse((await self.svc.heartbeat(first["job_id"], "mac-1"))["cancel_requested"])
 
+    async def test_a_bulk_job_is_not_stopped_by_the_time_limit_alone(self):
+        svc = JobService(self.store, now=self.clock, lease_s=600, worker_live_s=60, unroutable_after_s=600, max_run_s=480)
+        await svc.enqueue(seed_payload(request_id="req-bulk-long-01", account=A1))
+        job = await svc.claim(worker())
+        self.clock.advance(500)
+        self.assertFalse((await svc.heartbeat(job["job_id"], "mac-1"))["cancel_requested"])
+
     async def test_a_job_running_past_the_limit_is_stopped(self):
         svc = JobService(self.store, now=self.clock, lease_s=600, worker_live_s=60, unroutable_after_s=600, max_run_s=480)
         await svc.enqueue(seed_payload(request_id="req-long-0001", account=A1, correlation={"reset_session_id": "rs-1"}))
