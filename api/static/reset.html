@@ -274,7 +274,8 @@
       else if (at === i) st = "active";
       else if (apiFailed) st = "failed";
       states.push(st);
-      const want = ver[k] ? ver[k].expected : exp[k], got = ver[k] ? ver[k].seeded : cnt[k];
+      // A service not reached yet shows "–": the progress file carries the previous baseline counts until it is restored.
+      const want = ver[k] ? ver[k].expected : exp[k], got = ver[k] ? ver[k].seeded : (st === "pending" ? null : cnt[k]);
       notes.push(want == null ? "" : ((got == null ? "–" : got) + " / " + want));
     });
     const ks = keepState(svc);
