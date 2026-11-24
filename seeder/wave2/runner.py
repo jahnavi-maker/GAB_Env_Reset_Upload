@@ -441,6 +441,22 @@ def live_counts(S, st: dict[str, Any]) -> dict[str, Any]:
 
 
 # ----------------------------------------------------------------- wipe
+def _empty_drive_trash(S, log: Callable[[str], None]) -> Any:
+    """Empty Drive trash. Google answers 409 Conflict while an earlier empty is still running
+    (the wipe empties it, then the end-of-seed sweep empties it again), so wait and retry."""
+    import time as _time
+    for wait in (5, 15, 30, 0):
+        try:
+            return S.drive.files().emptyTrash().execute()
+        except Exception as exc:  # noqa: BLE001
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if wait and (status == 409 or (isinstance(status, int) and status >= 500) or "409" in str(exc)):
+                log(f"wave2: Drive trash busy ({status}), retrying in {wait}s")
+                _time.sleep(wait)
+                continue
+            raise
+
+
 def _step(label: str, fn: Callable[[], Any], errors: list[str], log: Callable[[str], None]) -> Any:
     try:
         return fn()
@@ -559,7 +575,7 @@ def full_wipe(S, creds, log: Callable[[str], None], keep_calendars: bool = False
     out["gmail"] = _step("wipe Gmail", lambda: wipe_seeded_mail(S.gmail, log), errors, log)
     out["calendar_primary"] = _step("clear primary calendar", lambda: wipe_seeded_events(S.cal, log), errors, log)
     out["drive"] = _step("wipe Drive", lambda: wipe_seed_folder(S.drive, "", log, creds=creds, workers=10), errors, log)
-    _step("empty Drive trash", lambda: S.drive.files().emptyTrash().execute(), errors, log)
+    _step("empty Drive trash", lambda: _empty_drive_trash(S, log), errors, log)
     extra = extra_wipe(S, log, keep_calendars=keep_calendars)
     errors += extra.pop("errors")
     out.update(extra)
@@ -594,7 +610,7 @@ def empty_trash(S, log: Callable[[str], None]) -> dict[str, Any]:
             removed[key] = len(ids)
             return len(ids)
         _step(f"empty Gmail {label.title()} (needs the mail.google.com permission)", sweep, errors, log)
-    _step("empty Drive trash", lambda: S.drive.files().emptyTrash().execute(), errors, log)
+    _step("empty Drive trash", lambda: _empty_drive_trash(S, log), errors, log)
 
     left: dict[str, Any] = {}
     left["gmail_trash"] = _step("count Gmail Trash", lambda: len(ids_in("TRASH")), errors, log)

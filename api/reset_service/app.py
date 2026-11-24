@@ -2379,6 +2379,7 @@ async def ui_batch_status(emails: str, store: Store = Depends(get_store)) -> dic
             "mode": s.get("mode"),
             "error": s.get("error"),
             "reset_session_id": s.get("reset_session_id"),
+            "created_at": s.get("created_at"),
             "last_reset_persona": a.get("last_reset_persona"),
             "last_reset_mode": a.get("last_reset_mode"),
             "last_reset_at": a.get("last_reset_at"),

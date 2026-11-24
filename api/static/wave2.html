@@ -288,7 +288,7 @@
   // ---------- run (upload / reconcile / reseed / delta) ----------
   async function run(i, forceMode){
     const row = rows[i]; if (!row.folder || row.wave2Ready !== true) return;
-    row.status = "running"; row.error = null; row.diag = null; row.progress = null; render();
+    row.status = "running"; row.error = null; row.diag = null; row.progress = null; row.startedAt = Date.now(); render();
     try {
       const body = {email: row.email, persona: row.folder};
       const mode = forceMode || row.mode; if (mode) body.mode = mode;
@@ -318,24 +318,39 @@
         const s = st[r.email]; if (!s || !s.status) return;
         const ns = s.status === "completed" ? "completed" : s.status === "failed" ? "failed" : "running";
         if (r.status === "running" || !r.uid || r.uid === s.reset_session_id){
+          if (r.uid !== s.reset_session_id) r.progress = null;           // a different run: drop the old run's counts
           r.status = ns; r.uid = s.reset_session_id; r.error = s.status === "failed" ? s.error : null; r.opMode = s.mode || r.opMode;
+          if (s.created_at) r.startedAt = Date.parse(s.created_at) || r.startedAt;
         }
       });
     } catch(e){}
   }
+  // A progress file left by an earlier run (stage done, started before this run) is not this run's progress.
+  function staleProgress(row, p){
+    if (!p || row.status !== "running" || !row.startedAt) return false;
+    const t = Date.parse(p.started_at || p.updated_at || "");
+    return !!t && t < row.startedAt - 60000;
+  }
   async function pollProgress(){
-    const live = rows.filter(r => r.folder && (r.status === "running" || (r.status !== "idle" && !r.progress))).slice(0, 12);
-    await Promise.all(live.map(async r => {
-      try {
-        const d = await (await fetch("/ui/wave2/progress?email=" + encodeURIComponent(r.email) + "&persona=" + encodeURIComponent(r.folder))).json();
-        if (d.progress) r.progress = d.progress;
-      } catch(e){}
-    }));
+    // Every row that is running or has no counts yet (not just the first 12), 6 requests at a time.
+    const live = rows.filter(r => r.folder && (r.status === "running" || (r.status !== "idle" && !r.progress)));
+    let next = 0;
+    async function lane(){
+      while (next < live.length){
+        const r = live[next++];
+        try {
+          const d = await (await fetch("/ui/wave2/progress?email=" + encodeURIComponent(r.email) + "&persona=" + encodeURIComponent(r.folder))).json();
+          if (d.progress && !staleProgress(r, d.progress)) r.progress = d.progress;
+          else if (d.progress) r.progress = null;
+        } catch(e){}
+      }
+    }
+    await Promise.all([1,2,3,4,5,6].map(lane));
   }
   async function pollOnce(){
     pollTimer = null;
     await syncStatuses(); await pollProgress(); render(); persist();
-    if (rows.some(r => r.status === "running")) pollTimer = setTimeout(pollOnce, 3000);
+    if (rows.some(r => r.status === "running")) pollTimer = setTimeout(pollOnce, rows.length > 30 ? 6000 : 3000);
   }
   async function refreshAll(){ rows.forEach((r, i) => setTimeout(() => refreshAccount(i), i * 150)); await pollOnce(); await syncKeep(); }
 
@@ -354,17 +369,24 @@
   let keepTimer = null;
   async function syncKeep(){
     const list = rows.filter(r => r.folder).map(r => ({email: r.email, persona: r.folder}));
-    for (let k = 0; k < list.length; k += 200){
+    let failed = false;
+    for (let k = 0; k < list.length; k += 50){
+      const part = list.slice(k, k + 50), ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 20000);
       try {
-        const r = await fetch("/ui/wave2/keep/status", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({rows: list.slice(k, k + 200)})});
-        if (!r.ok) continue;
+        const r = await fetch("/ui/wave2/keep/status", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({rows: part}), signal: ctl.signal});
+        if (!r.ok) throw new Error("HTTP " + r.status);
         const st = (await r.json()).states || {};
         rows.forEach(row => { const s = st[row.email]; if (s) { row.keep = s.check; row.keepErr = s.check ? null : s.error; } });
-      } catch(e){}
+      } catch(e){
+        failed = true;
+        const em = new Set(part.map(x => x.email));
+        rows.forEach(row => { if (em.has(row.email) && !row.keep) row.keepErr = "Keep status didn't load (" + (e.name === "AbortError" ? "timed out" : e.message) + "), retrying…"; });
+      } finally { clearTimeout(to); }
+      render();
     }
-    render();
     clearTimeout(keepTimer);
-    if (rows.some(r => r.keep && KEEP_OPEN.includes(r.keep.state))) keepTimer = setTimeout(syncKeep, 5000);
+    if (failed) keepTimer = setTimeout(syncKeep, 15000);
+    else if (rows.some(r => r.keep && KEEP_OPEN.includes(r.keep.state))) keepTimer = setTimeout(syncKeep, 8000);
   }
   async function keepRun(i){
     const row = rows[i]; if (!row.folder) return;
@@ -432,12 +454,21 @@
     if (row.authorized === undefined) return '<span class="perm unk">checking…</span>';
     return '<span class="perm no">not authorized</span>';
   }
+  // The server's error often starts with the per-service summary ("gmail 170/170, …") and only then
+  // says what went wrong ("wipe errors: …", "error: …"). Lead with what went wrong.
+  function failReason(err){
+    const e = String(err || "failed");
+    const m = e.match(/(wipe errors?:|errors?:|failed:|verify[^:]{0,20}:|HttpError[^:]*:)[\s\S]*/i);
+    const why = m && m.index > 0 ? m[0] : e;
+    const short = why.replace(/<HttpError (\d+) when requesting \S+ returned "([^"]*)"\.?/g, "HTTP $1 $2").replace(/\s+/g, " ");
+    return short.length > 160 ? short.slice(0, 157) + "…" : short;
+  }
   function statusCell(row){
     const p = row.progress, persona = personaOf(row);
     let label = "";
-    if (row.status === "running") label = '<span class="st running"><span class="spin"></span> ' + esc(STAGES[p && p.stage] || "running") + "</span>";
+    if (row.status === "running") label = '<span class="st running"><span class="spin"></span> ' + esc(p ? (STAGES[p.stage] || p.stage || "running") : "queued · waiting for a free slot") + "</span>";
     else if (row.status === "completed") label = '<span class="st completed">✅ ' + esc((p && p.action === "restore") || row.opMode === "reconcile" ? "reset to baseline" : "seeded") + "</span>";
-    else if (row.status === "failed") label = '<span class="st failed">❌ ' + esc((row.error || "failed").slice(0, 140)) + "</span>";
+    else if (row.status === "failed") label = '<span class="st failed" title="' + esc(row.error || "") + '">❌ ' + esc(failReason(row.error)) + "</span>";
     else label = '<span class="st idle">' + (row.wave2Ready === true ? "ready" : "—") + "</span>";
 
     let svc = "";
