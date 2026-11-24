@@ -328,7 +328,10 @@
   }
   async function fetchServices(id){
     try {
-      const r = await fetch("/ui/reset/" + encodeURIComponent(id) + "/services", { headers: { Accept: "application/json" } });
+      // Never let a slow progress check freeze the page: give up after 8 s and keep the last counts.
+      const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 8000);
+      const r = await fetch("/ui/reset/" + encodeURIComponent(id) + "/services", { headers: { Accept: "application/json" }, signal: ctl.signal });
+      clearTimeout(timer);
       if (r.ok) SVC = await r.json();
     } catch(_){ /* keep the last one */ }
     return SVC;

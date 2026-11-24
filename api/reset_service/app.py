@@ -897,6 +897,9 @@ async def _launch_reset(
 _KEEP_ENQUEUE_TASKS: set = set()   # keeps a reference so a running enqueue is not garbage-collected
 
 
+_KEEP_EXPECTED_CACHE: dict = {}   # persona -> {"folder", "notes"}: persona data does not change while the server runs
+
+
 @app.get("/ui/reset/{reset_session_id}/services")
 async def ui_reset_services(reset_session_id: str, store: Store = Depends(get_store)) -> dict:
     """For the reset page: per-service live counts of a Wave 2 reset (Gmail, Contacts, Calendar, Drive, Tasks) plus the Keep
@@ -905,10 +908,16 @@ async def ui_reset_services(reset_session_id: str, store: Store = Depends(get_st
     if not record:
         raise HTTPException(status_code=404, detail="unknown reset_session_id")
     email, persona = (record.get("email") or "").lower(), record.get("persona") or ""
-    want = await asyncio.to_thread(engine.wave2_keep_expected, persona)
+    # No worker thread here: under a big upload the thread pool is full and this page check hung for minutes. The persona's
+    # Keep list is computed once per persona and kept; the progress file is a small JSON read.
+    want = _KEEP_EXPECTED_CACHE.get(persona)
+    if want is None:
+        want = await asyncio.to_thread(engine.wave2_keep_expected, persona)
+        if want.get("folder") is not None or not want.get("error"):
+            _KEEP_EXPECTED_CACHE[persona] = want
     if not want.get("folder"):
         return {"wave2": False}
-    progress = await asyncio.to_thread(engine.wave2_progress, email, persona) or {}
+    progress = engine.wave2_progress(email, persona) or {}
     # The progress file is per account, not per reset: ignore one left by an earlier run.
     created = str(record.get("created_at") or "")
     if progress and created and str(progress.get("started_at") or "") < created[:19].replace("+00:00", ""):
