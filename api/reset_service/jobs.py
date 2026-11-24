@@ -18,7 +18,7 @@ from .jobs_store import DuplicateRequest, JobStore
 
 # What each workflow needs from a job. New workflows (Chat, ...) are added here and implemented in the worker.
 WORKFLOWS: dict[str, dict[str, Any]] = {
-    "keep-seed": {"persona": True, "modes": ("clean", "reseed"), "default_mode": "clean"},
+    "keep-seed": {"persona": True, "modes": ("clean", "reseed", "check"), "default_mode": "clean"},
     "keep-wipe": {"persona": False, "modes": (), "default_mode": None},
 }
 NEEDS = ("sign-in", "verification", "check", "none")

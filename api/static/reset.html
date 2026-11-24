@@ -128,6 +128,12 @@
           <div class="label">Persona</div>
           <div class="value empty" id="persona">looked up from gab_accounts</div>
         </div>
+        <div class="field" id="keepQ">
+          <div class="label">Did this task use or change Google Keep?</div>
+          <label style="display:block;margin:6px 0"><input type="radio" name="usedKeep" value="yes"> Yes, Keep was opened or changed</label>
+          <label style="display:block;margin:6px 0"><input type="radio" name="usedKeep" value="no"> No, Keep was not used</label>
+          <div class="foot">If you are not sure, choose Yes.</div>
+        </div>
         <button id="resetBtn">Reset environment</button>
         <div class="err-detail" id="lookupErr"></div>
       </div>
@@ -255,6 +261,7 @@
   function keepState(svc){
     const k = svc && svc.keep;
     if (!k) return "none";
+    if (k.status === "skipped") return "skipped";
     if (k.status === "done") return "done";
     if (k.status === "queued" || k.status === "running") return "active";
     return "failed";
@@ -280,10 +287,10 @@
     });
     const ks = keepState(svc);
     names.push("Restore Keep");
-    states.push(ks==="done" ? "done" : ks==="failed" ? "failed" : ks==="active" ? "active" : (apiDone ? "done" : "pending"));
-    notes.push(ks==="done" ? (svc.keep_expected + " / " + svc.keep_expected) : ks==="active" ? (svc.keep.status==="queued" ? "waiting for worker" : "worker running")
+    states.push(ks==="done" || ks==="skipped" ? "done" : ks==="failed" ? "failed" : ks==="active" ? "active" : (apiDone ? "done" : "pending"));
+    notes.push(ks==="skipped" ? "not used in task (checked later)" : ks==="done" ? (svc.keep_expected + " / " + svc.keep_expected) : ks==="active" ? (svc.keep.status==="queued" ? "waiting for worker" : "worker running")
                : ks==="failed" ? "needs a person" : (svc.keep_expected ? "– / " + svc.keep_expected : ""));
-    const allDone = apiDone && (ks==="done" || ks==="none");
+    const allDone = apiDone && (ks==="done" || ks==="none" || ks==="skipped");
     const failed = apiFailed || ks==="failed";
     names.push("Verify baseline"); states.push(allDone ? "done" : failed ? "pending" : (apiDone || late) ? "active" : "pending"); notes.push("");
     names.push("Complete"); states.push(allDone ? "done" : "pending"); notes.push("");
@@ -373,13 +380,17 @@
     // Option-2 token flow: the account is resolved server-side from the signed token,
     // and the reset runs under the pre-generated id bound into it.
     if (ctx.token){
+      const picked = document.querySelector('input[name="usedKeep"]:checked');
+      if (!picked){ $("lookupErr").textContent = "Answer whether this task used Google Keep first."; return; }
+      $("lookupErr").textContent = "";
+      ctx.includeKeep = picked.value !== "no";
       $("resetBtn").disabled = true;
       showProgress();
       renderProgress("queued", null);
       try {
         const r = await fetch("/ui/task/reset", {
           method:"POST", headers:{ "Content-Type":"application/json" },
-          body: JSON.stringify({ token: ctx.token, task_allocation_id: ctx.task_allocation_id, email: ctx.email }),
+          body: JSON.stringify({ token: ctx.token, task_allocation_id: ctx.task_allocation_id, email: ctx.email, include_keep: ctx.includeKeep }),
         });
         const d = await r.json();
         if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));

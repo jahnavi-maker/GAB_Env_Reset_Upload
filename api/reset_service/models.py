@@ -18,6 +18,9 @@ class ResetRequest(BaseModel):
     # Optional per-request overrides; default to server config when omitted.
     mode: Optional[str] = Field(default=None, description="delta | reseed | reset | seed")
     services: Optional[list[str]] = Field(default=None, description="subset of drive,gmail,calendar")
+    # Optional: false = the task did not use Google Keep, so Keep is only checked in the background (it does not hold up
+    # the reset). Omitted or true = Keep is reset with everything else (the default, same as before).
+    include_keep: Optional[bool] = Field(default=None, description="false = skip the Keep reset (background check only)")
 
     @field_validator("email")
     @classmethod
@@ -82,6 +85,7 @@ class TaskLookupRequest(BaseModel):
     Everything is in the body, never the query string."""
     token: Optional[str] = Field(default=None, description="Signed reset link token (preferred).")
     task_allocation_id: Optional[str] = Field(default=None, description="Legacy raw id (dev only).")
+    include_keep: Optional[bool] = Field(default=None, description="The tasker's answer: did this task use Google Keep? false = background check only")
     email: Optional[str] = Field(default=None, description="Legacy raw email (dev only).")
 
 

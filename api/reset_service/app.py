@@ -812,6 +812,7 @@ async def _launch_reset(
     reset_session_id: str | None = None,
     triggered_by: str | None = None,
     single_use: bool = False,
+    include_keep: bool | None = None,
 ) -> tuple[str, str]:
     """Create a queued session, dispatch to the bounded pool. Returns (id, op_mode).
 
@@ -887,7 +888,7 @@ async def _launch_reset(
     # job queue and the Clickless worker restores the persona's notes. Wave 2 personas only; never blocks the reset.
     if triggered_by in ("freelancer", "cosmo"):
         # Not a BackgroundTask: those run one after another, so the job would only be posted once the API reset ended.
-        task = asyncio.create_task(_enqueue_keep_reset(email, persona, reset_session_id, task_allocation_id))
+        task = asyncio.create_task(_enqueue_keep_reset(email, persona, reset_session_id, task_allocation_id, include_keep is not False))
         _KEEP_ENQUEUE_TASKS.add(task)
         task.add_done_callback(_KEEP_ENQUEUE_TASKS.discard)
     return reset_session_id, op_mode
@@ -920,6 +921,13 @@ async def ui_reset_services(reset_session_id: str, store: Store = Depends(get_st
             keep = {"status": j.get("status"), "summary": j.get("summary"),
                     "reason": ((j.get("follow_up") or {}).get("reason") if isinstance(j.get("follow_up"), dict) else None),
                     "expected": len(want.get("notes") or [])}
+        else:
+            latest = await _get_jobs_service().list_jobs(account=email, workflow="keep-seed", limit=1)
+            if latest and (latest[0].get("request") or {}).get("request_id", latest[0].get("request_id")) == f"reset-keepcheck-{reset_session_id}":
+                j = latest[0]
+                keep = {"status": "skipped", "check": j.get("status"), "summary": j.get("summary"),
+                        "reason": ((j.get("follow_up") or {}).get("reason") if isinstance(j.get("follow_up"), dict) else None),
+                        "expected": len(want.get("notes") or [])}
     except Exception:  # noqa: BLE001 - Keep status is best effort on this page
         log.debug("keep status read failed for %s", reset_session_id, exc_info=True)
     return {"wave2": True, "stage": progress.get("stage"), "expected": progress.get("expected") or {},
@@ -927,16 +935,22 @@ async def ui_reset_services(reset_session_id: str, store: Store = Depends(get_st
             "keep_expected": len(want.get("notes") or [])}
 
 
-async def _enqueue_keep_reset(email: str, persona: str, reset_session_id: str, task_allocation_id: str) -> None:
+async def _enqueue_keep_reset(email: str, persona: str, reset_session_id: str, task_allocation_id: str, reset_keep: bool = True) -> None:
     try:
         want = await asyncio.to_thread(engine.wave2_keep_expected, persona)
         if not want.get("folder"):
             return  # not a Wave 2 persona: no Keep to reset
-        out = await _get_jobs_service().enqueue({
-            "request_id": f"reset-keep-{reset_session_id}", "workflow": "keep-seed", "account": email.lower(),
-            "persona": want["folder"], "mode": "reseed",
-            "correlation": {"reset_session_id": reset_session_id, "task_allocation_id": task_allocation_id},
-        })
+        if reset_keep:
+            job = {"request_id": f"reset-keep-{reset_session_id}", "workflow": "keep-seed", "account": email.lower(),
+                   "persona": want["folder"], "mode": "reseed",
+                   "correlation": {"reset_session_id": reset_session_id, "task_allocation_id": task_allocation_id}}
+        else:
+            # The tasker said Keep was not used: the reset does not wait for Keep. A read-only check still runs in the background
+            # (after any waiting resets) and flags the account if Keep did change; it never edits Keep under the next tasker.
+            job = {"request_id": f"reset-keepcheck-{reset_session_id}", "workflow": "keep-seed", "account": email.lower(),
+                   "persona": want["folder"], "mode": "check", "max_attempts": 2,
+                   "correlation": {"task_allocation_id": task_allocation_id}}
+        out = await _get_jobs_service().enqueue(job)
         log.info("keep reset job for %s (reset %s): created=%s routable=%s %s", email, reset_session_id,
                  out.get("created"), out.get("routable"), out.get("routing_note") or "")
     except Exception:  # noqa: BLE001 - Keep must never break the API reset
@@ -1232,7 +1246,7 @@ async def ui_task_reset(
     try:
         reset_session_id, op_mode = await _launch_reset(
             store, background, email, persona, task_allocation_id, None, None,
-            reset_session_id=tok_sid, triggered_by="freelancer", single_use=True,
+            reset_session_id=tok_sid, triggered_by="freelancer", single_use=True, include_keep=req.include_keep,
         )
     except ActiveResetConflict:
         raise HTTPException(status_code=409, detail="a reset is already running for this account")
@@ -1253,7 +1267,7 @@ async def create_reset(
     try:
         reset_session_id, op_mode = await _launch_reset(
             store, background, req.email, req.persona, req.task_allocation_id, req.mode, req.services,
-            triggered_by="cosmo",
+            triggered_by="cosmo", include_keep=req.include_keep,
         )
     except HTTPException:
         raise
