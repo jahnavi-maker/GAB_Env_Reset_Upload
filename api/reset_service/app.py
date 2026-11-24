@@ -883,7 +883,27 @@ async def _launch_reset(
         _bounded_run, store, reset_session_id, task_allocation_id, email, persona, op_mode, services,
         None, triggered_by,
     )
+    # A tasker's reset (Cosmo link or Cosmo API) also resets Keep: Keep has no API, so a keep-seed job goes to the module
+    # job queue and the Clickless worker restores the persona's notes. Wave 2 personas only; never blocks the reset.
+    if triggered_by in ("freelancer", "cosmo"):
+        background.add_task(_enqueue_keep_reset, email, persona, reset_session_id, task_allocation_id)
     return reset_session_id, op_mode
+
+
+async def _enqueue_keep_reset(email: str, persona: str, reset_session_id: str, task_allocation_id: str) -> None:
+    try:
+        want = await asyncio.to_thread(engine.wave2_keep_expected, persona)
+        if not want.get("folder"):
+            return  # not a Wave 2 persona: no Keep to reset
+        out = await _get_jobs_service().enqueue({
+            "request_id": f"reset-keep-{reset_session_id}", "workflow": "keep-seed", "account": email.lower(),
+            "persona": want["folder"], "mode": "reseed",
+            "correlation": {"reset_session_id": reset_session_id, "task_allocation_id": task_allocation_id},
+        })
+        log.info("keep reset job for %s (reset %s): created=%s routable=%s %s", email, reset_session_id,
+                 out.get("created"), out.get("routable"), out.get("routing_note") or "")
+    except Exception:  # noqa: BLE001 - Keep must never break the API reset
+        log.warning("could not queue the Keep reset for %s (reset %s)", email, reset_session_id, exc_info=True)
 
 
 def _reset_accepted(reset_session_id: str, status: str = "in_progress", error: str | None = None) -> ResetApiResponse:
