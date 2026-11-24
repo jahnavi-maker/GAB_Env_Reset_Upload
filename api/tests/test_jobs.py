@@ -134,6 +134,28 @@ class ClaimTests(JobsTestBase):
         self.assertEqual((job["job_id"], job["status"], job["attempt"], job["worker_id"]), (queued["job_id"], "running", 1, "mac-1"))
         self.assertEqual(job["lease_expires_at"], (self.clock.now + timedelta(seconds=600)).isoformat())
 
+    async def test_a_bulk_job_steps_aside_when_a_reset_is_waiting(self):
+        await self.svc.enqueue(seed_payload(request_id="req-bulk-0001", account=A1))
+        bulk = await self.svc.claim(worker())
+        self.assertFalse((await self.svc.heartbeat(bulk["job_id"], "mac-1"))["cancel_requested"])
+        await self.svc.enqueue(seed_payload(request_id="req-reset-0002", account=A2, correlation={"reset_session_id": "rs-1"}))
+        self.assertTrue((await self.svc.heartbeat(bulk["job_id"], "mac-1"))["cancel_requested"])
+
+    async def test_a_reset_job_is_not_stopped_for_another_reset(self):
+        await self.svc.enqueue(seed_payload(request_id="req-reset-0001", account=A1, correlation={"reset_session_id": "rs-1"}))
+        first = await self.svc.claim(worker())
+        await self.svc.enqueue(seed_payload(request_id="req-reset-0002", account=A2, correlation={"reset_session_id": "rs-2"}))
+        self.assertFalse((await self.svc.heartbeat(first["job_id"], "mac-1"))["cancel_requested"])
+
+    async def test_a_job_running_past_the_limit_is_stopped(self):
+        svc = JobService(self.store, now=self.clock, lease_s=600, worker_live_s=60, unroutable_after_s=600, max_run_s=480)
+        await svc.enqueue(seed_payload(request_id="req-long-0001", account=A1, correlation={"reset_session_id": "rs-1"}))
+        job = await svc.claim(worker())
+        self.clock.advance(300)
+        self.assertFalse((await svc.heartbeat(job["job_id"], "mac-1"))["cancel_requested"])
+        self.clock.advance(200)
+        self.assertTrue((await svc.heartbeat(job["job_id"], "mac-1"))["cancel_requested"])
+
     async def test_a_read_only_keep_check_job_is_accepted(self):
         job = (await self.svc.enqueue(seed_payload(request_id="reset-keepcheck-0001", mode="check", max_attempts=2,
                                                    correlation={"task_allocation_id": "t-1"})))["job"]

@@ -63,10 +63,12 @@ def _text(value: Any, field: str, limit: int) -> str:
 
 
 class JobService:
-    def __init__(self, store: JobStore, now: Callable[[], datetime] | None = None, lease_s: int = 600, worker_live_s: int = 60, unroutable_after_s: int = 600) -> None:
+    def __init__(self, store: JobStore, now: Callable[[], datetime] | None = None, lease_s: int = 600, worker_live_s: int = 60, unroutable_after_s: int = 600,
+                 max_run_s: int = 0) -> None:
         self.store = store
         self._now = now or (lambda: datetime.now(timezone.utc))
         self.lease_s = lease_s
+        self.max_run_s = max_run_s   # 0 = no limit; otherwise a job running longer is asked to stop (it never blocks the queue)
         self.worker_live_s = worker_live_s
         self.unroutable_after_s = unroutable_after_s
 
@@ -288,7 +290,22 @@ class JobService:
         done = await self.store.update_if(job_id, {"status": "running", "attempt": job["attempt"], "worker_id": worker_id}, {"lease_expires_at": lease, "updated_at": _iso(now)})
         if not done:
             raise JobError("this job is not held by this worker")
-        return {"lease_expires_at": lease, "cancel_requested": bool(done["cancel_requested"])}
+        cancel = bool(done["cancel_requested"])
+        if not cancel:
+            # Keep the queue moving for taskers: a bulk/cleanup job steps aside when a tasker's reset is waiting, and no job may run
+            # past max_run_s. The worker stops at its next heartbeat and the job ends as cancelled (bulk work can be queued again).
+            why = None
+            started = _parse(job["started_at"]) if job.get("started_at") else now
+            if self.max_run_s and now - started > timedelta(seconds=self.max_run_s):
+                why = f"ran longer than {self.max_run_s // 60} min"
+            elif not (job.get("correlation") or {}).get("reset_session_id") and any(
+                    (q.get("correlation") or {}).get("reset_session_id") for q in await self._all(status="queued")):
+                why = "a tasker's reset is waiting"
+            if why:
+                stopped = await self.store.update_if(job_id, {"status": "running", "attempt": job["attempt"], "worker_id": worker_id},
+                                                     {"cancel_requested": True, "events": done["events"] + [{"at": _iso(now), "event": "auto_cancel", "reason": why}]})
+                cancel = bool(stopped)
+        return {"lease_expires_at": lease, "cancel_requested": cancel}
 
     @staticmethod
     def _follow_up(value: Any) -> dict[str, Any]:

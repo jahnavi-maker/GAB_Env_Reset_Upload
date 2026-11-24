@@ -102,6 +102,7 @@ class Settings:
     worker_api_key: str = os.environ.get("WORKER_API_KEY", "")
     jobs_table: str = os.environ.get("JOBS_TABLE", "module_jobs")
     workers_table: str = os.environ.get("WORKERS_TABLE", "module_workers")
+    job_max_run_s: int = _int_env("JOB_MAX_RUN_S", 480)                 # a Keep job running longer is stopped so the queue never stalls
     job_lease_s: int = _int_env("JOB_LEASE_S", 600)                      # a worker must heartbeat within this or the job returns to the queue
     job_worker_live_s: int = _int_env("JOB_WORKER_LIVE_S", 60)           # a worker polled within this is "live"
     job_unroutable_after_s: int = _int_env("JOB_UNROUTABLE_AFTER_S", 600)  # queued this long with no capable live worker = needs a person

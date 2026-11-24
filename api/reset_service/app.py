@@ -262,6 +262,7 @@ def _get_jobs_service() -> JobService:
         _jobs_service = JobService(
             make_job_store(), lease_s=settings.job_lease_s,
             worker_live_s=settings.job_worker_live_s, unroutable_after_s=settings.job_unroutable_after_s,
+            max_run_s=settings.job_max_run_s,
         )
     return _jobs_service
 
