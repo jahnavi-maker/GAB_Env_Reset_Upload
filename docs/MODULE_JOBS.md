@@ -1,3 +1,5 @@
+> **Note (24 Nov 2026):** tasker resets now queue Keep jobs too (see `docs/ARCHITECTURE.md` §3.3–3.4).
+
 # Module jobs: browser-driven workflows through the API
 
 Some parts of an environment have no API for consumer Google accounts (Google Keep today, Chat next). Clickless drives them through a

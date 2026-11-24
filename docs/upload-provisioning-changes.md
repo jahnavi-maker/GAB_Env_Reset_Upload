@@ -1,3 +1,5 @@
+> **Historical changelog.** Current behaviour: `docs/ARCHITECTURE.md`.
+
 # What changed in this branch — upload & provisioning rework
 
 _A plain-English summary of the work on `feature/upload-provisioning-pipeline`._

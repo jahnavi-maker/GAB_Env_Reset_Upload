@@ -1,3 +1,5 @@
+> **Note (24 Nov 2026):** Wave 2 is live in production; the deploy/test-plan notes below are historical. Operations: `docs/RUNBOOK.md`.
+
 # Wave 2 persona seeding (GAB Phase 9 · Wave 2)
 
 Branch `feat/wave2-contacts-tasks`, based on the live EC2 branch `unified` (6d370a9).

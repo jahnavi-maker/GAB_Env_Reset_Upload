@@ -1,3 +1,5 @@
+> **Superseded (24 Nov 2026):** see `docs/RUNBOOK.md`. Kept for history.
+
 # GAB Environment Platform — simple operator guide
 
 This is the “how do I actually run this” doc. No jargon beyond what you need.

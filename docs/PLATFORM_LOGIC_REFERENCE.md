@@ -1,3 +1,5 @@
+> **Superseded (24 Nov 2026):** see `docs/ARCHITECTURE.md` §3–4. Kept for history; it predates reconcile/clean modes and Wave 2.
+
 # GAB Platform — Logic Reference
 
 One page. Tables only. What each operation does, how the manifest/cache work, per-service behavior, and every fallback.
