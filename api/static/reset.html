@@ -65,6 +65,16 @@
   input[type=email]:focus, input[type=password]:focus { outline:2px solid var(--brand); outline-offset:1px; }
   .or { text-align:center; color:var(--muted); font-size:12px; margin:14px 0 8px; }
   .hidden { display:none; }
+  .keepq { border:1px solid var(--line); border-radius:12px; padding:14px; background:var(--chip); margin:4px 0 16px; }
+  .kq-title { font-size:15px; font-weight:600; }
+  .kq-sub { font-size:13px; color:var(--muted); margin-top:4px; line-height:1.4; }
+  .kq-opts { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:12px; }
+  .kq-opt { display:flex; gap:8px; align-items:flex-start; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; cursor:pointer; }
+  .kq-opt input { margin-top:3px; accent-color:var(--brand); }
+  .kq-opt span { display:flex; flex-direction:column; font-size:14px; }
+  .kq-opt small { color:var(--muted); font-size:12px; margin-top:2px; }
+  .kq-opt:has(input:checked) { border-color:var(--brand); box-shadow:0 0 0 1px var(--brand); }
+  #resetBtn.waiting { opacity:.55; }
 </style>
 </head>
 <body>
@@ -128,11 +138,13 @@
           <div class="label">Persona</div>
           <div class="value empty" id="persona">looked up from gab_accounts</div>
         </div>
-        <div class="field" id="keepQ">
-          <div class="label">Did this task use or change Google Keep?</div>
-          <label style="display:block;margin:6px 0"><input type="radio" name="usedKeep" value="yes"> Yes, Keep was opened or changed</label>
-          <label style="display:block;margin:6px 0"><input type="radio" name="usedKeep" value="no"> No, Keep was not used</label>
-          <div class="foot">If you are not sure, choose Yes.</div>
+        <div class="keepq" id="keepQ">
+          <div class="kq-title">Did this task use Google Keep?</div>
+          <div class="kq-sub">Keep takes longest to reset, so we only reset it if it was used. Not sure? Choose Yes.</div>
+          <div class="kq-opts">
+            <label class="kq-opt"><input type="radio" name="usedKeep" value="yes"><span><b>Yes</b><small>Keep was opened or changed</small></span></label>
+            <label class="kq-opt"><input type="radio" name="usedKeep" value="no"><span><b>No</b><small>Keep was not used</small></span></label>
+          </div>
         </div>
         <button id="resetBtn">Reset environment</button>
         <div class="err-detail" id="lookupErr"></div>
@@ -376,6 +388,7 @@
     $("pWho").textContent = [shortUser(ctx.email), ctx.persona].filter(Boolean).join(" · ") || "—";
   }
 
+  document.addEventListener("change", e => { if (e.target && e.target.name === "usedKeep"){ $("resetBtn").classList.remove("waiting"); $("lookupErr").textContent = ""; } });
   async function startReset(){
     // Option-2 token flow: the account is resolved server-side from the signed token,
     // and the reset runs under the pre-generated id bound into it.
@@ -485,6 +498,7 @@
       $("taskRow").classList.remove("hidden");
       $("acctRow").classList.remove("hidden");
       $("lookupSub").textContent = "You are signed in. Reset the account assigned to this task.";
+      if (!document.querySelector('input[name="usedKeep"]:checked')) $("resetBtn").classList.add("waiting");
       loadTask();
     } else {
       // No token: the manual "reset any account" form is removed. Only a task reset
@@ -493,6 +507,7 @@
       $("taskRow").classList.add("hidden");
       $("acctRow").classList.add("hidden");
       $("resetBtn").classList.add("hidden");
+      $("keepQ").classList.add("hidden");
       const pf = $("persona") && $("persona").closest(".field");
       if (pf) pf.classList.add("hidden");
       $("lookupSub").textContent =
