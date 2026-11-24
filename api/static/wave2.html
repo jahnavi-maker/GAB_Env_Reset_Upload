@@ -290,15 +290,16 @@
   // ---------- run (upload / reconcile / reseed / delta) ----------
   async function run(i, forceMode){
     const row = rows[i]; if (!row.folder || row.wave2Ready !== true) return;
-    row.status = "running"; row.error = null; row.diag = null; row.progress = null; row.startedAt = Date.now(); render();
+    row.status = "running"; row.error = null; row.diag = null; row.progress = null; row.startedAt = Date.now();
+    row.pendingRun = true; row.uid = null; render();
     try {
       const body = {email: row.email, persona: row.folder};
       const mode = forceMode || row.mode; if (mode) body.mode = mode;
       const r = await fetch("/ui/seed", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
       const d = await r.json(); if (!r.ok) throw new Error(d.detail || ("HTTP " + r.status));
-      row.uid = d.reset_session_id; row.opMode = d.mode || mode || null; render(); persist();
+      row.uid = d.reset_session_id; row.status = "running"; row.opMode = d.mode || mode || null; render(); persist();
       ensurePolling();
-    } catch(e){ row.status = "failed"; row.error = e.message; render(); }
+    } catch(e){ row.pendingRun = false; row.status = "failed"; row.error = e.message; render(); }
   }
   async function runAll(){
     for (let i = 0; i < rows.length; i++){
@@ -319,7 +320,11 @@
       rows.forEach(r => {
         const s = st[r.email]; if (!s || !s.status) return;
         const ns = s.status === "completed" ? "completed" : s.status === "failed" ? "failed" : "running";
-        if (r.status === "running" || !r.uid || r.uid === s.reset_session_id){
+        // The server's latest session is the truth, except while this page's own Run request is
+        // still on its way (then the server's latest is the previous run: keep showing ours).
+        if (r.pendingRun && s.reset_session_id !== r.uid) return;
+        r.pendingRun = false;
+        {
           if (r.uid !== s.reset_session_id) r.progress = null;           // a different run: drop the old run's counts
           r.status = ns; r.uid = s.reset_session_id; r.error = s.status === "failed" ? s.error : null; r.opMode = s.mode || r.opMode;
           if (s.created_at) r.startedAt = Date.parse(s.created_at) || r.startedAt;
