@@ -372,8 +372,8 @@
   async function syncKeep(){
     const list = rows.filter(r => r.folder).map(r => ({email: r.email, persona: r.folder}));
     let failed = false;
-    for (let k = 0; k < list.length; k += 50){
-      const part = list.slice(k, k + 50), ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 20000);
+    for (let k = 0; k < list.length; k += 20){
+      const part = list.slice(k, k + 20), ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 90000);
       try {
         const r = await fetch("/ui/wave2/keep/status", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({rows: part}), signal: ctl.signal});
         if (!r.ok) throw new Error("HTTP " + r.status);

@@ -2076,14 +2076,31 @@ async def ui_wave2_keep_status(payload: dict = Body(...)) -> dict:
     if not isinstance(rows, list) or len(rows) > 200:
         raise HTTPException(status_code=422, detail="rows: a list of at most 200 {email, persona}")
     out = {}
-    for row in rows:
-        if not isinstance(row, dict) or "@" not in str(row.get("email") or ""):
-            continue
+    # Each persona's notes are read once per request, and rows are checked 10 at a time
+    # (one row after another took ~0.6 s each, so a page of 87 accounts timed out).
+    wants: dict[str, asyncio.Task] = {}
+    sem = asyncio.Semaphore(10)
+
+    async def one(row: dict) -> None:
         email = _wave2_keep_email(row.get("email"))
+        persona = str(row.get("persona") or "")
         try:
-            out[email] = await _wave2_keep_state(email, str(row.get("persona") or ""))
+            if persona not in wants:
+                wants[persona] = asyncio.ensure_future(asyncio.to_thread(engine.wave2_keep_expected, persona))
+            want = await wants[persona]
+            if not want.get("folder"):
+                out[email] = {"email": email, "persona": None, "check": None,
+                              "error": want.get("error") or "not a Wave 2 persona"}
+                return
+            async with sem:
+                job = await _wave2_keep_latest(email)
+            out[email] = {"email": email, "persona": want["folder"],
+                          "check": wave2_keep.check(want["notes"], want["folder"], job)}
         except Exception as exc:  # noqa: BLE001 - one bad row must not hide the others
             out[email] = {"email": email, "check": None, "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+    await asyncio.gather(*(one(r) for r in rows
+                           if isinstance(r, dict) and "@" in str(r.get("email") or "")))
     return {"states": out}
 
 
