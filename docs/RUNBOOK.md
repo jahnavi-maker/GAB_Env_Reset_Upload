@@ -18,13 +18,13 @@ Details (hosts, where keys are kept, who grants each) are in the team's private 
 ### 1a. Consumer `@gmail.com` accounts: one OAuth client project per ≤100 accounts
 1. console.cloud.google.com → new project (e.g. `gab-wave2-1`), Organization "No organization".
 2. Enable APIs: Gmail, Google Calendar, Google Drive, Google Sheets, People, Google Tasks.
-3. Google Auth Platform → Get started. App name, Audience **External**. Branding: home page `https://gab-seed.soulhq.ai`.
+3. Google Auth Platform → Get started. App name, Audience **External**. Branding: home page `https://<your-domain>`.
 4. Data Access → add scopes: openid, userinfo.email, `https://mail.google.com/`, calendar, drive, contacts, tasks.
 5. Audience → Test users → add the account emails. **Max 100 per project**, so ~100 accounts per project.
    - In **Testing** status, sign-ins expire after **7 days** (accounts must be re-authorized).
    - Publishing status is per project; check each project's Audience page.
 6. Credentials → OAuth client ID → **Web application**.
-   - JavaScript origin `https://gab-seed.soulhq.ai`; redirect URI `https://gab-seed.soulhq.ai/oauth/callback`.
+   - JavaScript origin `https://<your-domain>`; redirect URI `https://<your-domain>/oauth/callback`.
    - Download the JSON. This is the **client.json**.
 7. Record which accounts belong to which client.json in the **"GAB | Client JSON Info"** sheet. A token only refreshes under the client it was issued by.
 

@@ -7,7 +7,7 @@ Seeds and resets Google test accounts for **GAB (GeminiApp Bench)** tasking, so 
 - **Verify:** compare the account with the persona after every seed and reset.
 - One FastAPI service (`api/`), one EC2 host, Supabase for records, a Mac running the Keep worker.
 
-## Live sites (`https://gab-seed.soulhq.ai`)
+## Live sites (`https://<your-domain>`)
 
 | Path | Who | What |
 |---|---|---|

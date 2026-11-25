@@ -9,7 +9,7 @@ flowchart LR
   OP[Operator browser<br>/onboard /wave2] --> LB
   T[Tasker browser<br>Cosmo + /reset] --> LB
   QM[QM browser<br>/managers] --> LB
-  LB[HTTPS gab-seed.soulhq.ai] --> NG[nginx :80] --> API[gab-api<br>FastAPI uvicorn 127.0.0.1:8791]
+  LB[HTTPS <your-domain>] --> NG[nginx :80] --> API[gab-api<br>FastAPI uvicorn 127.0.0.1:8791]
   API --> G[Google APIs<br>Gmail Calendar Drive People Tasks]
   API --> SB[(Supabase<br>8 tables)]
   API --> DISK[(Host disk<br>tokens, seed state, logs, persona files)]
