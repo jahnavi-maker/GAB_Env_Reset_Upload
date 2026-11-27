@@ -132,6 +132,14 @@ class Settings:
     # legit runtime (reset_timeout_s) + a buffer.
     stuck_reset_ttl_s: int = _int_env("STUCK_RESET_TTL_S", _int_env("GAB_RESET_TIMEOUT_S", 5400) + 1800)
     reaper_interval_s: int = _int_env("REAPER_INTERVAL_S", 600)  # sweep every 10 min
+    # --- Several servers on one Supabase ---------------------------------------
+    # This server's name (e.g. "A" for personal accounts, "B" for assessments). Every reset_sessions row it creates is
+    # stamped with it, and on restart it only resumes / reaps its OWN rows, never another server's running work.
+    # Empty (default) = the old single-server behaviour: no stamp, resume/reap every row.
+    # Needs the column first:  alter table reset_sessions add column if not exists server_id text;
+    server_id: str = os.environ.get("GAB_SERVER_ID", "").strip()
+    # Also resume/reap rows created before GAB_SERVER_ID existed (server_id is null). Set to 1 on the original server only.
+    server_claims_unowned: bool = _flag("GAB_SERVER_CLAIMS_UNOWNED", False)
 
     # --- Parallelism + routing + QC logging ---------------------------------
     # Max resets running concurrently across accounts. Each account still runs

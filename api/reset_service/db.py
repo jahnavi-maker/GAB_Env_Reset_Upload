@@ -21,6 +21,7 @@ from typing import Any, Optional
 import httpx
 
 from .config import settings
+from .servers import stamp as _stamp_server
 
 log = logging.getLogger("reset_service.db")
 
@@ -160,6 +161,7 @@ class SupabaseStore(Store):
         return r.status_code in (401, 403)
 
     async def create(self, record: dict[str, Any]) -> dict[str, Any]:
+        record = _stamp_server(record, settings)   # adds server_id when GAB_SERVER_ID is set (several servers, one DB)
         r = await self._client.post(
             self._url, json=record, headers={"Prefer": "return=representation"}
         )

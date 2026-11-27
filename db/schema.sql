@@ -59,6 +59,10 @@ create table if not exists reset_sessions (
 );
 -- Older DBs: add the single-use column if missing.
 alter table reset_sessions add column if not exists consumed_at timestamptz;
+-- Several servers on one Supabase: which server created the row (GAB_SERVER_ID). Each server only resumes and
+-- reaps its own queued/running rows after a restart. Null = created before server ids (or single-server setup).
+alter table reset_sessions add column if not exists server_id text;
+create index if not exists idx_reset_sessions_server on reset_sessions (server_id, status);
 create index if not exists idx_reset_sessions_email  on reset_sessions (email);
 create index if not exists idx_reset_sessions_task   on reset_sessions (task_allocation_id);
 create index if not exists idx_reset_sessions_status on reset_sessions (status);

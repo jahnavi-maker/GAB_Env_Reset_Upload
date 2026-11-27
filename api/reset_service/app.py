@@ -48,6 +48,7 @@ from .config import (
 )
 from .runlog import RunLog, purge_old_logs
 from .db import Store, make_store
+from .servers import check_name as _check_server_name, owner_filter
 from . import links
 from .jobs import InvalidJob, JobError, JobService
 from . import wave2_keep
@@ -143,6 +144,7 @@ async def lifespan(app: FastAPI):
     from concurrent.futures import ThreadPoolExecutor
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=int(os.environ.get("GAB_THREAD_POOL", "64"))))
     store = _ensure_store(app)
+    await _check_server_id(store)   # several servers on one DB: refuse to start half-configured
     if not settings.api_key:
         log.warning("RESET_API_KEY not set -> API authentication is DISABLED (dev only)")
     retention_task = asyncio.create_task(_qc_retention_loop())
@@ -538,7 +540,8 @@ async def _reap_stuck_sessions(store: Store) -> None:
     try:
         await store.patch_table(
             settings.supabase_table,
-            {"status": "in.(queued,running)", "created_at": f"lt.{cutoff}"},
+            # Only this server's rows (GAB_SERVER_ID); another server's long run is not ours to fail.
+            {"status": "in.(queued,running)", "created_at": f"lt.{cutoff}", **owner_filter(settings)},
             {"status": "failed", "completed_at": _now(),
              "error": f"reaped: no terminal status within {settings.stuck_reset_ttl_s}s "
                       "(task lost, process restart, or DB outage)"},
@@ -575,7 +578,8 @@ async def _resume_inflight_sessions(store: Store) -> None:
     try:
         rows = await store.query(
             settings.supabase_table,
-            {"status": "in.(queued,running)", "select": "*", "order": "created_at.desc"},
+            # Only this server's rows (GAB_SERVER_ID): another server's running work is NOT orphaned.
+            {"status": "in.(queued,running)", "select": "*", "order": "created_at.desc", **owner_filter(settings)},
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("auto-resume scan failed: %s", exc)
@@ -619,6 +623,28 @@ async def _resume_inflight_sessions(store: Store) -> None:
         resumed += 1
     if resumed:
         log.info("auto-resume: re-launched %d orphaned in-flight session(s) on startup", resumed)
+
+
+async def _check_server_id(store: Store) -> None:
+    """With GAB_SERVER_ID set, the name must be valid and reset_sessions must have the server_id column.
+
+    Without the column every new session insert would fail; starting anyway would also leave this server resuming and
+    reaping rows it cannot tell apart from another server's. So it stops here with a clear message instead.
+    """
+    if not settings.server_id:
+        return
+    _check_server_name(settings.server_id)
+    if not settings.use_supabase:
+        return
+    try:
+        await store.query(settings.supabase_table, {"select": "server_id", "limit": "1"})
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"GAB_SERVER_ID={settings.server_id} is set but {settings.supabase_table}.server_id is not readable ({exc}). "
+            f"Run in Supabase: alter table {settings.supabase_table} add column if not exists server_id text;"
+        ) from exc
+    log.info("server id %s: resuming/reaping only this server's sessions%s", settings.server_id,
+             " (plus rows from before server ids)" if settings.server_claims_unowned else "")
 
 
 async def _reaper_loop(store: Store) -> None:
